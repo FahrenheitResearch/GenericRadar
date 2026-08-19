@@ -1,0 +1,26 @@
+[package]
+name = "settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+# Dev-only. The workstation's settings window (`workstation_app/src/settings_ui.rs`)
+# is compiled and unit-tested here through `tests/workstation_settings_ui.rs`
+# (a `#[path]` include) until the human-owned wiring lands in `workstation_app`,
+# because unreferenced source files are not compiled at all and an unverified
+# UI module is worth nothing. The same include drives `examples/settings_preview`,
+# which opens the real window and photographs it. None of these reach the
+# shipped `settings` library: the firewall in `workstation_app/tests/architecture.rs`
+# reads only `[dependencies]`, and this section is not it.
+[dev-dependencies]
+analyst_runtime = { path = "../analyst_runtime" }
+color_tables = { path = "../color_tables" }
+eframe.workspace = true
+image.workspace = true
+map_scene = { path = "../map_scene" }
+radar_core = { path = "../radar_core" }
+render2d = { path = "../render2d" }

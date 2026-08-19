@@ -1,0 +1,34 @@
+[package]
+name = "workstation_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+analyst_runtime = { path = "../analyst_runtime" }
+chrono.workspace = true
+color_tables = { path = "../color_tables" }
+data_source = { path = "../data_source" }
+eframe.workspace = true
+map_scene = { path = "../map_scene" }
+nexrad_io = { path = "../nexrad_io" }
+product_engine = { path = "../product_engine" }
+radar_core = { path = "../radar_core" }
+rayon.workspace = true
+render2d = { path = "../render2d" }
+settings = { path = "../settings" }
+
+# Test-only. `vol3d` validates its two embedded WGSL shaders without a GPU, so
+# a headless build node still catches a broken shader. Pinned to the naga that
+# wgpu already resolves, so it adds nothing to the dependency graph. The
+# architecture firewall reads only [dependencies]; a dev-dependency cannot
+# reach the shipped binary.
+[dev-dependencies]
+# `examples/sweep_replay.rs` photographs a real chunked volume arriving, so
+# the sweep animation can be checked against a radar rather than a fixture.
+image.workspace = true
+naga = "29.0.3"
+
+[[bin]]
+name = "GenericRadar"
+path = "src/main.rs"

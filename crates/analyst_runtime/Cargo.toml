@@ -1,0 +1,10 @@
+[package]
+name = "analyst_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+radar_core = { path = "../radar_core" }
+serde.workspace = true

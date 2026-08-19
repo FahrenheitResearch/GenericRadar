@@ -1,0 +1,37 @@
+[package]
+name = "basemap_tiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Inherited so `CARGO_PKG_REPOSITORY` is non-empty: `default_user_agent()`
+# builds the contact URL the OpenStreetMap tile policy requires out of it.
+repository.workspace = true
+
+# Raster basemap tiles: Web Mercator arithmetic, provider policy, mesh
+# generation, and the fetch/decode/disk-cache pipeline.
+#
+# Deliberately has no `eframe`, `wgpu` or `egui` dependency. Everything here is
+# CPU work that must stay unit-testable on a headless build node, and the GPU
+# half lives in `map_scene`, which depends on this crate rather than the other
+# way round.
+[dependencies]
+# DEVIATION from the handed-down plan, which listed `{ image, reqwest }`:
+# `TileVertex` derives `bytemuck::Pod`/`Zeroable` so `map_scene` can turn a
+# `TileMesh` into a vertex buffer with `bytemuck::cast_slice` instead of an
+# `unsafe` transmute. `bytemuck` is already a workspace dependency and already
+# used by `map_scene`, so this adds no new lockfile entry and no new supply
+# chain - it moves one `unsafe` block out of the graphics crate.
+bytemuck = { workspace = true }
+image = { workspace = true }
+reqwest.workspace = true
+
+[dev-dependencies]
+# Integration tests do not inherit `[dependencies]`. The live-provider test
+# writes decoded tiles back out as PNG so a human can LOOK at real fetched
+# imagery rather than trust a byte count.
+image = { workspace = true }
+# Same reason, and the same crate the library already links: the live test that
+# checks each provider's credit against the service publishing it has to read
+# `MapServer?f=json` itself, because attribution that is merely transcribed
+# into a table drifts silently. No new lockfile entry.
+reqwest.workspace = true

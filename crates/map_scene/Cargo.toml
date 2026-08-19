@@ -1,0 +1,24 @@
+[package]
+name = "map_scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+analyst_runtime = { path = "../analyst_runtime" }
+# The CPU half of the raster tile basemap: Web Mercator arithmetic, the
+# provider table and its attribution obligations, mesh generation and the
+# fetch/decode/disk-cache pipeline. It owns no GPU code, which is why this
+# crate depends on it rather than the other way round.
+basemap_tiles = { path = "../basemap_tiles" }
+bytemuck = { workspace = true }
+# `eframe` is the graphics backend here: it re-exports `egui_wgpu` and `wgpu`,
+# so the workstation never depends on either of them directly.
+eframe.workspace = true
+radar_core = { path = "../radar_core" }
+
+[dev-dependencies]
+# The tile proof renders real fetched imagery through the real pipeline and
+# writes the read-back pixels out as a PNG, so a human can LOOK at the frame
+# rather than trust a pixel count.
+image = { workspace = true }
