@@ -57,7 +57,7 @@ fn both_palettes() -> [(&'static str, &'static Palette); 2] {
 #[test]
 fn every_text_role_clears_its_wcag_floor_in_both_variants() {
     for (name, p) in both_palettes() {
-        let floors: [(&str, Color32, Color32, f64); 8] = [
+        let floors: [(&str, Color32, Color32, f64); 10] = [
             ("text on face", p.text, p.face, 7.0),
             ("text on well", p.text, p.well, 7.0),
             ("text on raised face", p.text, p.face_raised, 7.0),
@@ -71,6 +71,11 @@ fn every_text_role_clears_its_wcag_floor_in_both_variants() {
             ),
             ("warn on face", p.warn, p.face, 4.5),
             ("error on face", p.error, p.face, 4.5),
+            // …and on the well, because `bevel::sunken_readout` invites
+            // exactly these two as overrides for a readout that has to
+            // shout — the live-stall notice on the toolbar is one.
+            ("warn on well", p.warn, p.well, 4.5),
+            ("error on well", p.error, p.well, 4.5),
         ];
         for (what, fg, bg, floor) in floors {
             let ratio = contrast(fg, bg);
@@ -422,4 +427,179 @@ fn an_etched_separator_does_not_inflate_an_auto_sized_window() {
          the sizing pass",
         window_rect.height()
     );
+}
+
+/// The root `Ui` eframe hands an app "has no margin or background color", and
+/// the window under it is cleared to eframe's own near-black default. The two
+/// halves of the ground must therefore both exist and must agree: a painted
+/// face with a black clear colour tears a seam on every resize, and a matched
+/// clear colour with an unpainted root leaves light chrome and dark ink
+/// floating on raw black — which is what the field failure looked like.
+#[test]
+fn the_root_ground_is_painted_and_the_clear_colour_matches_it() {
+    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, variant);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| theme::paint_root_ground(ui),
+        );
+        // The FIRST shape, because anything painted before it would be
+        // covered by it.
+        let first = output.shapes.first().expect("the ground painted nothing");
+        let egui::Shape::Rect(rect_shape) = &first.shape else {
+            panic!("{variant:?}: the ground is not a filled rect");
+        };
+        assert_eq!(rect_shape.fill, palette.face);
+        assert!(
+            rect_shape.rect.contains_rect(screen),
+            "{variant:?}: the ground covers {:?}, not the whole viewport",
+            rect_shape.rect
+        );
+
+        let clear = theme::clear_color(&theme::style(variant).visuals);
+        assert_eq!(
+            clear,
+            palette.face.to_opaque().to_normalized_gamma_f32(),
+            "{variant:?}: the window clear colour is not the painted ground"
+        );
+        assert_eq!(
+            clear[3], 1.0,
+            "{variant:?}: the clear colour is see-through"
+        );
+    }
+}
+
+/// A menu title latches while its menu is down, and it can only do that if
+/// the id `toolbar_control` allocates is the id `Popup::menu` derives its
+/// popup id from. That derivation lives in egui, so it is pinned here rather
+/// than assumed: a version bump that changes either end turns the latch off
+/// silently, and a menu bar whose open title looks identical to its closed
+/// ones is exactly the "which menu is this?" confusion the bevel is for.
+#[test]
+fn a_toolbar_menu_latches_while_its_menu_is_down() {
+    let ctx = egui::Context::default();
+    theme::apply(&ctx, Variant::Dark);
+    let input = || egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
+        ..Default::default()
+    };
+
+    // The id a bare `toolbar_button` takes is the one `next_auto_id` promised.
+    let mut promised = egui::Id::NULL;
+    let mut taken = egui::Id::NULL;
+    let _ = ctx.run_ui(input(), |ui| {
+        ui.horizontal(|ui| {
+            promised = ui.next_auto_id();
+            taken = bevel::toolbar_button(ui, "File").id;
+        });
+    });
+    assert_eq!(
+        promised, taken,
+        "toolbar_control no longer allocates the id next_auto_id promised"
+    );
+
+    // Opening the popup at `<that id>.with(\"popup\")` — the id `toolbar_menu`
+    // probes — really does show the menu.
+    let popup_id = promised.with("popup");
+    egui::Popup::open_id(&ctx, popup_id);
+    let mut menu_ran = false;
+    let _ = ctx.run_ui(input(), |ui| {
+        ui.horizontal(|ui| {
+            bevel::toolbar_menu(ui, "File", |ui| {
+                menu_ran = true;
+                ui.label("Open a Level II archive");
+            });
+        });
+    });
+    assert!(
+        menu_ran,
+        "the id toolbar_menu probes is not the id Popup::menu uses"
+    );
+    assert!(egui::Popup::is_id_open(&ctx, popup_id));
+}
+
+/// Readouts are the controls that used to be bare labels on whatever ground
+/// they landed on. They must be a well, they must be legible in both
+/// variants, and they must be the same height as the buttons beside them —
+/// a row of controls that disagree about their height is the thing that
+/// reads as amateur.
+#[test]
+fn a_sunken_readout_is_a_legible_well_the_height_of_a_toolbar_button() {
+    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, variant);
+        let mut button = Rect::NOTHING;
+        let mut short = Rect::NOTHING;
+        let mut long = Rect::NOTHING;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    button = bevel::toolbar_button(ui, "− Tilt").rect;
+                    short = bevel::sunken_readout(ui, 74.0, 150.0, "0.48°").rect;
+                    long = bevel::sunken_readout(
+                        ui,
+                        0.0,
+                        120.0,
+                        "KOAX · live · chunk 14/17 · 42 s ago · VCP 212",
+                    )
+                    .rect;
+                });
+            },
+        );
+        assert_eq!(
+            short.height(),
+            button.height(),
+            "{variant:?}: a readout and a button next to it are different heights"
+        );
+        assert!(short.height() >= bevel::MIN_TOUCH_POINTS);
+        assert!(
+            short.width() >= 74.0,
+            "{variant:?}: the floor width is what stops the bar re-flowing as the data changes"
+        );
+        assert!(
+            long.width() <= 120.0,
+            "{variant:?}: a long readout ran past its ceiling instead of truncating"
+        );
+        assert!(
+            long.height() <= short.height(),
+            "{variant:?}: a long readout wrapped, which changes the height of the whole bar"
+        );
+        // The pair the readout always draws, whatever the data says.
+        assert!(
+            contrast(palette.text, palette.well) >= 4.5,
+            "{variant:?}: readout ink is not legible on the well it sits in"
+        );
+    }
+}
+
+/// Secondary text is a declared colour, not a faded primary. egui's fallback
+/// (`text_color().gamma_multiply(weak_text_alpha)`) fades toward transparency
+/// without knowing what is behind it, and on the dark variant's well it
+/// landed at 2.64:1 — every text-edit hint on the toolbar was illegible.
+#[test]
+fn weak_text_is_the_palette_role_and_clears_the_floor_on_both_grounds() {
+    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+        let visuals = theme::style(variant).visuals;
+        assert_eq!(
+            visuals.weak_text_color(),
+            palette.text_weak,
+            "{variant:?}: weak text fell back to egui's alpha fade"
+        );
+        for (what, ground) in [("face", palette.face), ("well", palette.well)] {
+            let ratio = contrast(palette.text_weak, ground);
+            assert!(
+                ratio >= 4.5,
+                "{variant:?}: weak text on {what} is {ratio:.2}, below 4.5:1"
+            );
+        }
+    }
 }

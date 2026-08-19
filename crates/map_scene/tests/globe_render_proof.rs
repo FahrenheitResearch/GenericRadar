@@ -1068,7 +1068,7 @@ fn switching_to_a_radar_22_km_or_1903_km_away_keeps_the_near_view_and_the_limb_h
     }
 }
 
-/// The owner's complaint, reproduced on the REAL catalogue with the REAL
+/// The field complaint, reproduced on the REAL catalogue with the REAL
 /// camera: "the radar sites move every time i zoom".
 ///
 /// A marker's world position cannot move with the camera - `app.rs` projects

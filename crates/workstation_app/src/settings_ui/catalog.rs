@@ -24,6 +24,11 @@ use settings::{ChoiceOption, SettingKind, SettingSpec, SettingsCategory, Setting
 /// for a different meaning (renaming one orphans the stored value, which is
 /// safe; reusing one misreads it, which is not).
 pub mod keys {
+    pub mod appearance {
+        pub const CATEGORY: &str = "appearance";
+        pub const THEME: &str = "theme";
+        pub const TOOLBAR: &str = "toolbar";
+    }
     pub mod map {
         pub const CATEGORY: &str = "map";
         pub const BASEMAP_STYLE: &str = "basemap_style";
@@ -124,6 +129,7 @@ fn choice(options: Vec<ChoiceOption>, default_id: &str) -> SettingKind {
 /// The whole catalog. Order is the order the window lists categories.
 pub fn registry() -> SettingsRegistry {
     let mut registry = SettingsRegistry::new();
+    registry.register(appearance_category());
     registry.register(map_category());
     registry.register(radar_category());
     registry.register(navigation_category());
@@ -131,6 +137,35 @@ pub fn registry() -> SettingsRegistry {
     registry.register(analysis_category());
     registry.register(data_category());
     registry
+}
+
+fn appearance_category() -> SettingsCategory {
+    use keys::appearance as k;
+    let theme_options = vec![
+        ChoiceOption::new("light", "Daylight bench (Win95)"),
+        ChoiceOption::new("dark", "Night bench"),
+    ];
+    let toolbar_options = vec![
+        ChoiceOption::new("menus", "Menu bar (compact)"),
+        ChoiceOption::new("full", "Everything visible"),
+    ];
+    SettingsCategory::new(
+        k::CATEGORY,
+        "Appearance",
+        vec![
+            SettingSpec::new(k::THEME, "Theme", choice(theme_options, "light")).help(
+                "The whole application's chrome. Daylight bench is the classic              grey - raised buttons, etched group boxes, sunken wells - and is              the app's identity; Night bench is the same language cut in              graphite for a dark room. The radar panes keep their own ground              either way: data is drawn on the map's colours, not the theme's.",
+            ),
+            SettingSpec::new(
+                k::TOOLBAR,
+                "Toolbar style",
+                choice(toolbar_options, "menus"),
+            )
+            .help(
+                "Menu bar keeps one compact row - storm controls stay on it,              the occasional ones live under File / View / Map / Tools.              Everything visible puts every control on the row itself,              which wraps on narrower windows.",
+            ),
+        ],
+    )
 }
 
 fn map_category() -> SettingsCategory {

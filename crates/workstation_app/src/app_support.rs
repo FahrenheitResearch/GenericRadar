@@ -136,6 +136,103 @@ pub(crate) fn basemap_picker(
     }
 }
 
+/// The Map menu body: basemap look, ground imagery, and the dim slider.
+///
+/// Menu rows rather than nested combo boxes: a combo inside a menu popup
+/// closes the menu under the analyst's pointer. `for_style` preselects,
+/// because the controller stores a `MapStyle` rather than a preset.
+///
+/// The settings store is here for exactly one write: a hand-dragged Dim
+/// slider. Style and provider are mirrored from the scene every frame by
+/// `app.rs`, but the scrim cannot be - while auto-dim is on it is measured
+/// from arriving tiles, and mirroring the measurement would silently convert
+/// it into a stored manual choice.
+pub(crate) fn basemap_menu(
+    ui: &mut egui::Ui,
+    scene: &mut map_scene::MapSceneController,
+    store: &mut settings::SettingsStore,
+) {
+    ui.set_min_width(240.0);
+    let current = scene.style();
+    // `recognised` is kept rather than collapsed into a default, because the
+    // write-back below has to distinguish "the operator picked something else"
+    // from "this style is not in the preset table". Without that, an
+    // unrecognised style would be silently overwritten with Slate - the menu
+    // would quietly become a style eraser the moment anything other than
+    // itself sets a style.
+    let recognised = map_scene::MapStylePreset::for_style(current);
+    ui.label("Basemap");
+    for preset in map_scene::MapStylePreset::ALL {
+        if ui
+            .selectable_label(recognised == Some(preset), preset.label())
+            .clicked()
+            && recognised != Some(preset)
+        {
+            // `set_style` bumps the style clock and drops retained geometry,
+            // so the panes rebuild themselves without extra invalidation.
+            scene.set_style(preset.style());
+        }
+    }
+
+    ui.separator();
+    // Ground imagery: what the boundaries are drawn ON. "No imagery" is the
+    // shipped behaviour and the default, so an offline machine is never worse
+    // off. A provider whose terms this build cannot satisfy is not listed at
+    // all, rather than listed and then silently refusing to fetch.
+    ui.label("Ground imagery");
+    let provider = scene.tile_provider();
+    if ui
+        .selectable_label(provider.is_none(), "No imagery")
+        .clicked()
+        && provider.is_some()
+    {
+        scene.set_tile_provider(None);
+    }
+    for candidate in map_scene::TileProvider::ALL {
+        if !scene.tile_provider_permitted(candidate) {
+            continue;
+        }
+        if ui
+            .selectable_label(provider == Some(candidate), candidate.label())
+            .on_hover_text(candidate.coverage_note())
+            .clicked()
+            && provider != Some(candidate)
+        {
+            scene.set_tile_provider(Some(candidate));
+        }
+    }
+    if scene.tile_provider().is_some() {
+        let mut scrim = scene.tile_scrim();
+        if ui
+            .add(
+                egui::Slider::new(&mut scrim, 0.0..=0.9)
+                    .text("Dim")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text(
+                "How far the imagery is dimmed towards the pane's own ground,                  so weak reflectivity and near-zero velocity stay readable on                  top of it. The starting value is measured from the imagery                  that actually arrived.",
+            )
+            .changed()
+        {
+            scene.set_tile_scrim(scrim);
+            // A hand-set dim is a manual dim, so automatic dimming turns off
+            // - which is exactly what the settings window's pair of controls
+            // means - and the choice survives the process.
+            use crate::settings_ui::catalog::keys::map as k;
+            store.set(
+                k::CATEGORY,
+                k::IMAGERY_DIM,
+                settings::SettingValue::Float(f64::from(scrim)),
+            );
+            store.set(
+                k::CATEGORY,
+                k::IMAGERY_DIM_AUTO,
+                settings::SettingValue::Bool(false),
+            );
+        }
+    }
+}
+
 /// Every volume the 3D box may be built from, oldest first.
 ///
 /// The whole history rather than just the displayed frame: a live volume two

@@ -26,6 +26,18 @@
 //! windows and menus. Toolbars are flat-until-hover in the Office 97 manner
 //! — flatness is visual, never a smaller hit target.
 //!
+//! # The ground
+//!
+//! A style is not a background. eframe hands [`eframe::App::ui`] a root
+//! `egui::Ui` that "has no margin or background color" (eframe 0.34.3,
+//! `epi.rs`), and clears the window to its own near-black default, so an app
+//! that only installs a style paints light chrome onto raw near-black and
+//! draws its bare labels — a product name, a tilt value, a status line — in
+//! `#1C1B19` ink on it, invisible until something hovers a face underneath.
+//! Two calls close that hole and both are required: [`paint_root_ground`] at
+//! the top of `ui`, and [`clear_color`] from `App::clear_color` so the strip
+//! the compositor exposes mid-resize is the same face.
+//!
 //! # Palette (both variants, pinned by `tests/theme_contract.rs`)
 //!
 //! | Role            | Light       | Dark        |
@@ -128,6 +140,41 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_style_of(Theme::Light, style(Variant::Light));
 }
 
+/// The colour an [`eframe::App`] must clear its window to, so the ground the
+/// OS sees on a resize agrees with the ground [`paint_root_ground`] paints.
+///
+/// eframe's default is `rgba(12, 12, 12, 180)` — a near-black stand-in
+/// (`eframe` 0.34.3, `epi.rs`) that has nothing to do with any theme. When
+/// the window is dragged bigger, the compositor shows that clear colour in
+/// the newly exposed strip for the frame or two before egui lays out over
+/// it; if it is not the panel face, the app tears a black seam on every
+/// resize. Forced opaque: the default's alpha of 180 lets the desktop show
+/// through, which on a dark wallpaper is the same near-black again.
+pub fn clear_color(visuals: &Visuals) -> [f32; 4] {
+    visuals.panel_fill.to_opaque().to_normalized_gamma_f32()
+}
+
+/// Paint the ground of a root [`egui::Ui`] — the one eframe hands to
+/// [`eframe::App::ui`], which "has no margin or background color" (eframe
+/// 0.34.3, `epi.rs`).
+///
+/// Without this the app's widgets float on the raw window clear colour, and
+/// every text run that is not inside a well or a button is drawn straight
+/// onto it: in the light variant that is `#1C1B19` ink on near-black, which
+/// is invisible until a hover happens to paint a face under it. Call this
+/// FIRST in `ui`, before anything else allocates, so the fill lands behind
+/// the frame's own shapes.
+///
+/// The rect covers the root `Ui`'s extent unioned with the viewport's content
+/// area, because on the frame a resize lands the layout is still the previous
+/// frame's and the `Ui` alone would leave the new strip bare. The painter's
+/// clip keeps that union honest.
+pub fn paint_root_ground(ui: &egui::Ui) {
+    let ground = ui.visuals().panel_fill;
+    let rect = ui.max_rect().union(ui.ctx().content_rect());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, ground);
+}
+
 /// The complete [`egui::Style`] for one variant.
 pub fn style(variant: Variant) -> egui::Style {
     let mut style = egui::Style {
@@ -212,6 +259,15 @@ fn visuals(variant: Variant) -> Visuals {
             stroke: Stroke::new(1.0, palette.selection_text),
         },
         hyperlink_color: palette.link,
+        // Secondary text is a declared colour, not a faded primary. egui's
+        // default is `text_color().gamma_multiply(weak_text_alpha)`, which
+        // fades the ink toward transparency without knowing what is behind
+        // it: on the dark variant's well that lands at `#5C5D5D` on
+        // `#181A1D`, a measured 2.64:1, and every text-edit hint on the bar
+        // was illegible because of it (caught by the toolbar audit in
+        // `examples/theme_gallery.rs`, not by eye). `text_weak` is the
+        // palette's own answer, pinned at ≥ 4.5:1 on both face and well.
+        weak_text_color: Some(palette.text_weak),
         faint_bg_color: match variant {
             Variant::Dark => Color32::from_white_alpha(4),
             Variant::Light => Color32::from_black_alpha(7),

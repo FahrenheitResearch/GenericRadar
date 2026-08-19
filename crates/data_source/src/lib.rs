@@ -141,6 +141,132 @@ pub struct RealtimeLevel2Volume {
     pub total_size: u64,
 }
 
+impl RealtimeLevel2Volume {
+    /// How far behind `now` this volume's start time is, never negative.
+    ///
+    /// See [`volume_age_at`]. This is the number a live display has to show:
+    /// "newest in the feed" and "current" are different claims, and only this
+    /// one can tell them apart.
+    pub fn age_at(&self, now: DateTime<Utc>) -> Duration {
+        volume_age_at(self.volume_time, now)
+    }
+
+    /// Whether a live session looking at this volume may still imply it is
+    /// current. See [`classify_feed_age`].
+    pub fn freshness_at(&self, now: DateTime<Utc>) -> FeedFreshness {
+        classify_feed_age(self.age_at(now))
+    }
+}
+
+/// How far behind wall clock the newest volume in a realtime feed may fall
+/// before a live session must stop implying its picture is current.
+///
+/// Fifteen minutes, and the margin is deliberate on both sides.
+///
+/// The floor is the slowest legitimate case. A volume is aged from its START
+/// time, so the newest volume time is already a whole volume behind by the
+/// moment that volume finishes: VCP 12/212 run about 4.2 minutes, VCP 215
+/// about 6, and the clear-air VCP 31/32 about 10 (VCP 35 measured at 7 on
+/// KTLX - see [`REALTIME_PREVIOUS_VOLUME_MAX_GAP_MINUTES`]). Add the minute or
+/// two between a chunk being written and a listing showing it, and a healthy
+/// clear-air site can legitimately sit ~12 minutes behind wall clock. A
+/// threshold under that would cry stall at a radar that is working perfectly.
+///
+/// The ceiling is what the alarm is FOR. On 2026-08-19 the chunks bucket had
+/// stopped receiving KUEX: its id set was one contiguous run 1..=931 and the
+/// newest chunk anywhere under `KUEX/` was `KUEX/931/20260816-110802-003-I`,
+/// LastModified 2026-08-16T11:08:09Z - a three-day-old, three-chunk fragment
+/// that the app downloaded and displayed under today's warning polygons
+/// without a word. Anything between ~12 minutes and three days is a judgement
+/// call; 15 minutes is the smallest round number that clears the slowest real
+/// VCP, and every failure this guards against overshoots it by orders of
+/// magnitude.
+pub const REALTIME_FEED_STALL_AFTER_SECONDS: i64 = 15 * 60;
+
+/// What a live session may claim about the picture it is publishing.
+///
+/// Two of these are ages and the third is a SOURCE, and that is the whole
+/// shape of it. [`classify_feed_age`] answers the age question - may this be
+/// presented as current, yes or no - and deliberately still has only those two
+/// answers, because a middle "degraded" band would be a third thing to explain
+/// on a status line an analyst reads in a glance.
+///
+/// [`Self::ArchiveFallback`] is not a third age band. It is the session saying
+/// "the realtime chunk feed for this radar has stopped and I am publishing the
+/// archive bucket instead", which no age can express: the archive picture may
+/// be six minutes old and perfectly usable while the thing the app was built
+/// to read has been dead for three days. Both facts have to reach the analyst,
+/// so both are carried - the variant says which bucket, and the volume time
+/// published beside it says how far behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedFreshness {
+    /// The newest volume in the realtime chunk feed is recent enough to show
+    /// as live.
+    Current,
+    /// The chunk feed has stopped keeping up and nothing better is available.
+    /// The data is still real and still worth drawing; it must simply never be
+    /// labelled as current.
+    Stalled,
+    /// The chunk feed has stopped and the session has switched to the Level II
+    /// archive bucket, which is still receiving this radar. The volume time
+    /// published with this is the ARCHIVE's newest, not the chunk feed's.
+    ArchiveFallback,
+}
+
+impl FeedFreshness {
+    /// Whether the realtime chunk feed has stopped keeping up.
+    ///
+    /// True for [`Self::ArchiveFallback`] as well, and that is the point: this
+    /// is the "do not present this as a live chunk feed" bit, and being on the
+    /// archive is the loudest possible case of the chunk feed having stopped.
+    /// Every caller uses it to decide whether to raise a notice at all;
+    /// [`Self::is_archive_fallback`] and [`Self::status_label`] are what change
+    /// the words in that notice.
+    pub fn is_stalled(self) -> bool {
+        matches!(self, Self::Stalled | Self::ArchiveFallback)
+    }
+
+    /// Whether the picture is coming from the archive bucket rather than the
+    /// realtime chunk feed.
+    pub fn is_archive_fallback(self) -> bool {
+        matches!(self, Self::ArchiveFallback)
+    }
+
+    /// The words for a status line. Lower case, no site and no age: the caller
+    /// owns those, because it owns the clock the age is read against.
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Current => "live",
+            Self::Stalled => "feed stalled",
+            Self::ArchiveFallback => "archive fallback",
+        }
+    }
+}
+
+/// How far behind `now` a volume that started at `volume_time` is.
+///
+/// Clamped at zero: a radar whose clock runs a few seconds ahead of this
+/// machine's would otherwise produce a negative age, and "-3 s old" on a
+/// status line reads as a bug in the app rather than as skew in a clock the
+/// app does not own.
+pub fn volume_age_at(volume_time: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (now - volume_time).max(Duration::zero())
+}
+
+/// Classify a feed age against [`REALTIME_FEED_STALL_AFTER_SECONDS`].
+///
+/// An age question, so it has exactly two answers and never returns
+/// [`FeedFreshness::ArchiveFallback`] - which source a session is reading is
+/// a policy decision made above this function, not something an age can
+/// reveal.
+pub fn classify_feed_age(age: Duration) -> FeedFreshness {
+    if age.num_seconds() >= REALTIME_FEED_STALL_AFTER_SECONDS {
+        FeedFreshness::Stalled
+    } else {
+        FeedFreshness::Current
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DataSourceError {
     #[error("HTTP request failed: {0}")]
@@ -163,6 +289,11 @@ pub enum DataSourceError {
     DownloadWorkerPanic,
     #[error("download of {site} volume {volume_id} was cancelled")]
     DownloadCancelled { site: String, volume_id: u16 },
+    /// The single-object form of [`Self::DownloadCancelled`]. An archive
+    /// volume has no volume id - it is one key - so it names the key instead
+    /// rather than inventing a zero.
+    #[error("download of {key} was cancelled")]
+    ObjectDownloadCancelled { key: String },
     #[error(
         "{site} volume {volume_id} at {volume_time} is missing chunk {missing_chunk_id} of {last_chunk_id}"
     )]
@@ -414,6 +545,26 @@ pub fn latest_level2_object_cached(
     })
 }
 
+/// The newest volume the chunks bucket is holding for `site`.
+///
+/// NEWEST IS NOT CURRENT, and a caller that treats the two as the same word
+/// will show days-old weather as live. This function answers "what is the most
+/// recent thing in the feed"; it cannot answer "is the feed still running",
+/// because a feed that stopped three days ago still has a most-recent thing in
+/// it. On 2026-08-19 that is exactly what KUEX was: ids 1..=931 with nothing
+/// written under the prefix since 2026-08-16T11:08:09Z, so this returned a
+/// three-chunk fragment from Saturday and was right to.
+///
+/// Ask the returned volume [`RealtimeLevel2Volume::freshness_at`] before
+/// presenting it as live. Doing that BEFORE the download - it is a field on a
+/// value already in hand, not another request - is what lets a caller say
+/// "this feed is stalled" while the transfer is still running rather than
+/// after a stale volume has landed looking fresh.
+///
+/// The real cure for a dead prefix is a second source for the same radar (the
+/// Level II archive bucket carries KUEX for the same period, and NWS TDS is a
+/// third). This function deliberately does not reach for one: choosing between
+/// sources is a policy decision that belongs above it.
 pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume> {
     let site = site.to_ascii_uppercase();
     let site_prefix = format!("{site}/");
@@ -599,6 +750,448 @@ fn list_active_realtime_volume_ids(site: &str) -> Result<Vec<u16>> {
     ids.sort_unstable();
     ids.dedup();
     Ok(ids)
+}
+
+// --- the Level II archive, as the chunk feed's second source ----------------
+//
+// Every radar this app can draw is uploaded TWICE by different machinery: as a
+// stream of growing chunks into `unidata-nexrad-level2-chunks`, and as one
+// finished object per volume into `unidata-nexrad-level2` under
+// `YYYY/MM/DD/SITE/`. The two fail independently, which is the only reason
+// this section exists. Measured 2026-08-19T18:50Z: KUEX's chunk prefix had
+// written nothing since `KUEX/931/20260816-110802-003-I` at
+// 2026-08-16T11:08:09Z - three days - while `2026/08/19/KUEX/` held 262
+// finished volumes, the newest `KUEX20260819_184216_V06` uploaded at 18:47:13Z.
+// The radar never stopped scanning. Only one of its two pipes stopped moving,
+// and an app that reads one pipe shows a weekend-old storm under today's
+// warning polygons.
+
+/// The archive bucket's metadata companion objects.
+///
+/// Real keys, counted under `2026/08/19/KUEX/` at 18:49Z: 262 volume objects
+/// of 6.1-16.7 MB, and 18 `..._V06_MDM` objects of ~720 KB, about one an hour.
+/// An `_MDM` sorts immediately AFTER the volume it belongs to, so "the last key
+/// in the prefix" returns a metadata blob whenever one has just been written -
+/// and at 720 KB it is far too big for a size floor to catch. The suffix is the
+/// discriminator, and it is the same one [`recent_level2_objects`] has always
+/// used.
+const ARCHIVE_METADATA_KEY_SUFFIX: &str = "_MDM";
+
+/// How far back a cold archive listing starts, minutes.
+///
+/// Keys under a day prefix are chronological, so S3's `start-after` turns
+/// "what is newest" from a whole-day listing into a window. Measured against
+/// the KUEX prefix above: the whole day was 280 keys / 90,741 bytes / 486 ms,
+/// a two-hour window 23 keys / 7,770 bytes / 343 ms - 11.7x less to move, on
+/// a fallback that may run for hours.
+///
+/// Two hours is far longer than any legitimate gap between volumes. The
+/// slowest WSR-88D VCP is about 10 minutes, and that same day of KUEX measured
+/// volume intervals of min 196 s, max 418 s, mean 258 s. A site that is on the
+/// air at all lands inside the window; a site that is not falls through to the
+/// whole-day listing, which is the rarer and slower path on purpose.
+const ARCHIVE_RECENT_WINDOW_MINUTES: i64 = 120;
+
+/// Pages one archive listing will follow before giving up.
+///
+/// A day of one site is ~280 keys, comfortably inside a single 1,000-key page.
+/// But a truncated listing returns the OLDEST 1,000 keys - exactly the wrong
+/// end for "what is newest" - so truncation is followed rather than ignored.
+/// Eight pages is 8,000 keys, roughly a month of one site, and a hard stop
+/// against a prefix that is not what this code thinks it is.
+const ARCHIVE_LISTING_MAX_PAGES: usize = 8;
+
+/// One complete Level II volume sitting in the archive bucket.
+///
+/// The archive is the chunk feed's slower, steadier twin: the same radar, one
+/// finished object per volume instead of a growing chunk set. That makes it
+/// both easier (nothing to assemble, nothing to check for gaps) and later: on
+/// 2026-08-19 the KUEX object appeared a mean 252 s after the volume STARTED
+/// (min 190, max 611), so an archive picture is inherently ~4-9 minutes behind
+/// wall clock. Worse than a healthy chunk feed. Infinitely better than a chunk
+/// feed that stopped on Saturday.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveLevel2Volume {
+    pub site: String,
+    pub object: S3Object,
+    /// Volume START time, parsed from the key, so it means exactly what
+    /// [`RealtimeLevel2Volume::volume_time`] means and the two can be compared
+    /// to decide which source is ahead.
+    pub volume_time: DateTime<Utc>,
+}
+
+impl ArchiveLevel2Volume {
+    pub fn key(&self) -> &str {
+        &self.object.key
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.object.size
+    }
+
+    /// When the bucket received this volume, as opposed to when the radar
+    /// started scanning it. The gap between the two IS the archive's latency
+    /// and is worth reporting rather than hiding.
+    pub fn uploaded_at(&self) -> Option<DateTime<Utc>> {
+        self.object.last_modified
+    }
+
+    /// How far behind `now` this volume's start time is. See [`volume_age_at`].
+    pub fn age_at(&self, now: DateTime<Utc>) -> Duration {
+        volume_age_at(self.volume_time, now)
+    }
+
+    /// The AGE verdict on this volume - [`FeedFreshness::Current`] or
+    /// [`FeedFreshness::Stalled`], never [`FeedFreshness::ArchiveFallback`],
+    /// which is a statement about which source a session chose and belongs to
+    /// the session.
+    pub fn freshness_at(&self, now: DateTime<Utc>) -> FeedFreshness {
+        classify_feed_age(self.age_at(now))
+    }
+}
+
+/// The newest complete volume the archive bucket holds for `site`.
+///
+/// Fails with [`DataSourceError::NoObjects`] when today and yesterday are both
+/// empty for this radar, which for a live session means the archive has
+/// nothing to offer either.
+pub fn latest_archive_level2_volume(site: &str) -> Result<ArchiveLevel2Volume> {
+    let site = site.to_ascii_uppercase();
+    archive_level2_volume_newer_than(&site, Utc::now(), None)?.ok_or_else(|| {
+        DataSourceError::NoObjects {
+            bucket: LEVEL2_ARCHIVE_BUCKET.to_owned(),
+            prefix: site,
+        }
+    })
+}
+
+/// The newest archive volume for `site`, or `None` when nothing newer than
+/// `known_newest` exists.
+///
+/// Two questions in one function because they are the same listing asked from
+/// two starting points, and a poll loop only ever asks the second:
+///
+/// * `known_newest: None` is a cold start - "what is the newest thing here" -
+///   and pays for the widening walk below.
+/// * `known_newest: Some(t)` is the steady state - "has anything appeared
+///   since t" - and `start-after` makes that the cheapest question S3 answers.
+///   A poll that finds nothing new moves an empty listing envelope, not a day
+///   of keys, which is what makes a 30 s cadence affordable for hours.
+///
+/// THE UTC DAY BOUNDARY. Keys are day-parted by the volume's START time, so at
+/// 00:04Z today's prefix legitimately holds nothing and the newest volume in
+/// existence is under yesterday's. The walk is today (windowed), then today
+/// (whole), then yesterday, and the order matters: anything under today's
+/// prefix necessarily started after midnight and is therefore newer than
+/// anything under yesterday's, so a hit on today is final and yesterday is
+/// only ever consulted when today is genuinely empty.
+///
+/// With `known_newest` set the widening is skipped entirely: an empty
+/// `start-after` listing then means "nothing newer", full stop, and re-listing
+/// the whole day to rediscover a volume already in hand would cost 90 KB per
+/// poll to learn nothing. The one extra listing it does make is yesterday's,
+/// and only while the volume in hand is still yesterday's - see
+/// [`archive_listing_plan`], which is where every calendar case lives.
+pub fn archive_level2_volume_newer_than(
+    site: &str,
+    now: DateTime<Utc>,
+    known_newest: Option<DateTime<Utc>>,
+) -> Result<Option<ArchiveLevel2Volume>> {
+    let site = site.to_ascii_uppercase();
+    for step in archive_listing_plan(&site, now, known_newest) {
+        let objects = list_archive_day(&site, step.date, step.start_after.as_deref())?;
+        if let Some(volume) = newest_archive_volume(&site, objects, known_newest) {
+            return Ok(Some(volume));
+        }
+    }
+    Ok(None)
+}
+
+/// One listing in an archive poll's plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchiveListingStep {
+    date: NaiveDate,
+    /// S3's `start-after`, or `None` to list the whole day prefix.
+    start_after: Option<String>,
+}
+
+/// The listings one archive poll will make, in order, stopping at the first
+/// that answers.
+///
+/// Separated from the requests themselves because every hard case here is a
+/// CALENDAR case - midnight, the last volume of a day arriving after midnight,
+/// a site quiet for hours - and a calendar case that can only be exercised by
+/// waiting for midnight is a case that never gets exercised. This function
+/// takes its clock as an argument and returns data, so those cases are unit
+/// tests.
+///
+/// Stopping at the first answer is sound because the plan is ordered
+/// newest-prefix-first and a day prefix holds only volumes that STARTED that
+/// day: anything under today's prefix is necessarily newer than anything under
+/// yesterday's.
+fn archive_listing_plan(
+    site: &str,
+    now: DateTime<Utc>,
+    known_newest: Option<DateTime<Utc>>,
+) -> Vec<ArchiveListingStep> {
+    let today = now.date_naive();
+    let Some(known) = known_newest else {
+        // Cold. Widen: a two-hour window on today (the cheap question), then
+        // the whole of today, then yesterday. The second step is skipped when
+        // the window could not be expressed, because the first listing then
+        // already WAS the whole day and repeating it would be a wasted
+        // request.
+        let window_start = now - Duration::minutes(ARCHIVE_RECENT_WINDOW_MINUTES);
+        let windowed = archive_start_after_key(site, today, window_start);
+        let widen = windowed.is_some();
+        let mut plan = vec![ArchiveListingStep {
+            date: today,
+            start_after: windowed,
+        }];
+        if widen {
+            plan.push(ArchiveListingStep {
+                date: today,
+                start_after: None,
+            });
+        }
+        plan.push(ArchiveListingStep {
+            date: today - Duration::days(1),
+            start_after: None,
+        });
+        return plan;
+    };
+
+    // Warm - "anything newer than what I hold?" - which is one listing, and
+    // usually an empty one, which is what makes a 30 s cadence affordable for
+    // hours.
+    let mut plan = vec![ArchiveListingStep {
+        date: today,
+        start_after: archive_start_after_key(site, today, known),
+    }];
+
+    // THE DAY BOUNDARY, from the other side. A volume already in hand from
+    // yesterday does not stop yesterday's prefix from receiving one more: a
+    // volume that STARTS at 23:58Z is uploaded four to nine minutes later,
+    // which is tomorrow. Listing only today would leave that volume
+    // undiscoverable for ever, because the day it belongs to is one this walk
+    // would never look at again. It costs a second listing only until the
+    // first volume of the new day appears, which is minutes.
+    let known_day = known.date_naive();
+    if known_day < today {
+        plan.push(ArchiveListingStep {
+            date: known_day,
+            start_after: archive_start_after_key(site, known_day, known),
+        });
+    }
+    plan
+}
+
+/// `YYYY/MM/DD/SITE/` - the archive bucket's one and only layout.
+fn archive_day_prefix(site: &str, date: NaiveDate) -> String {
+    format!(
+        "{:04}/{:02}/{:02}/{}/",
+        date.year(),
+        date.month(),
+        date.day(),
+        site
+    )
+}
+
+/// The `start-after` key that limits a day listing to volumes that started
+/// after `from`, or `None` when no such key exists for this prefix.
+///
+/// S3 compares `start-after` as a plain string against the keys in the bucket,
+/// and archive keys embed their own date - `2026/08/19/KUEX/KUEX20260819_...` -
+/// so a key built from a DIFFERENT day would sort outside the prefix entirely
+/// and silently return either everything or nothing. `None` means "no window
+/// is expressible here, list the prefix", which is the honest answer whenever
+/// `from` falls on another day: at 00:30Z a two-hour window starts at 22:30
+/// yesterday, and today's whole prefix is half an hour long anyway.
+fn archive_start_after_key(site: &str, date: NaiveDate, from: DateTime<Utc>) -> Option<String> {
+    if from.date_naive() != date {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        archive_day_prefix(site, date),
+        site,
+        from.format("%Y%m%d_%H%M%S")
+    ))
+}
+
+/// Every object under one day prefix, following truncation.
+fn list_archive_day(
+    site: &str,
+    date: NaiveDate,
+    start_after: Option<&str>,
+) -> Result<Vec<S3Object>> {
+    let prefix = archive_day_prefix(site, date);
+    let mut objects = Vec::new();
+    let mut continuation_token: Option<String> = None;
+    for _ in 0..ARCHIVE_LISTING_MAX_PAGES {
+        let listing = list_s3_request(&S3ListRequest {
+            bucket: LEVEL2_ARCHIVE_BUCKET,
+            prefix: &prefix,
+            continuation_token: continuation_token.as_deref(),
+            start_after,
+            ..S3ListRequest::default()
+        })?;
+        objects.extend(listing.contents);
+        match listing.next_continuation_token {
+            Some(token) => continuation_token = Some(token),
+            None => break,
+        }
+    }
+    Ok(objects)
+}
+
+/// The newest real volume in a listing, optionally requiring it to beat a
+/// volume already in hand.
+///
+/// Ordered by the time parsed out of the KEY rather than by the key itself or
+/// by `LastModified`. The key is the volume's start time and is what the rest
+/// of the app compares against; `LastModified` is when the upload finished,
+/// which for a late-arriving volume can order two volumes backwards.
+fn newest_archive_volume(
+    site: &str,
+    objects: Vec<S3Object>,
+    newer_than: Option<DateTime<Utc>>,
+) -> Option<ArchiveLevel2Volume> {
+    objects
+        .into_iter()
+        .filter(is_archive_volume_object)
+        .filter_map(|object| {
+            let volume_time = parse_level2_object_time_utc(&object.key)?;
+            Some(ArchiveLevel2Volume {
+                site: site.to_owned(),
+                object,
+                volume_time,
+            })
+        })
+        .filter(|volume| newer_than.is_none_or(|known| volume.volume_time > known))
+        .max_by(|left, right| {
+            left.volume_time
+                .cmp(&right.volume_time)
+                .then_with(|| left.object.key.cmp(&right.object.key))
+        })
+}
+
+/// Whether one listed object is a volume rather than a metadata companion or a
+/// zero-byte placeholder.
+fn is_archive_volume_object(object: &S3Object) -> bool {
+    object.size > 0 && !object.key.ends_with(ARCHIVE_METADATA_KEY_SUFFIX)
+}
+
+/// The volume start time carried by an archive key.
+///
+/// `2026/08/19/KUEX/KUEX20260819_184216_V06` -> 2026-08-19T18:42:16Z. Handles
+/// the compressed historical form (`..._V03.gz`) too, because the same key
+/// shape has been in use since the 1990s and an archive browser reaches back
+/// that far even though this fallback never looks past yesterday.
+pub fn parse_level2_object_time_utc(key: &str) -> Option<DateTime<Utc>> {
+    let name = key.rsplit('/').next()?;
+    let underscore = name.find('_')?;
+    if underscore < 8 || name.len() < underscore + 7 {
+        return None;
+    }
+    let date = &name[underscore - 8..underscore];
+    let time = &name[underscore + 1..underscore + 7];
+    if !date.bytes().all(|byte| byte.is_ascii_digit())
+        || !time.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let naive = NaiveDate::parse_from_str(date, "%Y%m%d")
+        .ok()?
+        .and_hms_opt(
+            time[0..2].parse().ok()?,
+            time[2..4].parse().ok()?,
+            time[4..6].parse().ok()?,
+        )?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+/// Fetch one archive volume into the same cache the realtime path writes to.
+pub fn download_archive_volume(
+    volume: &ArchiveLevel2Volume,
+    cache_dir: &Path,
+) -> Result<DownloadedObject> {
+    download_archive_volume_cancellable(volume, cache_dir, &|| false)
+}
+
+/// [`download_archive_volume`], abandoned mid-transfer when `cancelled` starts
+/// returning true.
+///
+/// Same contract as [`download_realtime_volume_cancellable`] and for the same
+/// reason: a whole volume is 6-17 MB, and bytes pulled after the analyst has
+/// switched radars are bytes spent on a result that can no longer be
+/// installed. The realtime path can only check between chunk batches because
+/// its unit of work is a chunk; an archive volume is ONE object, so the check
+/// happens inside the copy instead - see [`copy_cancellable`] - which makes
+/// this the finer-grained of the two.
+///
+/// The cache filename is the key's own basename (`KUEX20260819_184216_V06`),
+/// distinct from the realtime path's `KUEX20260819_184216_RT931_V06`, so the
+/// two sources can hold the same volume time in the same directory without
+/// either overwriting the other's file. Both are ordinary files to
+/// [`prune_live_cache`], which bounds the directory either way.
+pub fn download_archive_volume_cancellable(
+    volume: &ArchiveLevel2Volume,
+    cache_dir: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DownloadedObject> {
+    fs::create_dir_all(cache_dir)?;
+    let filename = archive_volume_cache_filename(volume);
+    let path = cache_dir.join(&filename);
+    let url = format!(
+        "https://{}.s3.amazonaws.com/{}",
+        LEVEL2_ARCHIVE_BUCKET, volume.object.key
+    );
+
+    // Size, not existence: a half-written file from a killed session must be
+    // re-fetched rather than decoded. The realtime path makes the same check
+    // against its assembled total.
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() == volume.object.size)
+        .unwrap_or(false)
+    {
+        return Ok(DownloadedObject {
+            object: volume.object.clone(),
+            path,
+            url,
+            cache_hit: true,
+        });
+    }
+
+    if cancelled() {
+        return Err(DataSourceError::ObjectDownloadCancelled {
+            key: volume.object.key.clone(),
+        });
+    }
+    download_s3_object_to_path_cancellable(
+        LEVEL2_ARCHIVE_BUCKET,
+        &volume.object,
+        &path,
+        cancelled,
+    )?;
+
+    Ok(DownloadedObject {
+        object: volume.object.clone(),
+        path,
+        url,
+        cache_hit: false,
+    })
+}
+
+fn archive_volume_cache_filename(volume: &ArchiveLevel2Volume) -> String {
+    volume
+        .object
+        .key
+        .rsplit('/')
+        .next()
+        .unwrap_or(&volume.object.key)
+        .to_owned()
 }
 
 pub fn download_realtime_volume(
@@ -1070,17 +1663,52 @@ fn list_s3_limited(
     continuation_token: Option<&str>,
     max_keys: Option<usize>,
 ) -> Result<S3Listing> {
-    let url = format!("https://{bucket}.s3.amazonaws.com/");
+    list_s3_request(&S3ListRequest {
+        bucket,
+        prefix,
+        delimiter,
+        continuation_token,
+        max_keys,
+        start_after: None,
+    })
+}
+
+/// One ListObjectsV2 call.
+///
+/// A struct rather than seven positional arguments, because `start-after` and
+/// `continuation-token` are both "where to resume" and swapping them at a call
+/// site would produce a listing that is wrong rather than one that fails.
+#[derive(Clone, Copy, Debug, Default)]
+struct S3ListRequest<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    delimiter: Option<&'a str>,
+    continuation_token: Option<&'a str>,
+    max_keys: Option<usize>,
+    /// Return only keys that sort strictly after this one. The archive
+    /// fallback's whole cost argument rests on it - see
+    /// [`archive_start_after_key`].
+    start_after: Option<&'a str>,
+}
+
+fn list_s3_request(request: &S3ListRequest<'_>) -> Result<S3Listing> {
+    let url = format!("https://{}.s3.amazonaws.com/", request.bucket);
     let client = metadata_http_client();
-    let mut query = vec![("list-type", "2".to_owned()), ("prefix", prefix.to_owned())];
-    if let Some(delimiter) = delimiter {
+    let mut query = vec![
+        ("list-type", "2".to_owned()),
+        ("prefix", request.prefix.to_owned()),
+    ];
+    if let Some(delimiter) = request.delimiter {
         query.push(("delimiter", delimiter.to_owned()));
     }
-    if let Some(token) = continuation_token {
+    if let Some(token) = request.continuation_token {
         query.push(("continuation-token", token.to_owned()));
     }
-    if let Some(max_keys) = max_keys {
+    if let Some(max_keys) = request.max_keys {
         query.push(("max-keys", max_keys.to_string()));
+    }
+    if let Some(start_after) = request.start_after {
+        query.push(("start-after", start_after.to_owned()));
     }
     let text = client
         .get(url)
@@ -1408,9 +2036,24 @@ fn append_realtime_chunks(
 /// retried, because a link that is actually dead should fail in one timeout
 /// rather than three.
 fn download_s3_object_to_path(bucket: &str, object: &S3Object, path: &Path) -> Result<()> {
+    download_s3_object_to_path_cancellable(bucket, object, path, &|| false)
+}
+
+/// [`download_s3_object_to_path`], abandoned mid-body when `cancelled` starts
+/// returning true.
+///
+/// A cancellation is not retriable - see [`is_retriable_download_error`] - so
+/// it leaves the loop on the first pass rather than making two more requests
+/// for a result nobody is waiting for.
+fn download_s3_object_to_path_cancellable(
+    bucket: &str,
+    object: &S3Object,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     let url = format!("https://{bucket}.s3.amazonaws.com/{}", object.key);
     for attempt in 1..=S3_OBJECT_DOWNLOAD_ATTEMPTS {
-        match download_s3_object_attempt(&url, object, path) {
+        match download_s3_object_attempt(&url, object, path, cancelled) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if attempt == S3_OBJECT_DOWNLOAD_ATTEMPTS || !is_retriable_download_error(&error) {
@@ -1431,6 +2074,9 @@ fn is_retriable_download_error(error: &DataSourceError) -> bool {
         // A body that ended early is the same fault as a dropped connection,
         // it just happened to close cleanly.
         DataSourceError::DownloadSizeMismatch { .. } => true,
+        // Asked for, and asking again would be worse.
+        DataSourceError::ObjectDownloadCancelled { .. }
+        | DataSourceError::DownloadCancelled { .. } => false,
         DataSourceError::Http(http) => {
             if http.is_timeout() {
                 return false;
@@ -1450,7 +2096,12 @@ fn is_retriable_download_error(error: &DataSourceError) -> bool {
     }
 }
 
-fn download_s3_object_attempt(url: &str, object: &S3Object, path: &Path) -> Result<()> {
+fn download_s3_object_attempt(
+    url: &str,
+    object: &S3Object,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     let url = url.to_owned();
     let mut response = download_http_client()
         .get(&url)
@@ -1458,8 +2109,17 @@ fn download_s3_object_attempt(url: &str, object: &S3Object, path: &Path) -> Resu
         .error_for_status()?;
     let temp_path = path.with_extension("download");
     let mut temp_file = fs::File::create(&temp_path)?;
-    let copied = io::copy(&mut response, &mut temp_file)?;
+    let copied = copy_cancellable(&mut response, &mut temp_file, cancelled)?;
     drop(temp_file);
+    let Some(copied) = copied else {
+        // The partial file goes: a `.download` of the wrong length is exactly
+        // what the size check above is there to reject, and leaving it would
+        // hand the next attempt a decision it does not need to make.
+        let _ = fs::remove_file(&temp_path);
+        return Err(DataSourceError::ObjectDownloadCancelled {
+            key: object.key.clone(),
+        });
+    };
     if copied != object.size {
         let _ = fs::remove_file(&temp_path);
         return Err(DataSourceError::DownloadSizeMismatch {
@@ -1473,6 +2133,45 @@ fn download_s3_object_attempt(url: &str, object: &S3Object, path: &Path) -> Resu
     }
     fs::rename(&temp_path, path)?;
     Ok(())
+}
+
+/// How much of a body one [`copy_cancellable`] block moves.
+///
+/// The trade is check frequency against syscall count. 64 KiB against an 11 MB
+/// archive volume is ~170 checks, so a cancellation lands within a few
+/// milliseconds of being raised, while the check itself - one relaxed atomic
+/// load in the caller's closure - is nothing beside the socket read that
+/// precedes it.
+const CANCELLABLE_COPY_BLOCK_BYTES: usize = 64 * 1024;
+
+/// [`io::copy`] with a cancellation check per block.
+///
+/// `Ok(None)` means the copy was abandoned; the caller owns what to do with
+/// the partial output, because only it knows where that output lives.
+fn copy_cancellable(
+    reader: &mut dyn io::Read,
+    writer: &mut dyn io::Write,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>> {
+    let mut buffer = vec![0_u8; CANCELLABLE_COPY_BLOCK_BYTES];
+    let mut copied = 0_u64;
+    loop {
+        if cancelled() {
+            return Ok(None);
+        }
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            // What `io::copy` does, and for the same reason: an interrupted
+            // read moved no bytes and is not a failure.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            return Ok(Some(copied));
+        }
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
 }
 
 fn metadata_http_client() -> reqwest::blocking::Client {
@@ -1527,6 +2226,8 @@ struct S3ListingXml {
     contents: Vec<S3ObjectXml>,
     #[serde(rename = "CommonPrefixes", default)]
     common_prefixes: Vec<CommonPrefixXml>,
+    #[serde(rename = "NextContinuationToken", default)]
+    next_continuation_token: Option<String>,
 }
 
 impl From<S3ListingXml> for S3Listing {
@@ -1534,6 +2235,7 @@ impl From<S3ListingXml> for S3Listing {
         Self {
             contents: value.contents.into_iter().map(Into::into).collect(),
             common_prefixes: value.common_prefixes.into_iter().map(Into::into).collect(),
+            next_continuation_token: value.next_continuation_token,
         }
     }
 }
@@ -1547,6 +2249,10 @@ struct CommonPrefix {
 struct S3Listing {
     contents: Vec<S3Object>,
     common_prefixes: Vec<CommonPrefix>,
+    /// Present exactly when the listing was truncated. Ignoring it would hand
+    /// back the OLDEST page of a large prefix, which for "what is newest" is
+    /// the wrong end - see [`ARCHIVE_LISTING_MAX_PAGES`].
+    next_continuation_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1637,7 +2343,7 @@ const FALLBACK_SITE_IDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{SecondsFormat, TimeZone};
 
     #[test]
     fn site_can_carry_location() {
@@ -1657,10 +2363,8 @@ mod tests {
 
     #[test]
     fn newest_cached_level2_path_ignores_partial_empty_and_mdm_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "genericradar-cache-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("genericradar-cache-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("test cache dir");
 
@@ -2671,6 +3375,106 @@ mod tests {
         }
     }
 
+    // --- feed staleness -----------------------------------------------------
+    //
+    // The values here are the two real feeds this was diagnosed against on
+    // 2026-08-19, not invented times. KUEX had stopped: its chunk prefix held
+    // one contiguous id run 1..=931 and the newest object anywhere under it was
+    // `KUEX/931/20260816-110802-003-I`, LastModified 2026-08-16T11:08:09Z.
+    // KOAX on the same machine at the same moment was publishing normally, with
+    // `KOAX20260819_162446_RT680_V06` in the live cache.
+
+    /// The volume time of the last thing KUEX ever published to the chunks
+    /// bucket, read off the key `KUEX/931/20260816-110802-003-I`.
+    fn kuex_last_volume_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 16, 11, 8, 2).unwrap()
+    }
+
+    /// The volume time of the KOAX volume the same session had just fetched.
+    fn koax_live_volume_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 19, 16, 24, 46).unwrap()
+    }
+
+    /// Wall clock at the moment that KOAX volume landed in the live cache -
+    /// the file's mtime, 09:27 local. Both feeds are judged at the same
+    /// instant, which is the whole point: one had just published, the other had
+    /// not published for three days.
+    fn observed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 19, 16, 27, 0).unwrap()
+    }
+
+    fn feed_volume(site: &str, volume_time: DateTime<Utc>) -> RealtimeLevel2Volume {
+        RealtimeLevel2Volume {
+            site: site.to_owned(),
+            volume_id: 931,
+            volume_time,
+            chunks: Vec::new(),
+            complete: false,
+            total_size: 0,
+        }
+    }
+
+    #[test]
+    fn the_stalled_kuex_feed_and_the_live_koax_feed_classify_differently() {
+        let now = observed_now();
+
+        let kuex = feed_volume("KUEX", kuex_last_volume_time());
+        assert_eq!(kuex.freshness_at(now), FeedFreshness::Stalled);
+        // Three days and change, which is what the analyst was shown as live.
+        assert_eq!(kuex.age_at(now).num_days(), 3);
+
+        let koax = feed_volume("KOAX", koax_live_volume_time());
+        assert_eq!(koax.freshness_at(now), FeedFreshness::Current);
+        assert_eq!(koax.age_at(now).num_minutes(), 2);
+    }
+
+    /// The threshold has to sit above the slowest healthy VCP and far below a
+    /// dead prefix. Both edges are pinned so a later tweak has to be deliberate.
+    #[test]
+    fn the_stall_threshold_clears_a_clear_air_vcp_and_catches_a_dead_prefix() {
+        assert_eq!(REALTIME_FEED_STALL_AFTER_SECONDS, 900);
+
+        // A clear-air VCP 31/32 volume takes about 10 minutes, and the age is
+        // measured from its start, so a healthy site legitimately sits this far
+        // behind. It must not be called stalled.
+        assert_eq!(
+            classify_feed_age(Duration::minutes(10)),
+            FeedFreshness::Current
+        );
+        // Plus a couple of minutes of publication and listing latency.
+        assert_eq!(
+            classify_feed_age(Duration::minutes(12)),
+            FeedFreshness::Current
+        );
+
+        // The edge itself, from both sides.
+        assert_eq!(
+            classify_feed_age(Duration::seconds(REALTIME_FEED_STALL_AFTER_SECONDS - 1)),
+            FeedFreshness::Current
+        );
+        assert_eq!(
+            classify_feed_age(Duration::seconds(REALTIME_FEED_STALL_AFTER_SECONDS)),
+            FeedFreshness::Stalled
+        );
+
+        // And the case that started this.
+        assert_eq!(classify_feed_age(Duration::days(3)), FeedFreshness::Stalled);
+        assert!(classify_feed_age(Duration::days(3)).is_stalled());
+    }
+
+    /// A radar clock a little ahead of this machine's must not produce a
+    /// negative age, which would read on a status line as a bug in the app.
+    #[test]
+    fn a_volume_time_ahead_of_wall_clock_ages_to_zero_rather_than_negative() {
+        let now = observed_now();
+        let ahead = now + Duration::seconds(4);
+        assert_eq!(volume_age_at(ahead, now), Duration::zero());
+        assert_eq!(
+            classify_feed_age(volume_age_at(ahead, now)),
+            FeedFreshness::Current
+        );
+    }
+
     // --- the bounded live cache (review §2.9) -------------------------------
 
     fn unique_cache_dir(label: &str) -> PathBuf {
@@ -2909,6 +3713,570 @@ mod tests {
                 bytes_after: 4_000,
             }
         );
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    // --- the archive fallback -----------------------------------------------
+    //
+    // Every fixture below is a key that really existed in
+    // `unidata-nexrad-level2` under `2026/08/19/KUEX/` when this was written,
+    // taken from the listing rather than invented: 262 `_V06` volumes of
+    // 6.1-16.7 MB and 18 `_V06_MDM` companions of ~720 KB.
+
+    fn archive_object(key: &str, size: u64) -> S3Object {
+        S3Object {
+            key: key.to_owned(),
+            size,
+            last_modified: None,
+        }
+    }
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("a fixed instant")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn archive_keys_carry_their_volume_start_time() {
+        assert_eq!(
+            parse_level2_object_time_utc("2026/08/19/KUEX/KUEX20260819_184216_V06")
+                .expect("a real key")
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-08-19T18:42:16Z"
+        );
+        // The metadata companion parses too - it is rejected by suffix, not by
+        // being unreadable, and a test that leaned on a parse failure would be
+        // testing the wrong guard.
+        assert_eq!(
+            parse_level2_object_time_utc("2026/08/19/KUEX/KUEX20260819_005712_V06_MDM")
+                .expect("a real MDM key")
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-08-19T00:57:12Z"
+        );
+        // The historical compressed form, for the archive browser rather than
+        // for this fallback.
+        assert_eq!(
+            parse_level2_object_time_utc("2011/04/27/KBMX/KBMX20110427_221510_V03.gz")
+                .expect("a compressed key")
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2011-04-27T22:15:10Z"
+        );
+        assert!(parse_level2_object_time_utc("bad-key").is_none());
+        assert!(parse_level2_object_time_utc("2026/08/19/KUEX/").is_none());
+    }
+
+    /// The `_MDM` filter, against the exact trap it exists for: a metadata
+    /// companion sorts AFTER the volume it belongs to, so for the seven
+    /// minutes an hour when one is the last key written, "newest key wins"
+    /// returns 720 KB of metadata instead of a volume.
+    #[test]
+    fn the_newest_archive_volume_is_never_a_metadata_companion() {
+        let objects = vec![
+            archive_object("2026/08/19/KUEX/KUEX20260819_182848_V06", 16_330_036),
+            archive_object("2026/08/19/KUEX/KUEX20260819_183532_V06", 16_294_377),
+            archive_object("2026/08/19/KUEX/KUEX20260819_184216_V06", 11_382_988),
+            archive_object("2026/08/19/KUEX/KUEX20260819_184216_V06_MDM", 721_898),
+            // A zero-byte key is the other thing a listing can hand back.
+            archive_object("2026/08/19/KUEX/KUEX20260819_184900_V06", 0),
+        ];
+        let newest = newest_archive_volume("KUEX", objects, None).expect("a volume");
+        assert_eq!(newest.key(), "2026/08/19/KUEX/KUEX20260819_184216_V06");
+        assert_eq!(newest.total_size(), 11_382_988);
+        assert_eq!(
+            newest
+                .volume_time
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-08-19T18:42:16Z"
+        );
+        assert_eq!(newest.site, "KUEX");
+    }
+
+    /// The steady-state question a stalled session asks every 30 s: "anything
+    /// newer than what I already have?"
+    #[test]
+    fn a_listing_with_nothing_newer_answers_none() {
+        let objects = vec![
+            archive_object("2026/08/19/KUEX/KUEX20260819_183532_V06", 16_294_377),
+            archive_object("2026/08/19/KUEX/KUEX20260819_184216_V06", 11_382_988),
+        ];
+        let known = at("2026-08-19T18:42:16Z");
+        assert!(newest_archive_volume("KUEX", objects.clone(), Some(known)).is_none());
+
+        let older = at("2026-08-19T18:35:32Z");
+        assert_eq!(
+            newest_archive_volume("KUEX", objects, Some(older))
+                .expect("the next volume")
+                .key(),
+            "2026/08/19/KUEX/KUEX20260819_184216_V06"
+        );
+    }
+
+    /// THE UTC DAY BOUNDARY, which is where a day-parted bucket bites.
+    ///
+    /// At 00:04Z the newest volume in existence is usually under YESTERDAY's
+    /// prefix, and the two-hour window that makes a routine listing cheap
+    /// starts on yesterday's date - so the `start-after` key it would build
+    /// carries the wrong date and would sort outside the prefix. `None` is the
+    /// only correct answer there, and it is what sends the walk on to the
+    /// whole-day and then the previous-day listing.
+    #[test]
+    fn the_listing_window_gives_up_at_the_day_boundary_instead_of_guessing() {
+        // New year's morning, four minutes in: the day, the month and the year
+        // all roll over between the window's start and `now`.
+        let now = at("2026-01-01T00:04:00Z");
+        let today = now.date_naive();
+        let window_start = now - Duration::minutes(ARCHIVE_RECENT_WINDOW_MINUTES);
+        assert_eq!(
+            window_start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2025-12-31T22:04:00Z"
+        );
+        assert_eq!(archive_day_prefix("KUEX", today), "2026/01/01/KUEX/");
+        assert_eq!(
+            archive_day_prefix("KUEX", today - Duration::days(1)),
+            "2025/12/31/KUEX/"
+        );
+        assert_eq!(
+            archive_start_after_key("KUEX", today, window_start),
+            None,
+            "a window that starts on another day cannot be expressed here"
+        );
+
+        // Later the same day the window is expressible again, and this is the
+        // ordering claim the whole cost argument rests on: the key sorts after
+        // everything older than the window and before everything inside it.
+        let now = at("2026-01-01T18:49:00Z");
+        let window_start = now - Duration::minutes(ARCHIVE_RECENT_WINDOW_MINUTES);
+        let start_after =
+            archive_start_after_key("KUEX", today, window_start).expect("same-day window");
+        assert_eq!(start_after, "2026/01/01/KUEX/KUEX20260101_164900");
+        assert!(start_after.as_str() > "2026/01/01/KUEX/KUEX20260101_164859_V06");
+        assert!(start_after.as_str() < "2026/01/01/KUEX/KUEX20260101_164901_V06");
+        // And an `_MDM` inside the window still comes back from S3 - the
+        // window is not the filter, `is_archive_volume_object` is.
+        assert!(start_after.as_str() < "2026/01/01/KUEX/KUEX20260101_184216_V06_MDM");
+    }
+
+    /// The steady-state poll is ONE listing, and that is the number the
+    /// fallback's cadence argument is built on: a stall lasting hours must not
+    /// cost a day of keys every 30 s.
+    #[test]
+    fn a_warm_archive_poll_lists_exactly_one_prefix() {
+        let plan = archive_listing_plan(
+            "KUEX",
+            at("2026-08-19T18:49:00Z"),
+            Some(at("2026-08-19T18:42:16Z")),
+        );
+        assert_eq!(
+            plan,
+            vec![ArchiveListingStep {
+                date: NaiveDate::from_ymd_opt(2026, 8, 19).expect("a real date"),
+                start_after: Some("2026/08/19/KUEX/KUEX20260819_184216".to_owned()),
+            }]
+        );
+    }
+
+    /// A cold poll in the middle of the day widens at most twice, so the worst
+    /// entry into the fallback is three listings and not a walk back through
+    /// the archive.
+    #[test]
+    fn a_cold_archive_poll_widens_at_most_twice() {
+        let plan = archive_listing_plan("KUEX", at("2026-08-19T18:49:00Z"), None);
+        let today = NaiveDate::from_ymd_opt(2026, 8, 19).expect("a real date");
+        assert_eq!(
+            plan,
+            vec![
+                ArchiveListingStep {
+                    date: today,
+                    start_after: Some("2026/08/19/KUEX/KUEX20260819_164900".to_owned()),
+                },
+                ArchiveListingStep {
+                    date: today,
+                    start_after: None,
+                },
+                ArchiveListingStep {
+                    date: NaiveDate::from_ymd_opt(2026, 8, 18).expect("a real date"),
+                    start_after: None,
+                },
+            ]
+        );
+    }
+
+    /// MIDNIGHT, COLD. Four minutes into a new day today's prefix holds
+    /// nothing, and the two-hour window cannot be expressed against it, so the
+    /// widening step collapses and yesterday is reached in two listings rather
+    /// than three.
+    #[test]
+    fn a_cold_archive_poll_after_midnight_reaches_yesterday() {
+        let plan = archive_listing_plan("KUEX", at("2026-01-01T00:04:00Z"), None);
+        assert_eq!(
+            plan,
+            vec![
+                ArchiveListingStep {
+                    date: NaiveDate::from_ymd_opt(2026, 1, 1).expect("a real date"),
+                    start_after: None,
+                },
+                ArchiveListingStep {
+                    date: NaiveDate::from_ymd_opt(2025, 12, 31).expect("a real date"),
+                    start_after: None,
+                },
+            ],
+            "the year rolls over too"
+        );
+    }
+
+    /// MIDNIGHT, WARM - the case a today-only poll loses data on.
+    ///
+    /// A volume that STARTS at 23:58Z is uploaded four to nine minutes later,
+    /// which is tomorrow. A session holding yesterday's 23:52 volume and
+    /// listing only today's prefix would never see it: today is empty for the
+    /// first minutes of the day, and by the time today answers, yesterday is a
+    /// prefix this walk never looks at again. So yesterday stays in the plan -
+    /// with a `start-after`, so it costs an envelope and not a day - until the
+    /// volume in hand is one of today's.
+    #[test]
+    fn a_warm_archive_poll_after_midnight_still_watches_yesterday() {
+        let plan = archive_listing_plan(
+            "KUEX",
+            at("2026-01-01T00:04:00Z"),
+            Some(at("2025-12-31T23:52:10Z")),
+        );
+        assert_eq!(
+            plan,
+            vec![
+                ArchiveListingStep {
+                    date: NaiveDate::from_ymd_opt(2026, 1, 1).expect("a real date"),
+                    start_after: None,
+                },
+                ArchiveListingStep {
+                    date: NaiveDate::from_ymd_opt(2025, 12, 31).expect("a real date"),
+                    start_after: Some("2025/12/31/KUEX/KUEX20251231_235210".to_owned()),
+                },
+            ]
+        );
+
+        // And the moment a volume from the new day is in hand, yesterday drops
+        // out again: one listing per poll for the rest of the day.
+        let plan = archive_listing_plan(
+            "KUEX",
+            at("2026-01-01T00:12:00Z"),
+            Some(at("2026-01-01T00:03:40Z")),
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].date,
+            NaiveDate::from_ymd_opt(2026, 1, 1).expect("a real date")
+        );
+    }
+
+    #[test]
+    fn a_days_prefix_is_zero_padded() {
+        assert_eq!(
+            archive_day_prefix(
+                "KOAX",
+                NaiveDate::from_ymd_opt(2026, 8, 3).expect("a real date")
+            ),
+            "2026/08/03/KOAX/"
+        );
+    }
+
+    #[test]
+    fn cancellable_copy_stops_when_asked_and_copies_everything_when_not() {
+        let source = vec![7_u8; CANCELLABLE_COPY_BLOCK_BYTES * 3 + 11];
+
+        let mut sink = Vec::new();
+        let copied = copy_cancellable(&mut source.as_slice(), &mut sink, &|| false)
+            .expect("an uninterrupted copy");
+        assert_eq!(copied, Some(source.len() as u64));
+        assert_eq!(sink.len(), source.len());
+
+        // Cancelled before the first read: nothing moves at all.
+        let mut sink = Vec::new();
+        assert_eq!(
+            copy_cancellable(&mut source.as_slice(), &mut sink, &|| true).expect("a clean stop"),
+            None
+        );
+        assert!(sink.is_empty());
+
+        // Cancelled after the first block: the abandon is bounded by the block
+        // size rather than by the length of the body.
+        let mut sink = Vec::new();
+        let blocks = std::cell::Cell::new(0_u32);
+        assert_eq!(
+            copy_cancellable(&mut source.as_slice(), &mut sink, &|| {
+                let seen = blocks.get();
+                blocks.set(seen + 1);
+                seen > 0
+            })
+            .expect("a mid-body stop"),
+            None
+        );
+        assert_eq!(sink.len(), CANCELLABLE_COPY_BLOCK_BYTES);
+    }
+
+    /// A cached archive volume costs no request, which is what keeps a
+    /// re-entered fallback (or a session restart) from paying for the same
+    /// 11 MB twice.
+    #[test]
+    fn a_cached_archive_volume_is_a_cache_hit_without_a_request() {
+        let cache_dir = unique_cache_dir("archive-cache-hit");
+        let volume = ArchiveLevel2Volume {
+            site: "KUEX".to_owned(),
+            object: archive_object("2026/08/19/KUEX/KUEX20260819_184216_V06", 4_096),
+            volume_time: at("2026-08-19T18:42:16Z"),
+        };
+        fs::write(cache_dir.join("KUEX20260819_184216_V06"), vec![0_u8; 4_096])
+            .expect("a cached volume file");
+
+        let downloaded = download_archive_volume(&volume, &cache_dir).expect("cache hit");
+        assert!(downloaded.cache_hit);
+        assert_eq!(
+            downloaded.path.file_name().and_then(|name| name.to_str()),
+            Some("KUEX20260819_184216_V06"),
+            "the archive file is named for its key, not for a realtime volume id"
+        );
+        assert_eq!(
+            downloaded.url,
+            "https://unidata-nexrad-level2.s3.amazonaws.com/2026/08/19/KUEX/KUEX20260819_184216_V06"
+        );
+
+        // A file of the WRONG size is not a cache hit: a half-written volume
+        // decodes into garbage rather than failing.
+        fs::write(cache_dir.join("KUEX20260819_184216_V06"), vec![0_u8; 4_000])
+            .expect("a truncated volume file");
+        let err = download_archive_volume_cancellable(&volume, &cache_dir, &|| true)
+            .expect_err("a truncated cache entry must be re-fetched, and this fetch is cancelled");
+        assert!(
+            matches!(err, DataSourceError::ObjectDownloadCancelled { ref key }
+                if key == "2026/08/19/KUEX/KUEX20260819_184216_V06"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    /// PROVE IT ON THE REAL BUCKET. Asks both sources for the same radars and
+    /// prints what each says, so "the archive is current while the chunks feed
+    /// is dead" is a measurement rather than a claim.
+    ///
+    /// Ignored because it needs the network. `RADAR_LIVE_SITES` overrides the
+    /// list. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     the_archive_answers_for_a_radar_whose_chunk_feed_has_stopped
+    /// ```
+    #[test]
+    #[ignore = "lists both real NEXRAD buckets"]
+    fn the_archive_answers_for_a_radar_whose_chunk_feed_has_stopped() {
+        let sites = std::env::var("RADAR_LIVE_SITES").unwrap_or_else(|_| "KUEX,KOAX".to_owned());
+        for site in sites.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let now = Utc::now();
+            let chunks = latest_realtime_level2_volume(site);
+            let archive = latest_archive_level2_volume(site);
+
+            match &chunks {
+                Ok(volume) => println!(
+                    "{site} chunks   id {:>3} at {} · {:>4} s old · {:?}",
+                    volume.volume_id,
+                    volume
+                        .volume_time
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                    volume.age_at(now).num_seconds(),
+                    volume.freshness_at(now),
+                ),
+                Err(error) => println!("{site} chunks   unavailable: {error}"),
+            }
+            match &archive {
+                Ok(volume) => println!(
+                    "{site} archive  {} at {} · {:>4} s old · {:?} · {:.1} MiB · uploaded {}",
+                    volume.key().rsplit('/').next().unwrap_or_default(),
+                    volume
+                        .volume_time
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                    volume.age_at(now).num_seconds(),
+                    volume.freshness_at(now),
+                    volume.total_size() as f64 / (1_024.0 * 1_024.0),
+                    volume
+                        .uploaded_at()
+                        .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                ),
+                Err(error) => println!("{site} archive  unavailable: {error}"),
+            }
+
+            let archive = archive.unwrap_or_else(|error| panic!("{site} archive: {error}"));
+            assert!(
+                archive.age_at(now).num_seconds() >= 0,
+                "an archive volume cannot start in the future"
+            );
+            if let Ok(chunks) = chunks
+                && chunks.freshness_at(now).is_stalled()
+            {
+                // NOT a strict `>`. A radar that is genuinely off the air
+                // stops both pipes on the same scan, so the two times being
+                // EQUAL is the correct, expected reading for a down site -
+                // and the fallback declining to switch is the correct
+                // response to it. What must never happen is the archive
+                // sitting BEHIND the feed it is offered as a repair for.
+                assert!(
+                    archive.volume_time >= chunks.volume_time,
+                    "{site}: the archive is behind the stalled chunk feed"
+                );
+                let lead = (archive.volume_time - chunks.volume_time).num_seconds();
+                if lead > 0 {
+                    println!("{site} FALLBACK EARNED: archive is {lead} s ahead of the chunk feed");
+                } else {
+                    println!(
+                        "{site} RADAR IS DOWN: both pipes stopped on the same scan, \
+                         so there is nothing to fall back TO"
+                    );
+                }
+            }
+            println!();
+        }
+    }
+
+    /// THE DAY BOUNDARY, ON THE REAL BUCKET.
+    ///
+    /// At 00:03Z today's prefix is empty and the newest volume in existence is
+    /// under yesterday's - a shape that cannot be waited for in a test, but
+    /// can be borrowed: TOMORROW's prefix is empty for exactly the same reason
+    /// that today's is empty just after midnight. So the walk is asked to find
+    /// a volume as of tomorrow 00:03Z, and the only way it can answer is by
+    /// reaching back a day, with a `start-after` key built from a volume it
+    /// already holds.
+    ///
+    /// Ignored because it needs the network. Run it with:
+    ///
+    /// ```text
+    /// cargo test --release -p data_source -- --ignored --nocapture \
+    ///     the_day_boundary_walk_reaches_yesterday_on_the_real_bucket
+    /// ```
+    #[test]
+    #[ignore = "lists the real Level II archive bucket across a day boundary"]
+    fn the_day_boundary_walk_reaches_yesterday_on_the_real_bucket() {
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KUEX".to_owned());
+        let newest = latest_archive_level2_volume(&site).expect("a volume today");
+        // Something real and earlier the same day, so the `start-after` key is
+        // built from a volume time the bucket actually contains.
+        let known = newest.volume_time - Duration::minutes(30);
+
+        let next_midnight = (newest.volume_time.date_naive() + Duration::days(1))
+            .and_hms_opt(0, 3, 0)
+            .expect("a real instant");
+        let as_of = DateTime::<Utc>::from_naive_utc_and_offset(next_midnight, Utc);
+        assert_eq!(
+            archive_listing_plan(&site, as_of, Some(known)).len(),
+            2,
+            "the plan must list the empty new day AND the day the volume came from"
+        );
+
+        let found = archive_level2_volume_newer_than(&site, as_of, Some(known))
+            .expect("the walk")
+            .expect("a volume from the previous day");
+        println!(
+            "{site} as of {}: today's prefix is empty, walk found {}",
+            as_of.to_rfc3339_opts(SecondsFormat::Secs, true),
+            found.key()
+        );
+        assert_eq!(
+            found.key(),
+            newest.key(),
+            "the walk must find the same newest volume the ordinary path finds"
+        );
+        assert!(found.volume_time > known);
+    }
+
+    /// THE `_MDM` TRAP, ON REAL KEYS.
+    ///
+    /// A metadata companion sorts immediately after the volume it belongs to,
+    /// so for the minutes after one is written, the last key under the prefix
+    /// is 720 KB of metadata rather than a 6-17 MB volume. This takes the real
+    /// listing and cuts it at exactly that moment.
+    #[test]
+    #[ignore = "lists the real Level II archive bucket"]
+    fn a_real_listing_cut_at_a_metadata_companion_still_answers_with_a_volume() {
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KUEX".to_owned());
+        let today = Utc::now().date_naive();
+        let objects = list_archive_day(&site, today, None).expect("today's prefix");
+        let cut = objects
+            .iter()
+            .rposition(|object| object.key.ends_with(ARCHIVE_METADATA_KEY_SUFFIX))
+            .unwrap_or_else(|| {
+                panic!("{site}: no _MDM companion under today's prefix - nothing to trap")
+            });
+        let truncated = objects[..=cut].to_vec();
+        let last = truncated.last().expect("the cut key").clone();
+        println!(
+            "{site} listing cut after {} ({} bytes)",
+            last.key, last.size
+        );
+        assert!(last.key.ends_with(ARCHIVE_METADATA_KEY_SUFFIX));
+
+        let newest = newest_archive_volume(&site, truncated, None).expect("a volume");
+        println!("{site} newest volume chosen: {}", newest.key());
+        assert!(
+            !newest.key().ends_with(ARCHIVE_METADATA_KEY_SUFFIX),
+            "the fallback would have downloaded a metadata blob as a radar volume"
+        );
+        assert_eq!(
+            newest.volume_time,
+            parse_level2_object_time_utc(&last.key).expect("the companion's own time"),
+            "the volume the companion belongs to is the newest one, and it is what wins"
+        );
+    }
+
+    /// CANCELLATION MID-TRANSFER, ON A REAL 10 MB OBJECT.
+    ///
+    /// The unit test for [`copy_cancellable`] proves the loop; this proves the
+    /// contract end to end against the bucket: an analyst who switches radar
+    /// during an archive fetch stops paying for it within one 64 KiB block,
+    /// and nothing half-written is left where a later poll could mistake it
+    /// for a cached volume.
+    #[test]
+    #[ignore = "starts a real archive download and abandons it"]
+    fn a_real_archive_download_stops_when_the_session_ends() {
+        let site = std::env::var("RADAR_LIVE_SITE").unwrap_or_else(|_| "KUEX".to_owned());
+        let volume = latest_archive_level2_volume(&site).expect("a volume today");
+        let cache_dir = unique_cache_dir("archive-cancel");
+        let filename = archive_volume_cache_filename(&volume);
+
+        let blocks = std::sync::atomic::AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+        let error = download_archive_volume_cancellable(&volume, &cache_dir, &|| {
+            blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3
+        })
+        .expect_err("the transfer must be abandoned");
+        let elapsed = started.elapsed();
+
+        println!(
+            "{site} abandoned {} ({:.1} MiB) after {} blocks in {:.0} ms: {error}",
+            volume.key(),
+            volume.total_size() as f64 / (1_024.0 * 1_024.0),
+            blocks.load(std::sync::atomic::Ordering::Relaxed),
+            elapsed.as_secs_f64() * 1_000.0,
+        );
+        assert!(
+            matches!(error, DataSourceError::ObjectDownloadCancelled { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            blocks.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+            "the copy has to have actually started moving the body"
+        );
+        assert!(
+            !cache_dir.join(&filename).exists(),
+            "a cancelled transfer must not leave a volume file"
+        );
+        assert!(
+            !cache_dir
+                .join(&filename)
+                .with_extension("download")
+                .exists(),
+            "nor a partial one for the next attempt to trip over"
+        );
+
         let _ = fs::remove_dir_all(&cache_dir);
     }
 }

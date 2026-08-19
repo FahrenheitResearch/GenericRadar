@@ -181,7 +181,18 @@ fn main() -> eframe::Result {
         Box::new(move |creation_context| {
             // The visual theme, before anything draws: every widget of the
             // first frame styles itself from the context this call fills in.
-            theme::apply(&creation_context.egui_ctx, theme::Variant::Dark);
+            // The Win95-grey daylight bench is the app's identity and the
+            // default; the stored choice - set in Settings > Appearance -
+            // wins when present. Applied before the first frame so the app
+            // never flashes the wrong chrome.
+            let variant = match store.value(
+                crate::settings_ui::catalog::keys::appearance::CATEGORY,
+                crate::settings_ui::catalog::keys::appearance::THEME,
+            ) {
+                Some(settings::SettingValue::Text(text)) if text == "dark" => theme::Variant::Dark,
+                _ => theme::Variant::Light,
+            };
+            theme::apply(&creation_context.egui_ctx, variant);
             // Register the map's persistent GPU resources once, before any
             // pane paints. Without a wgpu render state the map cannot draw at
             // all, so say so rather than silently falling back to per-frame

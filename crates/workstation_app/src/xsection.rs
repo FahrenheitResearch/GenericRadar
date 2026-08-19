@@ -83,6 +83,10 @@ pub struct XSection {
     /// Dealiased velocity tilts of the last volume touched, so an endpoint
     /// drag pays the dealias once per volume rather than once per frame.
     dealias: Option<build::DealiasMemo>,
+    /// What fills the column between the flown beams. Defaults to
+    /// [`render2d::xsection::SliceVerticalFill::Beams`] — the native picture,
+    /// one band per beam — with the smooth reconstruction one click away.
+    fill: render2d::xsection::SliceVerticalFill,
     /// One line of state for the window header.
     pub status: String,
 }
@@ -168,7 +172,17 @@ impl XSection {
             .show(context, |ui| {
                 draw::draw_window_contents(self, ui, input);
             });
-        self.open = open;
+        if open { self.open = true } else { self.close() }
+    }
+
+    /// The window was dismissed. Closing is walking away from the tool, so it
+    /// also puts the placement cursor down: leaving `armed` set would keep
+    /// stealing pane clicks after the window is gone, and every completed
+    /// pair of them would place a new line and reopen it.
+    fn close(&mut self) {
+        self.open = false;
+        self.armed = false;
+        self.pending_first = None;
     }
 }
 
@@ -389,7 +403,7 @@ mod build {
     use eframe::egui;
     use radar_core::{MomentGrid, MomentType, RadarVolume};
     use render2d::xsection::{
-        InterpPolicy, SliceRequest, SliceSmoothing, SliceVolume, sample_slice,
+        InterpPolicy, SliceRequest, SliceSmoothing, SliceVerticalFill, SliceVolume, sample_slice,
     };
 
     use super::{XSection, XSectionInput};
@@ -424,6 +438,11 @@ mod build {
         pub build_ms: f32,
         pub provenance: String,
         pub dealias: Option<DealiasMemo>,
+        /// Which vertical fill this picture is, so the texture is filtered
+        /// the way the picture wants: a beams slice is a grid of measured
+        /// bands and must be magnified with hard edges, a smooth slice is a
+        /// continuous field and may be interpolated.
+        pub fill: SliceVerticalFill,
     }
 
     /// What the last build was keyed on. Quantized so float jitter cannot
@@ -441,6 +460,10 @@ mod build {
         /// Storm motion in tenths of a degree and tenths of a m/s.
         storm: Option<(i32, i32)>,
         dealiased: bool,
+        /// Beams or smooth. In the key because the toggle must repaint: it
+        /// changes the picture without changing the volume, the line or the
+        /// palette, and nothing else here would notice.
+        fill: SliceVerticalFill,
     }
 
     /// Dealiased velocity tilts of one volume, indexed by cut. Costs on the
@@ -548,6 +571,7 @@ mod build {
         volume: &RadarVolume,
         input: &XSectionInput<'_>,
         line: super::SectionLine,
+        fill: SliceVerticalFill,
     ) -> SliceKey {
         let stamp = volume_stamp(volume);
         SliceKey {
@@ -570,6 +594,7 @@ mod build {
                 )
             }),
             dealiased: input.uses_dealiased_velocity,
+            fill,
         }
     }
 
@@ -586,16 +611,27 @@ mod build {
                 xs.rx = None;
                 xs.dealias = built.dealias.clone().or_else(|| xs.dealias.take());
                 xs.status = format!(
-                    "{} · {} tilts · {:.1} ms",
-                    built.provenance, built.tilts, built.build_ms
+                    "{} · {} tilts · {} · {:.1} ms",
+                    built.provenance,
+                    built.tilts,
+                    fill_label(built.fill),
+                    built.build_ms
                 );
+                // NEAREST for the beams picture: the slice raster is one
+                // sample per beam band, and magnifying it with a linear
+                // filter would smear the band edges back into the gradient
+                // the beams fill exists to remove.
+                let options = match built.fill {
+                    SliceVerticalFill::Beams => egui::TextureOptions::NEAREST,
+                    SliceVerticalFill::Interpolated => egui::TextureOptions::LINEAR,
+                };
                 match &mut xs.texture {
-                    Some(texture) => texture.set(built.image.clone(), egui::TextureOptions::LINEAR),
+                    Some(texture) => texture.set(built.image.clone(), options),
                     None => {
                         xs.texture = Some(context.load_texture(
                             "xsection-slice",
                             built.image.clone(),
-                            egui::TextureOptions::LINEAR,
+                            options,
                         ));
                     }
                 }
@@ -629,7 +665,8 @@ mod build {
             }
             return;
         };
-        let key = slice_key(volume, input, line);
+        let fill = xs.fill;
+        let key = slice_key(volume, input, line, fill);
         if xs.key.as_ref() == Some(&key) {
             return;
         }
@@ -637,52 +674,62 @@ mod build {
 
         let (sender, receiver) = mpsc::channel();
         xs.rx = Some(receiver);
-        let volume = Arc::clone(volume);
-        let moment = input.moment.clone();
-        let table = input.color_table.clone();
-        let storm_motion = input.storm_motion;
-        let dealiased = input.uses_dealiased_velocity;
-        let memo = xs.dealias.clone();
         let context = context.clone();
-        let request = SliceRequest {
-            start_km: (line.a_km.0 as f32, line.a_km.1 as f32),
-            end_km: (line.b_km.0 as f32, line.b_km.1 as f32),
-            width: SLICE_WIDTH,
-            height: SLICE_HEIGHT,
-            top_m: SLICE_TOP_M,
+        let job = BuildJob {
+            volume: Arc::clone(volume),
+            moment: input.moment.clone(),
+            table: input.color_table.clone(),
+            storm_motion: input.storm_motion,
+            dealiased: input.uses_dealiased_velocity,
+            memo: xs.dealias.clone(),
+            request: SliceRequest {
+                start_km: (line.a_km.0 as f32, line.a_km.1 as f32),
+                end_km: (line.b_km.0 as f32, line.b_km.1 as f32),
+                width: SLICE_WIDTH,
+                height: SLICE_HEIGHT,
+                top_m: SLICE_TOP_M,
+            },
+            fill,
         };
 
         thread::spawn(move || {
-            let built = build_slice(
-                &volume,
-                &moment,
-                &table,
-                storm_motion,
-                dealiased,
-                memo,
-                request,
-            );
-            if let Some(built) = built {
+            if let Some(built) = build_slice(job) {
                 let _ = sender.send(built);
             }
             context.request_repaint();
         });
     }
 
-    /// The worker body: dealias if the product needs it (memoised per volume
-    /// extent), sample, apply storm motion, colorize through the pane's
-    /// table.
-    fn build_slice(
-        volume: &Arc<RadarVolume>,
-        moment: &MomentType,
-        table: &color_tables::ColorTable,
+    /// Everything one background build owns. A struct rather than eight
+    /// arguments: the worker takes the whole job across the thread boundary,
+    /// so the job is the natural unit.
+    pub(super) struct BuildJob {
+        volume: Arc<RadarVolume>,
+        moment: MomentType,
+        table: color_tables::ColorTable,
         storm_motion: Option<render2d::StormMotion>,
         dealiased: bool,
         memo: Option<DealiasMemo>,
         request: SliceRequest,
-    ) -> Option<BuiltSlice> {
+        fill: SliceVerticalFill,
+    }
+
+    /// The worker body: dealias if the product needs it (memoised per volume
+    /// extent), sample, apply storm motion, colorize through the pane's
+    /// table.
+    fn build_slice(job: BuildJob) -> Option<BuiltSlice> {
+        let BuildJob {
+            volume,
+            moment,
+            table,
+            storm_motion,
+            dealiased,
+            memo,
+            request,
+            fill,
+        } = job;
         let started = Instant::now();
-        let stamp = volume_stamp(volume);
+        let stamp = volume_stamp(&volume);
 
         let memo = if dealiased {
             Some(match memo.filter(|memo| memo.stamp == stamp) {
@@ -708,20 +755,21 @@ mod build {
 
         let prepared = match &memo {
             Some(memo) => SliceVolume::from_indexed_grids(
-                volume,
+                &volume,
                 memo.grids
                     .iter()
                     .enumerate()
                     .filter_map(|(cut_index, grid)| grid.as_ref().map(|grid| (cut_index, grid))),
             ),
-            None => SliceVolume::from_volume(volume, moment),
+            None => SliceVolume::from_volume(&volume, &moment),
         };
         let tilts = prepared.tilt_count();
         let mut slice = sample_slice(
             &prepared,
             &request,
-            interp_policy(moment),
-            SliceSmoothing::Smoothed,
+            interp_policy(&moment),
+            SliceSmoothing::Native,
+            fill,
         )?;
 
         // Storm-relative: subtract the motion component along each column's
@@ -741,7 +789,7 @@ mod build {
             }
         }
 
-        let image = colorize(&slice, table);
+        let image = colorize(&slice, &table);
         let build_ms = started.elapsed().as_secs_f32() * 1_000.0;
         let provenance = format!(
             "{} {}",
@@ -755,7 +803,16 @@ mod build {
             build_ms,
             provenance,
             dealias: memo,
+            fill,
         })
+    }
+
+    /// How a fill mode is named in the header and on its button.
+    pub(super) fn fill_label(fill: SliceVerticalFill) -> &'static str {
+        match fill {
+            SliceVerticalFill::Beams => "beams",
+            SliceVerticalFill::Interpolated => "smooth",
+        }
     }
 
     /// Slice values through the pane's colour table. NaN — the radar saw
@@ -937,6 +994,52 @@ mod build {
             assert!(!xs.status.is_empty(), "the header states what happened");
         }
 
+        /// The toggle must repaint. Nothing else in the key moves when the
+        /// analyst switches Beams to Smooth — same volume, same line, same
+        /// palette — so if the fill were missing from the key the button
+        /// would do nothing at all.
+        #[test]
+        fn the_fill_mode_is_part_of_the_rebuild_key() {
+            let volume = volume("KUEX", 1_700_000_000, &[0.5, 1.5, 2.4]);
+            let tables = color_tables::ColorTableSet::default();
+            let domain = product_engine::ProductRegistry::builtin()
+                .get("REF")
+                .expect("REF exists")
+                .domain;
+            let candidates = [XsCandidate {
+                volume: &volume,
+                displayed: true,
+            }];
+            let input = XSectionInput {
+                candidates: &candidates,
+                moment: MomentType::Reflectivity,
+                product_label: "REF".to_owned(),
+                uses_dealiased_velocity: false,
+                storm_motion: None,
+                color_table: tables.for_family(color_tables::ColorTableFamily::Reflectivity),
+                domain,
+            };
+            let line = super::super::SectionLine {
+                a_km: (-20.0, 5.0),
+                b_km: (40.0, 12.0),
+            };
+            let beams = slice_key(&volume, &input, line, SliceVerticalFill::Beams);
+            let smooth = slice_key(&volume, &input, line, SliceVerticalFill::Interpolated);
+            assert_ne!(beams, smooth, "toggling the fill must schedule a rebuild");
+            assert_eq!(
+                beams,
+                slice_key(&volume, &input, line, SliceVerticalFill::Beams),
+                "nothing else about the key drifted"
+            );
+        }
+
+        #[test]
+        fn the_section_starts_in_the_native_beams_fill() {
+            assert_eq!(XSection::default().fill, SliceVerticalFill::Beams);
+            assert_eq!(fill_label(SliceVerticalFill::Beams), "beams");
+            assert_eq!(fill_label(SliceVerticalFill::Interpolated), "smooth");
+        }
+
         #[test]
         fn absent_cells_colorize_to_full_transparency() {
             let slice = render2d::xsection::Slice {
@@ -968,8 +1071,17 @@ mod build {
 /// nothing there.
 mod draw {
     use eframe::egui;
+    use render2d::xsection::SliceVerticalFill;
 
     use super::{XSection, XSectionInput, build};
+
+    /// The fill toggle's buttons. Height is the touch floor: the section
+    /// window is used on a tablet in the field, and a mode switch that a
+    /// fingertip cannot hit is a mode switch that does not exist. Plain
+    /// `egui::Button`s, so the application's theme restyles them with
+    /// everything else.
+    const TOGGLE_HEIGHT: f32 = 26.0;
+    const TOGGLE_WIDTH: f32 = 62.0;
 
     /// Margins around the plot, screen points.
     const AXIS_LEFT: f32 = 46.0;
@@ -1013,6 +1125,36 @@ mod draw {
             }
             if xs.line.is_some() && ui.button("Clear").clicked() {
                 xs.clear_line();
+            }
+            ui.separator();
+            // What fills the column between the flown beams. Beams is the
+            // default and the native picture; Smooth keeps the interpolated
+            // reconstruction one click away. Changing it re-keys the build,
+            // so the slice repaints without any other input changing.
+            for fill in [SliceVerticalFill::Beams, SliceVerticalFill::Interpolated] {
+                let selected = xs.fill == fill;
+                let (label, hover) = match fill {
+                    SliceVerticalFill::Beams => (
+                        "Beams",
+                        "Native: every pixel is the value of the beam that covered it. \
+                         Discrete beams with hard edges, and empty air where no beam looked.",
+                    ),
+                    SliceVerticalFill::Interpolated => (
+                        "Smooth",
+                        "Interpolated: linear in elevation angle between the beams \
+                         (Zhang, Howard & Gourley 2005). Continuous, but the smoothness \
+                         between beams is inference, not measurement.",
+                    ),
+                };
+                let response = ui
+                    .add_sized(
+                        [TOGGLE_WIDTH, TOGGLE_HEIGHT],
+                        egui::Button::selectable(selected, label),
+                    )
+                    .on_hover_text(hover);
+                if response.clicked() && !selected {
+                    xs.fill = fill;
+                }
             }
         });
         ui.separator();
@@ -1274,6 +1416,16 @@ mod draw {
             );
         }
 
+        /// The fill toggle is a field control: a fingertip has to hit it.
+        /// A const block, so shrinking the button refuses to even compile.
+        #[test]
+        fn the_fill_toggle_meets_the_touch_floor() {
+            const {
+                assert!(TOGGLE_HEIGHT >= 24.0);
+                assert!(TOGGLE_WIDTH >= 24.0);
+            }
+        }
+
         #[test]
         fn the_readout_reports_absence_as_absence() {
             let domain = product_engine::ProductRegistry::builtin()
@@ -1314,6 +1466,24 @@ mod tests {
             !xs.handle_pane_click((0.0, 0.0)),
             "after placement clicks pass through again"
         );
+    }
+
+    /// The field bug of 2026-08-19: close the window while armed, and every
+    /// later pane click kept placing endpoints - each completed pair reopening
+    /// the window with a line nobody asked for.
+    #[test]
+    fn closing_the_window_disarms_placement() {
+        let mut xs = XSection::default();
+        xs.toggle_armed();
+        xs.handle_pane_click((10.0, 5.0));
+        xs.close();
+        assert!(!xs.open && !xs.armed, "closing put the cursor down");
+        assert!(xs.pending_first.is_none(), "the half line went with it");
+        assert!(
+            !xs.handle_pane_click((40.0, -5.0)),
+            "clicks after closing belong to the panes again"
+        );
+        assert!(xs.line.is_none(), "no line appeared from beyond the grave");
     }
 
     #[test]

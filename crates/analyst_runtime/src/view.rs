@@ -903,7 +903,7 @@ mod tests {
         count
     }
 
-    /// The rate the owner was complaining about. Deliberate clicking is the
+    /// The rate that made zooming feel slow. Deliberate clicking is the
     /// SLOW end of the new response and it still beats the old one nearly
     /// fourfold; anything faster than clicking beats it by an order.
     #[test]

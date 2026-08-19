@@ -1,7 +1,7 @@
 //! The quick-zoom behaviour of the tile basemap, measured frame by frame on a
 //! real GPU against the real USGS provider.
 //!
-//! This is the diagnosis-and-proof harness for the owner's report that
+//! This is the diagnosis-and-proof harness for the report that
 //! satellite tiles "would be nice if they loaded either faster or more uniform
 //! when quick zooming in". It scripts exactly that gesture — three tile-zoom
 //! steps in about 700 ms over KTLX — through the shipping pipeline

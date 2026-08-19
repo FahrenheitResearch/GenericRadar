@@ -336,9 +336,9 @@ impl Default for Vol3d {
             // range left to grade and the box opened as a uniform translucent
             // slab; at 12 dBZ the weak echo becomes the cloud body and the
             // cores read as solid masses inside it - measured and LOOKED AT on
-            // KMKX 2026-08-18 20:31Z and KUDX 2026-08-19 04:37Z. The owner's
-            // requirement, verbatim: "having my 3d look like a realistic
-            // cloud is important to me."
+            // KMKX 2026-08-18 20:31Z and KUDX 2026-08-19 04:37Z. The point of
+            // the volumetric view is a storm that reads as a real cloud with
+            // solid cores, and only this threshold delivers that by default.
             threshold_dbz: 12.0,
             threshold_mode: Vol3dThresholdMode::Above,
             vel_ref_gate_dbz: 15.0,

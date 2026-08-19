@@ -1,6 +1,6 @@
-# Extending the Radar Workstation
+# Extending GenericRadar
 
-This is the white-label plumbing document: how a new capability — a data
+How a new capability — a data
 provider, a derived product, an overlay, a whole module ported from BowEcho —
 plugs into this workspace so that it appears in the application, appears in
 the master settings window, persists its state, and passes the gates. It is
@@ -30,7 +30,7 @@ Consequences, in order of use:
   (a) adding it to `workstation_app/Cargo.toml` **and** (b) adding its name,
   with a comment saying what capability it admits, to
   `ALLOWED_DIRECT_DEPENDENCIES` in `architecture.rs`. Both edits are a
-  deliberate owner decision — the firewall exists so this is never a drive-by.
+  deliberate maintainer decision — the firewall exists so this is never a drive-by.
   Precedent inside the allowlist: `product_engine` ("product meaning is
   declared once"), `rayon` (admitted "deliberately, and narrowly").
 * A crate that only *feeds* an existing capability goes behind the crate that
@@ -45,7 +45,7 @@ Consequences, in order of use:
 
 ---
 
-## 2. Declaring settings (the part that makes white-labelling real)
+## 2. Declaring settings
 
 Settings are **contributed, not centrally enumerated**. A category is plain
 data — `(id, label, list of typed items with ids, labels, ranges, defaults)` —

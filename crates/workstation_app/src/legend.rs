@@ -1603,7 +1603,7 @@ mod tests {
     /// VEL DVEL SRV DSRV          43.09
     /// ```
     ///
-    /// RHO is the bar the owner reported: 37.06 rather than 54, so the panel
+    /// RHO is the bar that motivated the change: 37.06 rather than 54, so the panel
     /// behind it is 45.06 instead of 62.0 and 17 points of radar come back. KDP
     /// proves the unit line has to be measured too - its widest tick label is
     /// "-2", a bar block of 31.03, but "deg/km" under the bar is 36.12 and that

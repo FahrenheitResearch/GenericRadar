@@ -446,7 +446,7 @@ fn the_hazard_tag_halo_is_the_panes_own_ground() {
 /// Everything else in this file starts from a `PaneMap` that already carries a
 /// chrome. The step before that - an operator opening the toolbar's basemap
 /// combo box and clicking a name - was the one part of the chain nobody had
-/// executed: `basemap_picker` had been verified by reading it and by an
+/// executed: `basemap_menu` had been verified by reading it and by an
 /// equivalence test on `MapStylePreset::for_style`, which is not the same as
 /// proving the widget fires. These click a real `egui::ComboBox` with
 /// synthetic pointer events and check what came out the far end.
@@ -460,7 +460,7 @@ mod the_picker_itself {
     /// Where a piece of text was drawn, if this frame drew it.
     ///
     /// Clicking a widget needs a point inside it, and a row's own label is the
-    /// only handle available from outside: neither `basemap_picker` nor
+    /// only handle available from outside: neither `basemap_menu` nor
     /// `ComboBox` hands back a rectangle, and hard-coding a guess at the
     /// popup's layout would be a test of egui's spacing constants rather than
     /// of the picker.
@@ -506,7 +506,7 @@ mod the_picker_itself {
             std::env::temp_dir().join("radar-workstation-chrome-tests-no-settings.json"),
         );
         let output = context.run_ui(input, |ui| {
-            crate::app_support::basemap_picker(ui, scene, &mut store);
+            crate::app_support::basemap_menu(ui, scene, &mut store);
         });
         output.shapes.into_iter().map(|c| c.shape).collect()
     }
@@ -544,7 +544,7 @@ mod the_picker_itself {
             if let Some(row) = text_position(&open, preset.label()) {
                 click(context, scene, row);
                 // One more idle frame, so the write-back at the end of
-                // `basemap_picker` has run with the new selection in hand.
+                // `basemap_menu` has run with the new selection in hand.
                 frame(context, scene, Vec::new());
                 return;
             }

@@ -19,10 +19,11 @@
 //! hover to be discoverable: a latched toolbar toggle is sunken and tinted
 //! whether or not a pointer exists.
 
+use eframe::egui::containers::menu::MenuConfig;
 use eframe::egui::emath::GuiRounding as _;
 use eframe::egui::{
-    Color32, InnerResponse, Margin, Painter, Rect, Response, Sense, TextStyle, TextWrapMode, Ui,
-    WidgetInfo, WidgetText, WidgetType, pos2, vec2,
+    Color32, InnerResponse, Margin, Painter, Popup, Rect, Response, Sense, TextStyle, TextWrapMode,
+    Ui, UiKind, UiStackInfo, WidgetInfo, WidgetText, WidgetType, pos2, vec2,
 };
 
 use super::palette::Palette;
@@ -303,6 +304,106 @@ pub fn toolbar_button(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
 /// toward the accent — visible without hover, so it works under a finger.
 pub fn toolbar_toggle(ui: &mut Ui, selected: bool, text: impl Into<WidgetText>) -> Response {
     toolbar_control(ui, text.into(), selected)
+}
+
+/// A menu title in the bar: the same flat-until-hover control, latched for as
+/// long as its menu is down — the Win95 menu bar's inverted title, in this
+/// theme's grammar rather than by inverting the colours.
+///
+/// `egui::Ui::menu_button` is not used because it hard-codes a stock
+/// `egui::Button`, which paints a raised face with a border at rest: four of
+/// those in a row read as four pushbuttons, not as a menu bar. This is the
+/// composition `egui::containers::menu::MenuButton` performs — the button,
+/// then `Popup::menu` over its response, tagged as a menu so `ui.close()`,
+/// submenus and menu styling inside `content` behave exactly as they do under
+/// `menu_button` — with the button swapped for [`toolbar_button`]'s painter.
+///
+/// The latch reads the popup's state from the previous frame, which is when
+/// it was last written: the click that opens the menu is processed after this
+/// button has already painted. One frame is not perceptible, and egui is
+/// repainting continuously while a menu is open.
+pub fn toolbar_menu<R>(
+    ui: &mut Ui,
+    text: impl Into<WidgetText>,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> Response {
+    // The id `toolbar_control`'s `allocate_exact_size` is about to take, and
+    // from it the id `Popup::menu` will derive (`Popup::default_response_id`
+    // is `response.id.with("popup")`). Pinned by
+    // `tests/theme_contract.rs::a_toolbar_menu_latches_while_its_menu_is_down`,
+    // so a change in either egui's id derivation or in `toolbar_control`'s
+    // allocation order fails a test instead of silently un-latching the bar.
+    let open = Popup::is_id_open(ui.ctx(), ui.next_auto_id().with("popup"));
+    let response = toolbar_control(ui, text.into(), open);
+    let config = MenuConfig::new();
+    Popup::menu(&response)
+        .close_behavior(config.close_behavior)
+        .style(config.style.clone())
+        .info(UiStackInfo::new(UiKind::Menu).with_tag_value(MenuConfig::MENU_CONFIG_TAG, config))
+        .show(content);
+    response
+}
+
+/// A one-line data readout inset into the chrome: the toolbar's equivalent of
+/// [`sunken_well`], sized to stand in a row of [`toolbar_button`]s.
+///
+/// Readouts are the reason this exists as its own helper rather than as a
+/// `ui.label` on the bar. A bare label inherits whatever ground it happens to
+/// land on, which is how a tilt value or a live status ends up as dark ink on
+/// a dark window; here the ground is always [`Palette::well`], and the ink
+/// defaults to [`Palette::text`] — a pair the contrast contract pins at ≥ 7:1
+/// in both variants. It is never disabled and never weak.
+///
+/// A caller that needs to shout may name its own colour
+/// (`RichText::new(…).color(ui.visuals().error_fg_color)`); that colour wins,
+/// because `Painter::galley` treats [`Palette::text`] here as the *fallback*
+/// for text that did not name one. The theme's `warn` and `error` inks are
+/// the intended overrides and both clear 4.5:1 on the well in both variants
+/// (6.7 – 8.1:1); an arbitrary colour is the caller's contrast to answer for.
+///
+/// The width range is explicit because a readout's text changes as data
+/// changes: `min_width` stops the whole bar from re-flowing every time the
+/// elevation gains a digit, and `max_width` truncates rather than wrapping,
+/// because a second line would change the height of the bar itself.
+pub fn sunken_readout(
+    ui: &mut Ui,
+    min_width: f32,
+    max_width: f32,
+    text: impl Into<WidgetText>,
+) -> Response {
+    let palette = Palette::detect(ui);
+    // The vertical padding is small on purpose: the height floor below is
+    // what sets the height, so a readout comes out exactly as tall as a
+    // `toolbar_button` and the row of controls shares one baseline instead of
+    // stepping up and down across the bar.
+    let padding = vec2(7.0, 2.0);
+    let galley = text.into().into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        (max_width - 2.0 * padding.x).max(1.0),
+        TextStyle::Body,
+    );
+    let size = vec2(
+        (galley.size().x + 2.0 * padding.x).max(min_width),
+        (galley.size().y + 2.0 * padding.y).max(MIN_TOUCH_POINTS),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, galley.text()));
+
+    if ui.is_rect_visible(rect) {
+        let ppp = ui.painter().pixels_per_point();
+        let rect = rect.round_to_pixels(ppp);
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, palette.well);
+        paint_bevel(painter, rect, Bevel::Sunken, palette);
+        let text_pos = pos2(
+            rect.min.x + padding.x,
+            rect.center().y - 0.5 * galley.size().y,
+        )
+        .round_to_pixels(ppp);
+        painter.galley(text_pos, galley, palette.text);
+    }
+    response
 }
 
 fn toolbar_control(ui: &mut Ui, text: WidgetText, selected: bool) -> Response {

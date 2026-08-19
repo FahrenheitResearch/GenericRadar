@@ -799,8 +799,8 @@ fn draw_radar_sites(
             )
         };
         painter.rect_filled(box_rect, 1.0, fill);
-        // A halo ring under the ink ring, the same pairing the labels use: a
-        // lone 1 px slate outline disappears on top of bright reflectivity,
+        // A halo ring under the ink ring, the same pairing the labels use:
+        // a lone 1 px slate outline disappears on top of bright reflectivity,
         // which is exactly where an analyst most needs to find the site.
         painter.rect_stroke(
             box_rect,

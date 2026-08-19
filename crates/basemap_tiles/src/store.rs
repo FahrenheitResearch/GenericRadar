@@ -102,17 +102,14 @@ impl Default for TileCacheConfig {
 /// or contact the application behind it, so this string is a condition of use
 /// for that provider. The fallback URL exists because `CARGO_PKG_REPOSITORY`
 /// is empty unless the manifest inherits it, and shipping
-/// `GenericRadar/0.1.0 (+)` would defeat the point.
+/// `GenericRadar/0.2.0 (+)` would defeat the point.
 #[must_use]
 pub fn default_user_agent() -> String {
     let repository = match env!("CARGO_PKG_REPOSITORY") {
         "" => "https://github.com/FahrenheitResearch/GenericRadar",
         url => url,
     };
-    format!(
-        "GenericRadar/{} (+{repository})",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("GenericRadar/{} (+{repository})", env!("CARGO_PKG_VERSION"))
 }
 
 /// The platform cache directory, with this application's subdirectory

@@ -1,6 +1,6 @@
 # GenericRadar
 
-`GenericRadar` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho and from the legacy `app_ui` reference harness.
+`GenericRadar` is the clean native Rust/egui successor for professional Level II radar analysis. It is intentionally separate from BowEcho.
 
 The complete product and architecture contract is in [`../../docs/ANALYST_WORKSTATION.md`](../../docs/ANALYST_WORKSTATION.md).
 

@@ -1585,7 +1585,7 @@ mod tests {
     /// A cache directory holds partial downloads and volumes with no
     /// reflectivity in them, so the harness SKIPS what it cannot read and says
     /// how many rather than failing: a test that cannot be pointed at the
-    /// owner's own cache is a test nobody reruns.
+    /// local cache is a test nobody reruns.
     ///
     /// It resamples the real 192 x 192 x 48 box at the old default (radar
     /// centre, 120 km) and the new one (auto centre, 60 km) and reports, for
