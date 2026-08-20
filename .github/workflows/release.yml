@@ -102,6 +102,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
+          # The bare executable is the asset a Windows user actually wants:
+          # download it and run it, with no unpacking step. The zip beside
+          # it carries the same bytes plus the README and the two licences,
+          # for anyone who wants the notices with the binary.
+          Copy-Item target\release\GenericRadar.exe "dist\${{ matrix.artifact_name }}.exe"
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item target\release\GenericRadar.exe package\GenericRadar.exe
           Copy-Item README.md package\README.md
@@ -230,6 +235,11 @@ jobs:
           app="GenericRadar.app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${{ matrix.artifact_name }}.zip"
 
+      # Linux stays a tarball rather than a bare binary on purpose: an asset
+      # downloaded through a browser arrives without its executable bit, so a
+      # bare ELF would need chmod +x before it ran, while a tarball carries the
+      # mode. macOS likewise must stay an archive - a .app is a directory, and
+      # the bundle is what holds the Info.plist and the code signature.
       - name: Package Linux binary
         if: runner.os == 'Linux'
         shell: bash
