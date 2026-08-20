@@ -44,4 +44,4 @@ or open a Level II archive file from the File menu.
 
 ## License
 
-MIT or Apache-2.0, at your option. Copyright (c) 2026 Fahrenheit Research.
+MIT or Apache-2.0, at your option.
