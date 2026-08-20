@@ -1,14 +1,10 @@
 //! The seam the application actually uses, compiled and exercised here.
 //!
-//! `crates/workstation_app/src/app.rs`, `app_support.rs` and `pane_canvas.rs`
-//! are hand-applied by a human from the handoff notes, so nothing in this
-//! crate's own gates would catch a snippet that names a method wrongly, or one
-//! whose borrows do not work out inside a struct literal. This test performs
-//! the same calls, in the same order, with the same types, so the snippets are
-//! checked by the compiler rather than by eye.
-//!
-//! It is not a substitute for applying them. It is the part that can be
-//! checked without editing files this agent was told not to touch.
+//! The application drives this crate from `workstation_app`, which lives
+//! outside it, so this crate's own gates cannot catch a call that names a
+//! method wrongly or one whose borrows do not work out inside a struct
+//! literal. This test performs the same calls, in the same order, with the
+//! same types, so the seam is checked by the compiler rather than by eye.
 
 use std::sync::Arc;
 

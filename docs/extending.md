@@ -1,9 +1,10 @@
 # Extending GenericRadar
 
-How a new capability — a data provider, a derived product, an overlay, a
-whole new module — plugs into this workspace so that it appears in the
-application, appears in the master settings window, persists its state, and
-passes the gates. Exact seams, exact files, no narrative.
+How a new capability — a data
+provider, a derived product, an overlay, a whole module ported from BowEcho —
+plugs into this workspace so that it appears in the application, appears in
+the master settings window, persists its state, and passes the gates. It is
+written for an agent doing the work: exact seams, exact files, no narrative.
 
 Baseline for this document: the settings system landed with the
 `settings` crate rewrite and `workstation_app/src/settings_ui.rs`.

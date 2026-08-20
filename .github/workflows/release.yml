@@ -5,6 +5,8 @@
 # docs/RELEASING.md) copies it into the PUBLIC snapshot as
 # .github/workflows/release.yml, where a tag push builds the six platform
 # archives and attaches them to the release the maintainer already created.
+# (That process lives in the development repository; the public tree carries
+# only this pipeline.)
 #
 # The canonical `GenericRadar.exe` asset is NOT produced here: it is the
 # locally built, locally flown Windows binary the maintainer uploads when

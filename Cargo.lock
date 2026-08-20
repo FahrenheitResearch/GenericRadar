@@ -196,6 +196,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "app_ui"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "color_tables",
+ "data_source",
+ "eframe",
+ "map_scene",
+ "nexrad_io",
+ "radar_core",
+ "render2d",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

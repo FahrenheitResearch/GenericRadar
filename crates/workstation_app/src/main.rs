@@ -77,7 +77,7 @@ struct Startup {
     vol3d: bool,
 }
 
-/// `radar-workstation [<radar-volume-file>] [--live <SITE>] [--zoom <km-per-point>]
+/// `GenericRadar [<radar-volume-file>] [--live <SITE>] [--zoom <km-per-point>]
 /// [--center <east_km,north_km>] [--warnings-url <base-url|off>]
 /// [--product <REF|VEL|DVEL|SRV|DSRV|SW|ZDR|RHO|PHI|KDP>] [--vol3d]`
 fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {

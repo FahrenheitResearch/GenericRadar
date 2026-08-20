@@ -1364,9 +1364,9 @@ mod tests {
         assert_eq!(WarningsSource::parse("off"), WarningsSource::WeatherGov);
         assert_eq!(WarningsSource::parse("NONE"), WarningsSource::WeatherGov);
         assert_eq!(
-            WarningsSource::parse("http://node3:8080/"),
+            WarningsSource::parse("http://warnings.example.invalid:8080/"),
             WarningsSource::Daemon {
-                base_url: "http://node3:8080".to_owned()
+                base_url: "http://warnings.example.invalid:8080".to_owned()
             },
             "a trailing slash must not become a double slash in the path"
         );
