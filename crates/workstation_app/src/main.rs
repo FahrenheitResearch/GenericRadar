@@ -2,13 +2,16 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
+mod annotation;
 mod app;
 mod app_support;
+mod gate_filter_ui;
 mod hazards;
 mod legend;
 mod live_service;
 mod load_service;
 mod nearest_site;
+mod net_tuning;
 mod palette_editor;
 mod palettes;
 mod pane_canvas;
@@ -29,6 +32,7 @@ mod sites_service;
 mod sweep;
 #[allow(dead_code)]
 mod theme;
+mod units;
 // Also compiled in a second home - `examples/user_table_proof.rs` includes
 // it by `#[path]` to drive a real palette through the real drop path - so
 // items this binary does not call (the notice text the proof prints) are
@@ -45,8 +49,13 @@ mod xsection;
 /// machine. A base URL selects it; `off` pins the public feed.
 const WARNINGS_URL_ENV: &str = "RADAR_WORKSTATION_WARNINGS_URL";
 
-/// Startup intent parsed from the command line: a Level II file to open or a
+/// Startup intent parsed from the command line: a radar volume to open or a
 /// site to go live on, plus an optional starting camera.
+///
+/// The file argument is any container the io crate's routing seam accepts -
+/// NEXRAD Archive II in any of its wrappers, a GR2Analyst `.msg31` export, or
+/// one of the formats it can name but not yet decode. It is routed by magic
+/// bytes, so the extension, or its absence, does not decide anything.
 ///
 /// The camera options exist so a given view is reproducible from the command
 /// line. Driving this window with synthetic mouse input is unreliable — Windows
@@ -68,7 +77,7 @@ struct Startup {
     vol3d: bool,
 }
 
-/// `radar-workstation [<level2-file>] [--live <SITE>] [--zoom <km-per-point>]
+/// `radar-workstation [<radar-volume-file>] [--live <SITE>] [--zoom <km-per-point>]
 /// [--center <east_km,north_km>] [--warnings-url <base-url|off>]
 /// [--product <REF|VEL|DVEL|SRV|DSRV|SW|ZDR|RHO|PHI|KDP>] [--vol3d]`
 fn parse_startup<I: Iterator<Item = String>>(args: I) -> Startup {
@@ -190,17 +199,24 @@ fn main() -> eframe::Result {
             // The visual theme, before anything draws: every widget of the
             // first frame styles itself from the context this call fills in.
             // The Win95-grey daylight bench is the app's identity and the
-            // default; the stored choice - set in Settings > Appearance -
-            // wins when present. Applied before the first frame so the app
-            // never flashes the wrong chrome.
-            let variant = match store.value(
-                crate::settings_ui::catalog::keys::appearance::CATEGORY,
-                crate::settings_ui::catalog::keys::appearance::THEME,
-            ) {
-                Some(settings::SettingValue::Text(text)) if text == "dark" => theme::Variant::Dark,
-                _ => theme::Variant::Light,
+            // default; the stored choices - set in Settings > Appearance -
+            // win when present. Applied before the first frame so the app
+            // never flashes the wrong chrome, and read from the RAW store
+            // because the settings registry does not exist yet: the fallback
+            // rule for a stranger id lives in `theme::settings`, not here.
+            use theme::settings::keys;
+            let stored = |id: &str| match store.value(keys::CATEGORY, id) {
+                Some(settings::SettingValue::Text(text)) => Some(text.to_owned()),
+                _ => None,
             };
-            theme::apply(&creation_context.egui_ctx, variant);
+            let appearance = theme::settings::appearance_from_ids(
+                stored(keys::THEME).as_deref(),
+                stored(keys::ACCENT).as_deref(),
+                stored(keys::CHROME_EDGES).as_deref(),
+                stored(keys::DENSITY).as_deref(),
+                stored(keys::UI_SCALE).as_deref(),
+            );
+            theme::apply(&creation_context.egui_ctx, &appearance);
             // Register the map's persistent GPU resources once, before any
             // pane paints. Without a wgpu render state the map cannot draw at
             // all, so say so rather than silently falling back to per-frame

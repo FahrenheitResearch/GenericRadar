@@ -734,10 +734,10 @@ fn paint_empty_strip(ui: &egui::Ui, strip: egui::Rect) {
     if !ui.is_rect_visible(strip) {
         return;
     }
-    let palette = Palette::detect(ui);
+    let chrome = crate::theme::chrome(ui);
     let painter = ui.painter();
-    painter.rect_filled(strip, 0.0, palette.well);
-    bevel::paint_bevel(painter, strip, Bevel::Sunken, palette);
+    painter.rect_filled(strip, 0.0, chrome.palette.well);
+    bevel::paint_bevel(painter, strip, Bevel::Sunken, &chrome.palette, chrome.edges);
 }
 
 /// Paint the checkerboard, the ramp and the sunken frame around them.
@@ -757,7 +757,7 @@ fn paint_strip(
     if !ui.is_rect_visible(strip) {
         return;
     }
-    let palette = Palette::detect(ui);
+    let chrome = crate::theme::chrome(ui);
     let painter = ui.painter();
     // Transparency has to be visible: a stop at alpha 0 over a solid ground
     // looks like a stop the colour of the ground. The SAME ground the preview
@@ -784,7 +784,7 @@ fn paint_strip(
             egui::Color32::from_rgba_unmultiplied(red, green, blue, alpha),
         );
     }
-    bevel::paint_bevel(painter, strip, Bevel::Sunken, palette);
+    bevel::paint_bevel(painter, strip, Bevel::Sunken, &chrome.palette, chrome.edges);
 }
 
 /// The two-tone ground that makes transparency visible, over `rect`.
@@ -1328,7 +1328,7 @@ fn preview_section(
         if let Some(texture) = &state.preview.texture {
             let side = ui.available_width().clamp(160.0, 320.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-            let palette = Palette::detect(ui);
+            let chrome = crate::theme::chrome(ui);
             let painter = ui.painter();
             // The same two-tone ground the gradient strip uses, and the same
             // one in both variants - see `preview_ground`. The raster is
@@ -1343,7 +1343,7 @@ fn preview_section(
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            bevel::paint_bevel(painter, rect, Bevel::Sunken, palette);
+            bevel::paint_bevel(painter, rect, Bevel::Sunken, &chrome.palette, chrome.edges);
         }
         if let Some(note) = &state.preview.note {
             ui.label(egui::RichText::new(note.as_str()).small().weak());

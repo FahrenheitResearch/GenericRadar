@@ -7,13 +7,13 @@ fn main() {
     let mut args = std::env::args_os().skip(1).map(PathBuf::from);
     let Some(input) = args.next() else {
         eprintln!(
-            "usage: cargo run -p render2d --example render_reflectivity_png -- <level2-file> <out.png> [cut-index]"
+            "usage: cargo run -p render2d --example render_reflectivity_png -- <radar-file> <out.png> [cut-index]"
         );
         std::process::exit(2);
     };
     let Some(output) = args.next() else {
         eprintln!(
-            "usage: cargo run -p render2d --example render_reflectivity_png -- <level2-file> <out.png> [cut-index] [moment]"
+            "usage: cargo run -p render2d --example render_reflectivity_png -- <radar-file> <out.png> [cut-index] [moment]"
         );
         std::process::exit(2);
     };
@@ -42,7 +42,10 @@ fn run(
     cut_index: usize,
     moment: MomentType,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let volume = nexrad_io::decode_volume_from_path(input)?;
+    // The routing seam, not the Archive II decoder directly: this example
+    // is how a change gets checked against a picture, and every format the
+    // app can open should be checkable the same way.
+    let volume = nexrad_io::decode_supported_volume_from_path(input)?;
     render_moment_png(&volume, cut_index, moment, output, RasterOptions::default())?;
     Ok(())
 }

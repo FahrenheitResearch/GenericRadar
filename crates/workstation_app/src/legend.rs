@@ -1393,9 +1393,20 @@ mod tests {
     /// wider than the fixed one this file replaced.
     const HAIL_SUMMARY: &str = "ASSUMED ENV H0 3.0 km / H-20 6.0 km ARL";
 
-    /// Every badge stack `app.rs` can hand a pane: at most two, in this order -
-    /// the frame stage when the frame is not `Complete`, then the hail
-    /// environment summary for MESH, POH and POSH.
+    /// The gate filter's badge, verbatim from `gate_filter_ui::pane_badge_text`.
+    ///
+    /// One word on purpose, and this file is the reason: the version that
+    /// carried the whole criteria summary wrapped to four rows in a 40-point
+    /// column, took the badge stack's entire row budget and pushed the colour
+    /// bar sixty points down the pane. The full statement is on the FILTERED
+    /// band `pane_canvas` draws under the header, which has the pane's width
+    /// to say it in.
+    const FILTERED: &str = crate::gate_filter_ui::FILTERED_WORD;
+
+    /// Every badge stack `app.rs` can hand a pane, in the order `pane_badges`
+    /// pushes them: the stall notice, then the gate filter, then the frame
+    /// stage when the frame is not `Complete`, then the hail environment
+    /// summary for MESH, POH and POSH.
     fn app_badge_stacks() -> Vec<Vec<String>> {
         vec![
             Vec::new(),
@@ -1403,6 +1414,17 @@ mod tests {
             vec!["PREVIEW".to_owned()],
             vec![HAIL_SUMMARY.to_owned()],
             vec!["PARTIAL".to_owned(), HAIL_SUMMARY.to_owned()],
+            vec![FILTERED.to_owned()],
+            vec![FILTERED.to_owned(), "PARTIAL".to_owned()],
+            vec![FILTERED.to_owned(), HAIL_SUMMARY.to_owned()],
+            // The deepest stack the application can build: a stalled feed, a
+            // filter, a partial frame and a guessed hail environment.
+            vec![
+                "FEED STALLED · 12 h OLD".to_owned(),
+                FILTERED.to_owned(),
+                "PARTIAL".to_owned(),
+                HAIL_SUMMARY.to_owned(),
+            ],
         ]
     }
 

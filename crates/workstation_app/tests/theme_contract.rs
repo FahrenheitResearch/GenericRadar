@@ -27,7 +27,7 @@ mod theme;
 use eframe::egui::emath::GuiRounding as _;
 use eframe::egui::{self, Color32, CornerRadius, Rect, Theme, pos2, vec2};
 use theme::palette::{DARK, LIGHT, Palette};
-use theme::{Variant, bevel};
+use theme::{Appearance, ChromeEdges, Ground, bevel};
 
 /// WCAG 2.2 relative luminance of an sRGB colour (the SC 1.4.3 definition,
 /// which follows IEC 61966-2-1 for the transfer function).
@@ -144,8 +144,8 @@ fn the_light_face_is_not_the_dingy_classic_and_the_dark_face_is_not_black() {
 
 #[test]
 fn every_widget_state_is_square_with_a_visible_border() {
-    for variant in [Variant::Light, Variant::Dark] {
-        let style = theme::style(variant);
+    for variant in [Ground::Light, Ground::Dark] {
+        let style = theme::style(&Appearance::on_ground(variant));
         let v = &style.visuals;
         for w in [
             &v.widgets.noninteractive,
@@ -168,8 +168,8 @@ fn every_widget_state_is_square_with_a_visible_border() {
 
 #[test]
 fn the_raised_pressed_grammar_is_wired_into_stock_widgets() {
-    for (variant, p) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
-        let v = theme::style(variant).visuals;
+    for (variant, p) in [(Ground::Light, &LIGHT), (Ground::Dark, &DARK)] {
+        let v = theme::style(&Appearance::on_ground(variant)).visuals;
         assert_eq!(v.panel_fill, p.face);
         assert_eq!(v.window_fill, p.face);
         // A button at rest stands one step proud of the panel; pressed, one
@@ -184,7 +184,7 @@ fn the_raised_pressed_grammar_is_wired_into_stock_widgets() {
         assert_eq!(v.selection.bg_fill, p.selection_bg);
         assert_eq!(v.selection.stroke.color, p.selection_text);
         assert_eq!(v.hyperlink_color, p.link);
-        assert_eq!(v.dark_mode, matches!(variant, Variant::Dark));
+        assert_eq!(v.dark_mode, matches!(variant, Ground::Dark));
     }
 }
 
@@ -193,8 +193,8 @@ fn hit_targets_hold_the_mobile_floor() {
     const {
         assert!(bevel::MIN_TOUCH_POINTS >= 24.0);
     }
-    for variant in [Variant::Light, Variant::Dark] {
-        let style = theme::style(variant);
+    for variant in [Ground::Light, Ground::Dark] {
+        let style = theme::style(&Appearance::on_ground(variant));
         assert!(
             style.spacing.interact_size.y >= bevel::MIN_TOUCH_POINTS,
             "stock widgets fell below the touch floor"
@@ -208,7 +208,7 @@ fn hit_targets_hold_the_mobile_floor() {
 
 #[test]
 fn the_type_ramp_is_the_bundled_fonts_at_professional_density() {
-    let styles = theme::style(Variant::Dark).text_styles;
+    let styles = theme::style(&Appearance::on_ground(Ground::Dark)).text_styles;
     let size = |ts: &egui::TextStyle| styles[ts].size;
     assert_eq!(size(&egui::TextStyle::Small), 10.0);
     assert_eq!(size(&egui::TextStyle::Body), 12.5);
@@ -224,7 +224,7 @@ fn the_type_ramp_is_the_bundled_fonts_at_professional_density() {
 #[test]
 fn apply_styles_both_theme_slots_and_pins_the_preference() {
     let ctx = egui::Context::default();
-    theme::apply(&ctx, Variant::Dark);
+    theme::apply(&ctx, &Appearance::on_ground(Ground::Dark));
     assert_eq!(ctx.theme(), Theme::Dark);
     // Both slots carry the language, so an OS preference flip can never
     // land on stock egui.
@@ -232,7 +232,7 @@ fn apply_styles_both_theme_slots_and_pins_the_preference() {
     assert_eq!(ctx.style_of(Theme::Light).visuals.panel_fill, LIGHT.face);
 
     let ctx = egui::Context::default();
-    theme::apply(&ctx, Variant::Light);
+    theme::apply(&ctx, &Appearance::on_ground(Ground::Light));
     assert_eq!(ctx.theme(), Theme::Light);
     assert_eq!(ctx.style_of(Theme::Light).visuals.panel_fill, LIGHT.face);
 }
@@ -269,9 +269,9 @@ fn ring_rects_are_one_pixel_strips_that_tile_the_ring() {
 /// helper, so their layout arithmetic runs against the actual font metrics.
 #[test]
 fn composition_helpers_lay_out_touch_sized_controls_in_a_real_pass() {
-    for variant in [Variant::Light, Variant::Dark] {
+    for variant in [Ground::Light, Ground::Dark] {
         let ctx = egui::Context::default();
-        theme::apply(&ctx, variant);
+        theme::apply(&ctx, &Appearance::on_ground(variant));
         let mut button_rect = Rect::NOTHING;
         let mut toggle_rect = Rect::NOTHING;
         let mut well_rect = Rect::NOTHING;
@@ -332,7 +332,7 @@ fn paint_bevel_snaps_off_grid_rects_to_device_pixels() {
     use eframe::egui::Shape;
     for ppp in [1.25_f32, 1.5, 2.0] {
         let ctx = egui::Context::default();
-        theme::apply(&ctx, Variant::Dark);
+        theme::apply(&ctx, &Appearance::on_ground(Ground::Dark));
         ctx.set_pixels_per_point(ppp);
         let mut shapes = Vec::new();
         // Two passes: the scale change lands on the second.
@@ -347,7 +347,8 @@ fn paint_bevel_snaps_off_grid_rects_to_device_pixels() {
                     ui.painter(),
                     off_grid,
                     bevel::Bevel::Raised,
-                    theme::palette::Palette::of(Variant::Dark),
+                    &theme::palette::Palette::of(Ground::Dark),
+                    ChromeEdges::Bevelled,
                 );
             });
             assert_eq!(output.pixels_per_point, ppp);
@@ -388,7 +389,7 @@ fn paint_bevel_snaps_off_grid_rects_to_device_pixels() {
 #[test]
 fn an_etched_separator_does_not_inflate_an_auto_sized_window() {
     let ctx = egui::Context::default();
-    theme::apply(&ctx, Variant::Dark);
+    theme::apply(&ctx, &Appearance::on_ground(Ground::Dark));
     let mut window_rect = Rect::NOTHING;
     for _ in 0..3 {
         let input = egui::RawInput {
@@ -437,9 +438,9 @@ fn an_etched_separator_does_not_inflate_an_auto_sized_window() {
 /// floating on raw black — which is what the field failure looked like.
 #[test]
 fn the_root_ground_is_painted_and_the_clear_colour_matches_it() {
-    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+    for (variant, palette) in [(Ground::Light, &LIGHT), (Ground::Dark, &DARK)] {
         let ctx = egui::Context::default();
-        theme::apply(&ctx, variant);
+        theme::apply(&ctx, &Appearance::on_ground(variant));
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let output = ctx.run_ui(
             egui::RawInput {
@@ -461,7 +462,7 @@ fn the_root_ground_is_painted_and_the_clear_colour_matches_it() {
             rect_shape.rect
         );
 
-        let clear = theme::clear_color(&theme::style(variant).visuals);
+        let clear = theme::clear_color(&theme::style(&Appearance::on_ground(variant)).visuals);
         assert_eq!(
             clear,
             palette.face.to_opaque().to_normalized_gamma_f32(),
@@ -483,7 +484,7 @@ fn the_root_ground_is_painted_and_the_clear_colour_matches_it() {
 #[test]
 fn a_toolbar_menu_latches_while_its_menu_is_down() {
     let ctx = egui::Context::default();
-    theme::apply(&ctx, Variant::Dark);
+    theme::apply(&ctx, &Appearance::on_ground(Ground::Dark));
     let input = || egui::RawInput {
         screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))),
         ..Default::default()
@@ -530,9 +531,9 @@ fn a_toolbar_menu_latches_while_its_menu_is_down() {
 /// reads as amateur.
 #[test]
 fn a_sunken_readout_is_a_legible_well_the_height_of_a_toolbar_button() {
-    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+    for (variant, palette) in [(Ground::Light, &LIGHT), (Ground::Dark, &DARK)] {
         let ctx = egui::Context::default();
-        theme::apply(&ctx, variant);
+        theme::apply(&ctx, &Appearance::on_ground(variant));
         let mut button = Rect::NOTHING;
         let mut short = Rect::NOTHING;
         let mut long = Rect::NOTHING;
@@ -587,8 +588,8 @@ fn a_sunken_readout_is_a_legible_well_the_height_of_a_toolbar_button() {
 /// landed at 2.64:1 — every text-edit hint on the toolbar was illegible.
 #[test]
 fn weak_text_is_the_palette_role_and_clears_the_floor_on_both_grounds() {
-    for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
-        let visuals = theme::style(variant).visuals;
+    for (variant, palette) in [(Ground::Light, &LIGHT), (Ground::Dark, &DARK)] {
+        let visuals = theme::style(&Appearance::on_ground(variant)).visuals;
         assert_eq!(
             visuals.weak_text_color(),
             palette.text_weak,

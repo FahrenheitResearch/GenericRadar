@@ -11,9 +11,11 @@ use map_scene::{MapChrome, MapGeometry, RadarProjection, TileFrame};
 
 use crate::hazards::PlacedHazard;
 
+use crate::annotation::Annotation;
+use crate::units::UnitSystem;
+
 const PANE_GAP: f32 = 3.0;
 const HEADER_HEIGHT: f32 = 26.0;
-const RANGE_RINGS_KM: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 400.0];
 
 pub struct PaneTexture<'a> {
     pub handle: &'a egui::TextureHandle,
@@ -92,6 +94,13 @@ pub struct PaneMap {
     pub sites: Arc<[PlacedSite]>,
     /// When a site marker's identifier is written beside it.
     pub site_labels: SiteLabelMode,
+    /// Ring ladder, marker and label sizes, readout precision - everything the
+    /// pane writes on top of the radar. [`Annotation::default`] is the pane
+    /// this application has always painted.
+    pub annotation: Annotation,
+    /// The units the two corner readouts and the ring labels are written in.
+    /// Display only: nothing here reaches the camera or the probe.
+    pub units: UnitSystem,
     /// The site currently being displayed, drawn as selected.
     pub active_site: Option<String>,
     /// Warning polygons in force, already projected, least severe first.
@@ -110,6 +119,15 @@ pub struct PaneOverlay<'a> {
     pub badges: &'a [String],
     /// The formatted value under the cursor, from the previous frame.
     pub probe: Option<&'a str>,
+    /// What the gate filter is hiding, when it is hiding anything.
+    ///
+    /// `Some` draws the FILTERED band under the header - unconditionally, in
+    /// the error ink, on its own opaque ground - and makes that band clear the
+    /// filter when it is clicked. It is separate from `badges` on purpose:
+    /// badges are drawn by the legend, and the legend can be switched off,
+    /// which must never be a way to switch off the admission that gates are
+    /// being hidden. See `crate::gate_filter_ui` for the whole rule.
+    pub filter_notice: Option<&'a str>,
 }
 
 /// A radar site at a known world position, ready to draw and hit-test.
@@ -119,12 +137,15 @@ pub struct PlacedSite {
     pub world: WorldPoint,
 }
 
-/// Half-size of a site marker in screen points.
-const SITE_MARKER_HALF: f32 = 5.0;
 /// Extra slack around a marker so it is easy to hit with the mouse.
-const SITE_CLICK_SLACK: f32 = 4.0;
-/// Ceiling on markers drawn per pane, so a dense view stays bounded.
-const MAX_SITE_MARKERS: usize = 250;
+///
+/// Still a constant: it is a property of pointing devices and human hands, not
+/// of a preference. The marker's own size moved to
+/// [`crate::annotation::Annotation`].
+///
+/// `pub(crate)` because `nearest_site` restates the resulting halo and pins it
+/// against this plus the shipped marker size.
+pub(crate) const SITE_CLICK_SLACK: f32 = 4.0;
 
 pub struct PaneInteraction {
     pub clicked: bool,
@@ -141,6 +162,9 @@ pub struct PaneInteraction {
     /// Where a Ctrl+click landed, in degrees `(longitude, latitude)`, when the
     /// pane has a projection to place it with.
     pub ctrl_clicked_lon_lat: Option<(f64, f64)>,
+    /// The analyst clicked the FILTERED band. The one obvious way out of a
+    /// filtered view, right where the evidence of it is.
+    pub clear_filter_clicked: bool,
 }
 
 pub fn pane_rects(canvas: egui::Rect, layout: PaneLayout) -> Vec<(PaneId, egui::Rect)> {
@@ -352,15 +376,19 @@ pub fn draw_pane(
         updated_camera,
         viewport,
         response.hovered(),
-        map.projection.as_ref(),
+        map,
         chrome_color(map.chrome.readout_ink),
     );
     // Overlays sit above the readout and below the header, so the header and
     // the active-pane border stay on top of everything.
     if let (Some(layout), Some(table)) = (overlay.legend, overlay.table) {
+        // The legend measures itself from the top of the rect it is given, and
+        // the FILTERED band is painted after it. Handing it the whole pane put
+        // the band straight through the product name - caught by looking at
+        // the photograph - so the band's strip is taken off the top first.
         crate::legend::draw_legend(
             &painter,
-            rect,
+            legend_rect(rect, overlay.filter_notice.is_some()),
             layout,
             table,
             overlay.product_name,
@@ -372,18 +400,57 @@ pub fn draw_pane(
     }
     draw_tile_attribution(&painter, rect, map);
     draw_header(&painter, rect, title, status);
+    // Over the header's band and under the active border: the last thing
+    // drawn on the data, because it is the one thing on this pane that is
+    // about the data being incomplete.
+    let filter_band = overlay
+        .filter_notice
+        .map(|notice| draw_filter_band(&painter, rect, notice));
+    let clear_filter_clicked = filter_band.is_some_and(|band| {
+        response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pointer| band.contains(pointer))
+    });
+    if filter_band.is_some_and(|band| {
+        ui.input(|input| input.pointer.hover_pos())
+            .is_some_and(|pointer| band.contains(pointer))
+    }) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // The band takes the whole click, not just `clicked`.
+    //
+    // Site markers are hit-tested anywhere in the pane, and the band is
+    // painted over them in its own opaque ground - so a marker whose halo
+    // reaches under the band is a target the analyst cannot see. Left as it
+    // was, one click on the band both cleared the filter AND called
+    // `start_live` on that invisible marker, and a Ctrl+click on it cleared
+    // the filter AND loaded the nearest S-band radar: the analyst asks to see
+    // the echo that was being hidden and is shown a different radar instead,
+    // with the volume they were reading gone. Withheld here rather than in
+    // `app.rs` so every consumer of a pane click gets the same answer from
+    // one place; the markers are still drawn, only the click is refused.
+    let (clicked_site, ctrl_clicked_lon_lat) = if clear_filter_clicked {
+        (None, None)
+    } else {
+        (clicked_site, ctrl_clicked_lon_lat)
+    };
     draw_border(&painter, rect, active);
 
     PaneInteraction {
-        // A click that selected a site is consumed by that site, and a
-        // Ctrl+click is consumed by the radar switch.
-        clicked: response.clicked() && clicked_site.is_none() && ctrl_clicked_lon_lat.is_none(),
+        // A click that selected a site is consumed by that site, a Ctrl+click
+        // by the radar switch, and a click on the FILTERED band by the filter.
+        clicked: response.clicked()
+            && clicked_site.is_none()
+            && ctrl_clicked_lon_lat.is_none()
+            && !clear_filter_clicked,
         hovered_world_km: hovered_world_km(ui, rect, updated_camera, viewport, response.hovered()),
         camera: updated_camera,
         camera_changed,
         viewport,
         clicked_site,
         ctrl_clicked_lon_lat,
+        clear_filter_clicked,
     }
 }
 
@@ -742,12 +809,13 @@ fn draw_radar_sites(
         map_scene::projection::globe::blend_for_pane(camera.sanitized().km_per_point, viewport);
     let pointer = ui.input(|input| input.pointer.hover_pos());
     let mut hit: Option<(String, f32)> = None;
-    let mut drawn = 0_usize;
+    let marker_half = map.annotation.site_marker_half();
 
-    for site in map.sites.iter() {
-        if drawn >= MAX_SITE_MARKERS {
-            break;
-        }
+    // Which sites are on this pane, and where. One pass to find them and a
+    // second to paint them, so the ceiling below can choose WHICH ones to keep
+    // instead of taking whichever the catalog happened to list first.
+    let mut on_screen: Vec<(usize, egui::Pos2)> = Vec::new();
+    for (index, site) in map.sites.iter().enumerate() {
         // A site on the far side of the globe is not drawn at all. It is not
         // moved to the limb: a marker at a position that is not the site's is
         // worse than no marker.
@@ -756,15 +824,35 @@ fn draw_radar_sites(
         };
         let screen = camera.world_to_screen(world, viewport);
         let position = egui::pos2(rect.left() + screen.x, rect.top() + screen.y);
-        if !rect.contains(position) {
-            continue;
+        if rect.contains(position) {
+            on_screen.push((index, position));
         }
-        drawn += 1;
-
-        let active = map.active_site.as_deref() == Some(site.id.as_str());
-        let hovered = pointer.is_some_and(|pointer| {
-            (pointer - position).length() <= SITE_MARKER_HALF + SITE_CLICK_SLACK
+    }
+    // The ceiling, when it bites: keep the markers nearest the middle of the
+    // pane. It used to `break` out of the loop at the limit in catalog order,
+    // so an analyst who lowered it lost arbitrary sites - a marker under the
+    // pointer could vanish while one in the far corner survived, with nothing
+    // on screen saying why. Nearest-first makes the setting mean what its name
+    // says. Sorted back into catalog order afterwards, so which marker
+    // overlaps which is unchanged, and skipped entirely when the ceiling does
+    // not bite - which is every default session, since the shipped catalog is
+    // 159 S-band sites against a ceiling of 250.
+    if on_screen.len() > map.annotation.site_marker_max {
+        let middle = rect.center();
+        on_screen.sort_by(|(_, left), (_, right)| {
+            (*left - middle)
+                .length_sq()
+                .total_cmp(&(*right - middle).length_sq())
         });
+        on_screen.truncate(map.annotation.site_marker_max);
+        on_screen.sort_by_key(|(index, _)| *index);
+    }
+
+    for (index, position) in on_screen {
+        let site = &map.sites[index];
+        let active = map.active_site.as_deref() == Some(site.id.as_str());
+        let hovered = pointer
+            .is_some_and(|pointer| (pointer - position).length() <= marker_half + SITE_CLICK_SLACK);
         if hovered && let Some(pointer) = pointer {
             let distance = (pointer - position).length();
             if hit.as_ref().is_none_or(|(_, best)| distance < *best) {
@@ -774,7 +862,7 @@ fn draw_radar_sites(
 
         let box_rect = egui::Rect::from_center_size(
             position,
-            egui::vec2(SITE_MARKER_HALF * 2.0, SITE_MARKER_HALF * 2.0),
+            egui::vec2(marker_half * 2.0, marker_half * 2.0),
         );
         // Outline and identifier come from the chosen look; the fill does
         // not. A marker's fill is a translucent dark scrim that reads as a
@@ -821,13 +909,15 @@ fn draw_radar_sites(
         if match map.site_labels {
             SiteLabelMode::Always => true,
             SiteLabelMode::Never => false,
-            SiteLabelMode::Auto => active || hovered || map.sites.len() <= 40,
+            SiteLabelMode::Auto => {
+                active || hovered || map.sites.len() <= map.annotation.site_declutter_max
+            }
         } {
             painter.text(
-                position + egui::vec2(0.0, -SITE_MARKER_HALF - 2.0),
+                position + egui::vec2(0.0, -marker_half - 2.0),
                 egui::Align2::CENTER_BOTTOM,
                 &site.id,
-                egui::FontId::monospace(11.0),
+                egui::FontId::monospace(map.annotation.site_label_points),
                 stroke_color,
             );
         }
@@ -1061,10 +1151,43 @@ fn draw_range_rings(
     let radar = camera.world_to_screen(WorldPoint::ORIGIN, viewport);
     let center = egui::pos2(rect.left() + radar.x, rect.top() + radar.y);
     let stroke = egui::Stroke::new(0.8_f32, chrome_color(map.chrome.range_ring));
-    for range_km in RANGE_RINGS_KM {
-        let radius = (*range_km as f32 / camera.sanitized().km_per_point).abs();
+    let ink = chrome_color(map.chrome.readout_ink);
+    // Radii are kilometres whatever the analyst reads in: the camera measures
+    // the world in kilometres, so a converted radius would put the ring in the
+    // wrong place. Only the label changes unit.
+    for range_km in map.annotation.ring_radii_km(map.units.distance) {
+        let radius = (range_km as f32 / camera.sanitized().km_per_point).abs();
         if radius > 4.0 && radius < rect.width().max(rect.height()) * 2.0 {
             painter.circle_stroke(center, radius, stroke);
+            if map.annotation.ring_labels {
+                // Due north of the radar, just inside the arc, so a ladder of
+                // labels reads as one column instead of chasing the circle.
+                //
+                // On a plate of the map's own label halo, because that column
+                // crosses whatever the basemap has written north of the radar:
+                // in the proof renders of KDVN, "62 mi" landed squarely on the
+                // county name "Dubuque" and "100 km" on the same word. The
+                // collision is structural - a fixed azimuth over a labelled
+                // basemap will hit something at most sites - so the label is
+                // made legible rather than moved somewhere it would collide
+                // with something else. Same plate the tile attribution uses.
+                let galley = painter.layout_no_wrap(
+                    map.units.distance(range_km, 0),
+                    egui::FontId::monospace(10.0),
+                    ink,
+                );
+                let padding = egui::vec2(3.0, 1.0);
+                let text_at = egui::pos2(
+                    center.x - galley.size().x * 0.5,
+                    center.y - radius + 2.0 + padding.y,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_size(text_at - padding, galley.size() + padding * 2.0),
+                    2.0,
+                    chrome_color(map.chrome.label_halo),
+                );
+                painter.galley(text_at, galley, ink);
+            }
         }
     }
     painter.circle_filled(center, 3.2, chrome_color(map.chrome.origin_dot));
@@ -1115,10 +1238,11 @@ fn draw_cursor_readout(
     camera: Camera2D,
     viewport: ViewportMetrics,
     hovered: bool,
-    projection: Option<&RadarProjection>,
+    map: &PaneMap,
     ink: egui::Color32,
 ) {
-    if !hovered {
+    let annotation = map.annotation;
+    if !hovered || annotation.corner_readout == crate::annotation::CornerReadout::Off {
         return;
     }
     let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
@@ -1144,17 +1268,37 @@ fn draw_cursor_readout(
         .to_degrees()
         .rem_euclid(360.0);
     // Same inverse transform the map was built with, so the readout and the
-    // basemap can never disagree.
-    let text = match projection.map(|projection| projection.world_to_lon_lat(world)) {
-        Some((lon_deg, lat_deg)) => format!(
-            "{range_km:.1} km  {azimuth_deg:05.1}°   {:.4}°{}  {:.4}°{}",
+    // basemap can never disagree. Two halves - the radar-local one and the
+    // geographic one - each of which the analyst can turn off; the spacing
+    // between them is the same three spaces the one-piece format string had.
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    if annotation.corner_readout.shows_range() {
+        parts.push(format!(
+            "{}  {azimuth_deg:05.1}°",
+            map.units.distance(range_km, annotation.range_decimals)
+        ));
+    }
+    if annotation.corner_readout.shows_coordinates()
+        && let Some((lon_deg, lat_deg)) = map
+            .projection
+            .as_ref()
+            .map(|projection| projection.world_to_lon_lat(world))
+    {
+        let places = usize::from(annotation.coordinate_decimals);
+        parts.push(format!(
+            "{:.*}°{}  {:.*}°{}",
+            places,
             lat_deg.abs(),
             if lat_deg >= 0.0 { "N" } else { "S" },
+            places,
             lon_deg.abs(),
             if lon_deg >= 0.0 { "E" } else { "W" },
-        ),
-        None => format!("{range_km:.1} km  {azimuth_deg:05.1}°"),
-    };
+        ));
+    }
+    if parts.is_empty() {
+        return;
+    }
+    let text = parts.join("   ");
     painter.text(
         egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0),
         egui::Align2::LEFT_BOTTOM,
@@ -1162,6 +1306,75 @@ fn draw_cursor_readout(
         egui::FontId::monospace(11.0),
         ink,
     );
+}
+
+/// The two ends of the header, each held to its own half of the row.
+///
+/// `Painter::text` does not know about the other end, so a long status and a
+/// long title simply overlap - and this header carries the engine's filter
+/// line, which is one of the four places an analyst reads what is hidden. At
+/// Dense spacing and 160 % UI scale in the smallest window the two collided
+/// into an unreadable stack: "1 · REF (dBZ) · 0.3°" printed straight through
+/// "FILTERED: REF below 20 dBZ … 269,740 of 298,195 gates hidden (90.5%)".
+///
+/// So each end gets a share of the row and truncates inside it, with an
+/// ellipsis the analyst can see. The title is given a third: it is the shorter
+/// of the two and the one that identifies the pane, and it must not be the
+/// thing that disappears. The status takes the rest, because the filter line
+/// grows with the number of criteria and there is no width at which it is
+/// guaranteed to fit - the full statement is on the band below, which has the
+/// pane's whole width to say it in.
+const HEADER_TITLE_SHARE: f32 = 1.0 / 3.0;
+
+/// Margin at each end of the header row, and between its two ends.
+const HEADER_MARGIN: f32 = 8.0;
+
+const HEADER_TITLE_COLOR: egui::Color32 = egui::Color32::from_rgb(239, 243, 246);
+const HEADER_STATUS_COLOR: egui::Color32 = egui::Color32::from_rgb(166, 184, 196);
+
+/// Lay one end of the header out to a width, truncating to a single row.
+fn header_galley(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, width.max(1.0));
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('\u{2026}');
+    painter.layout_job(job)
+}
+
+/// Both ends of the header, laid out against each other for a pane of this
+/// width.
+///
+/// One function so that [`draw_header`] and the test that measures the overlap
+/// cannot arrive at different answers - a test that recomputed this arithmetic
+/// would keep passing while the header it describes was changed underneath it.
+fn header_galleys(
+    painter: &egui::Painter,
+    width: f32,
+    title: &str,
+    status: &str,
+) -> (std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>) {
+    let inner = (width - 3.0 * HEADER_MARGIN).max(1.0);
+    let title = header_galley(
+        painter,
+        title,
+        egui::FontId::proportional(12.0),
+        HEADER_TITLE_COLOR,
+        inner * HEADER_TITLE_SHARE,
+    );
+    let status = header_galley(
+        painter,
+        status,
+        egui::FontId::monospace(10.0),
+        HEADER_STATUS_COLOR,
+        inner - title.size().x,
+    );
+    (title, status)
 }
 
 fn draw_header(painter: &egui::Painter, rect: egui::Rect, title: &str, status: &str) {
@@ -1177,20 +1390,101 @@ fn draw_header(painter: &egui::Painter, rect: egui::Rect, title: &str, status: &
         0.0,
         egui::Color32::from_rgba_unmultiplied(4, 7, 10, 218),
     );
-    painter.text(
-        egui::pos2(header.left() + 8.0, header.center().y),
-        egui::Align2::LEFT_CENTER,
+
+    let (title, status) = header_galleys(painter, header.width(), title, status);
+    painter.galley(
+        egui::pos2(
+            header.left() + HEADER_MARGIN,
+            header.center().y - 0.5 * title.size().y,
+        ),
         title,
-        egui::FontId::proportional(12.0),
-        egui::Color32::from_rgb(239, 243, 246),
+        HEADER_TITLE_COLOR,
     );
-    painter.text(
-        egui::pos2(header.right() - 8.0, header.center().y),
-        egui::Align2::RIGHT_CENTER,
+    painter.galley(
+        egui::pos2(
+            header.right() - HEADER_MARGIN - status.size().x,
+            header.center().y - 0.5 * status.size().y,
+        ),
         status,
-        egui::FontId::monospace(10.0),
-        egui::Color32::from_rgb(166, 184, 196),
+        HEADER_STATUS_COLOR,
     );
+}
+
+/// Height of the FILTERED band, in points. Deliberately taller than the
+/// header's text needs, so it reads as a bar and not as a second status line -
+/// and so it is a comfortable click target at any device scale.
+const FILTER_BAND_HEIGHT: f32 = 22.0;
+
+/// The band's ground and ink.
+///
+/// Hard-coded rather than taken from `MapChrome`, and that is the same
+/// decision `draw_header` and `crate::legend` already make: a band that paints
+/// its own opaque ground is furniture, not a mark on the map, so it is not
+/// subject to the "everything the pane paints on its ground comes from the
+/// chrome" rule and must NOT follow the basemap look. A warning that changed
+/// colour with the basemap would be a warning an analyst could tune down.
+///
+/// The pair is a deep red ground under near-white text: 9.60:1 by WCAG 2.2
+/// relative luminance, past the 7:1 AAA floor and well past the 4.5:1 the rest
+/// of the chrome is held to. `the_filtered_bands_own_contrast_clears_aaa`
+/// computes it rather than trusting this sentence. It is also the only
+/// red-grounded band in the application, which is the point: no other piece of
+/// chrome can be mistaken for it at a glance.
+const FILTER_BAND_GROUND: egui::Color32 = egui::Color32::from_rgb(122, 18, 18);
+const FILTER_BAND_INK: egui::Color32 = egui::Color32::from_rgb(255, 236, 236);
+
+/// The rect the colour legend lays itself out in: the pane, less the FILTERED
+/// band's strip when there is one.
+///
+/// A function so the band's height is named once and the two callers - the
+/// paint site and its test - cannot drift apart.
+fn legend_rect(pane: egui::Rect, filtered: bool) -> egui::Rect {
+    if !filtered {
+        return pane;
+    }
+    egui::Rect::from_min_max(
+        egui::pos2(
+            pane.left(),
+            (pane.top() + FILTER_BAND_HEIGHT).min(pane.bottom()),
+        ),
+        pane.max,
+    )
+}
+
+/// Draw the "this pane is hiding gates" band and answer where it landed.
+///
+/// Unconditional whenever the caller passes a notice: this is the one thing on
+/// the pane that no setting may switch off, because every setting that could
+/// would be a way to hide the fact that data is being hidden.
+fn draw_filter_band(painter: &egui::Painter, rect: egui::Rect, notice: &str) -> egui::Rect {
+    let top = (rect.top() + HEADER_HEIGHT).min(rect.bottom());
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), top),
+        egui::pos2(rect.right(), (top + FILTER_BAND_HEIGHT).min(rect.bottom())),
+    );
+    painter.rect_filled(band, 0.0, FILTER_BAND_GROUND);
+    // Laid out with an explicit one-row truncation rather than handed to
+    // `Painter::text`, which would let the sentence run off the right of a
+    // quarter-pane and be cut mid-word by the clip rect. An ellipsis is a
+    // truncation the analyst can see; a clipped word looks like a rendering
+    // fault, and this is the one band on the pane that must never look like
+    // one. The word that carries the whole meaning is first either way.
+    let mut job = egui::text::LayoutJob::simple(
+        notice.to_owned(),
+        egui::FontId::proportional(11.5),
+        FILTER_BAND_INK,
+        (band.width() - 16.0).max(1.0),
+    );
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('\u{2026}');
+    let galley = painter.layout_job(job);
+    painter.galley(
+        egui::pos2(band.left() + 8.0, band.center().y - 0.5 * galley.size().y),
+        galley,
+        FILTER_BAND_INK,
+    );
+    band
 }
 
 fn draw_border(painter: &egui::Painter, rect: egui::Rect, active: bool) {
@@ -1210,6 +1504,165 @@ fn draw_border(painter: &egui::Painter, rect: egui::Rect, active: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The band is the one piece of chrome that is read in a hurry, so its own
+    /// two colours are held to WCAG 2.2's AAA floor rather than to the 4.5:1
+    /// the rest of the bar clears.
+    ///
+    /// Computed rather than pasted: the first version of this claimed 12.9:1
+    /// in a comment and the real figure is 9.60:1. A number in prose is a
+    /// number nobody rechecks.
+    #[test]
+    fn the_filtered_bands_own_contrast_clears_aaa() {
+        fn channel(byte: u8) -> f64 {
+            let value = f64::from(byte) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: egui::Color32) -> f64 {
+            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        }
+        let ink = luminance(FILTER_BAND_INK);
+        let ground = luminance(FILTER_BAND_GROUND);
+        let contrast = (ink.max(ground) + 0.05) / (ink.min(ground) + 0.05);
+        assert!(
+            contrast >= 7.0,
+            "the FILTERED band reads at {contrast:.2}:1, under the 7:1 this band is held to"
+        );
+        // Opaque, both of them. A translucent warning band would take its
+        // contrast from whatever reflectivity happened to be underneath it.
+        assert_eq!(FILTER_BAND_GROUND.a(), 255);
+        assert_eq!(FILTER_BAND_INK.a(), 255);
+    }
+
+    /// The header's two ends never print through each other, at any pane
+    /// width the application can produce.
+    ///
+    /// The status line is where the engine's own filter statement goes -
+    /// `FILTERED: REF below 20 dBZ … 269,740 of 298,195 gates hidden (90.5%)` -
+    /// so two indicators overlapping here is two indicators unreadable. It was
+    /// on the photograph before it was in a test: at Dense spacing and 160 %
+    /// UI scale in the 960-point window, "1 · REF (dBZ) · 0.3°" printed
+    /// straight through the filter line.
+    ///
+    /// Measured on the laid-out galleys rather than on the strings, because
+    /// the question is where the glyphs landed.
+    #[test]
+    fn the_pane_headers_two_ends_never_print_through_each_other() {
+        let context = egui::Context::default();
+        // A pane header at its longest: the engine's filter line with every
+        // criterion on, beside a dealiased-velocity title.
+        const TITLE: &str = "1 · DVEL (kt) · 0.5°";
+        const STATUS: &str = "19 h old · 27.5 ms | FILTERED: REF below 20 dBZ, VEL where REF \
+                              below 20 dBZ, RhoHV below 0.95, range-folded gates, everything \
+                              inside 5 km - 269,740 of 298,195 gates hidden (90.5%)";
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(2000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let painter = ui.painter();
+                // Every pane width from a quarter of the narrowest supported
+                // window to a full 4K pane.
+                for width in [120.0_f32, 150.0, 200.0, 300.0, 480.0, 600.0, 960.0, 1920.0] {
+                    // The header's OWN layout, not a copy of it.
+                    let (title, status) = header_galleys(painter, width, TITLE, STATUS);
+                    let title_right = HEADER_MARGIN + title.size().x;
+                    let status_left = width - HEADER_MARGIN - status.size().x;
+                    assert!(
+                        status_left >= title_right,
+                        "at a {width}-point pane the title ends at {title_right:.1} and the \
+                         status starts at {status_left:.1}: the pane's own filter line is \
+                         printed through its title"
+                    );
+                    // And neither is reduced to nothing: an indicator that
+                    // truncated to a bare ellipsis says less than no indicator,
+                    // because it still occupies the row.
+                    assert!(
+                        title.rows.iter().any(|row| row.row.text().len() > 1),
+                        "at a {width}-point pane the title truncated away entirely"
+                    );
+                    assert!(
+                        status.rows.iter().any(|row| row.row.text().len() > 1),
+                        "at a {width}-point pane the status truncated away entirely"
+                    );
+                }
+            },
+        );
+    }
+
+    /// The FILTERED band is painted after the legend, so a legend that laid
+    /// itself out from the top of the whole pane has its product name struck
+    /// through by the band.
+    ///
+    /// This was on the photograph before it was in a test: the first capture
+    /// of Storm mode showed "REF" cut in half by the red bar. The claim is
+    /// about the two rectangles rather than about a pixel, so it is checked on
+    /// the real geometry the legend measured, for every pane a layout offers.
+    #[test]
+    fn the_filtered_band_is_never_painted_through_the_legends_own_lines() {
+        let layout = crate::legend::LegendLayout {
+            span: product_engine::domain::ValueRange::new(0.0, 1.0),
+            ticks: ["-20", "0", "20", "40", "60", "80"]
+                .iter()
+                .enumerate()
+                .map(|(index, label)| crate::legend::LegendTick {
+                    engine_value: index as f32 / 5.0,
+                    label: (*label).to_owned(),
+                    fraction: index as f32 / 5.0,
+                })
+                .collect(),
+            unit_label: "dBZ",
+        };
+        let context = egui::Context::default();
+        // Two passes: the first builds the font atlas, and a legend measured
+        // against an empty atlas measures nothing.
+        for _ in 0..2 {
+            let _ = context.run_ui(egui::RawInput::default(), |ui| {
+                for height in [320.0_f32, 600.0, 900.0] {
+                    for width in [200.0_f32, 600.0, 1400.0] {
+                        let pane = egui::Rect::from_min_size(
+                            egui::pos2(11.0, 7.0),
+                            egui::vec2(width, height),
+                        );
+                        let band = egui::Rect::from_min_max(
+                            egui::pos2(pane.left(), pane.top() + HEADER_HEIGHT),
+                            egui::pos2(
+                                pane.right(),
+                                pane.top() + HEADER_HEIGHT + FILTER_BAND_HEIGHT,
+                            ),
+                        );
+                        let Some(geometry) = crate::legend::legend_geometry(
+                            ui.painter(),
+                            legend_rect(pane, true),
+                            &layout,
+                            "REF",
+                            &[crate::gate_filter_ui::FILTERED_WORD.to_owned()],
+                        ) else {
+                            continue;
+                        };
+                        assert!(
+                            geometry.panel.top() >= band.bottom(),
+                            "a {width}x{height} pane puts the legend panel at {} under a band \
+                             that reaches {} - the product name is struck through",
+                            geometry.panel.top(),
+                            band.bottom()
+                        );
+                    }
+                }
+            });
+        }
+        // And an unfiltered pane keeps every point it had.
+        let pane = egui::Rect::from_min_size(egui::pos2(11.0, 7.0), egui::vec2(600.0, 600.0));
+        assert_eq!(legend_rect(pane, false), pane);
+    }
 
     #[test]
     fn four_pane_layout_covers_each_quadrant() {
@@ -1952,6 +2405,7 @@ mod tests {
             product_name: "REF",
             badges: &[],
             probe: None,
+            filter_notice: None,
         };
         let mut camera = camera;
         let mut last = None;

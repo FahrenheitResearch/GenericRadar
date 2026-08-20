@@ -23,6 +23,18 @@
 #[allow(dead_code)]
 #[path = "../../workstation_app/src/settings_ui.rs"]
 mod settings_ui;
+// The Appearance page is declared by the theme module, because its options
+// are derived from the theme catalog. Included here so this harness covers
+// the REAL registry rather than one page short of it.
+#[allow(dead_code)]
+#[path = "../../workstation_app/src/theme.rs"]
+mod theme;
+
+/// The registry the application runs on, assembled the way `app.rs`
+/// assembles it.
+fn registry() -> settings::SettingsRegistry {
+    settings_ui::full_registry(theme::settings::settings_category())
+}
 
 use settings::{SettingValue, SettingsStore};
 
@@ -31,7 +43,7 @@ use settings::{SettingValue, SettingsStore};
 /// would return `None`/defaults silently in release, so it is pinned here.
 #[test]
 fn every_catalog_key_resolves_against_the_real_store() {
-    let registry = settings_ui::catalog::registry();
+    let registry = registry();
     let store =
         SettingsStore::open(std::env::temp_dir().join("settings-ui-harness-never-written.json"));
     let mut checked = 0usize;
@@ -69,7 +81,7 @@ fn every_catalog_setting_survives_a_real_disk_round_trip() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join("settings.json");
-    let registry = settings_ui::catalog::registry();
+    let registry = registry();
 
     let mut expectations: Vec<(String, String, SettingValue)> = Vec::new();
     {

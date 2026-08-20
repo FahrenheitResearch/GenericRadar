@@ -112,6 +112,7 @@
 use eframe::egui;
 
 use crate::sites_service::LocatedSite;
+use crate::units::UnitSystem;
 
 /// How far from the click a WSR-88D may be and still be offered, in
 /// kilometres.
@@ -299,11 +300,17 @@ pub fn site_marker_click_allowed(modifiers: egui::Modifiers) -> bool {
 }
 
 /// Radius in screen points within which `pane_canvas::draw_radar_sites`
-/// counts a click as landing on a site marker: `SITE_MARKER_HALF` (5.0) plus
-/// `SITE_CLICK_SLACK` (4.0). Restated here because those two constants are
-/// private to a module this one must not depend on. The test named
-/// `the_marker_halo_this_module_assumes_is_the_one_the_pane_uses` reads the
-/// pane's own source and fails if either number moves.
+/// counts a click as landing on a site marker: half the shipped marker size
+/// (5.0) plus `pane_canvas::SITE_CLICK_SLACK` (4.0). Restated here because
+/// this module must not depend on the pane. The test named
+/// `the_marker_halo_this_module_assumes_is_the_one_the_pane_uses` recomputes
+/// it from those two and fails if either moves.
+///
+/// The marker's size is a setting (Readout & annotation), so an analyst who
+/// enlarges it enlarges the halo with it. This constant is the SHIPPED halo,
+/// which is what the Ctrl+click rule below is argued against - and the rule
+/// only gets safer as the marker grows, because a bigger marker is a bigger
+/// thing to have deliberately clicked.
 /// Test-facing: nothing in the shipping path reads these four. They exist
 /// so the assumption this module makes about the pane is written down and
 /// checked, which is why they are gated rather than silenced.
@@ -353,19 +360,32 @@ impl SiteChoice {
     /// beam height are the evidence for the choice, and an operator who asked
     /// for the nearest S-band radar and got one 300 km away needs to see that
     /// in the same breath as the id.
-    pub fn status_line(&self) -> String {
+    ///
+    /// The two figures are written in the analyst's own units. The RANKING
+    /// above is untouched by them: the winner is chosen on kilometres from a
+    /// great circle, and this is the last step before the numbers become
+    /// characters. Under [`UnitSystem::default`] the line is what it always
+    /// was, character for character.
+    pub fn status_line(&self, units: UnitSystem) -> String {
         format!(
-            "{} - nearest WSR-88D, {:.0} km, 0.5 deg beam {:.1} km",
+            "{} - nearest WSR-88D, {}, 0.5 deg beam {}",
             self.id,
-            self.distance_km,
-            self.beam_height_m / 1000.0
+            units.distance(self.distance_km, 0),
+            units.altitude(self.beam_height_m, 1)
         )
     }
 }
 
 /// The status line for a click with no S-band radar in range.
-pub fn no_site_in_range_status() -> String {
-    format!("No WSR-88D within {MAX_SITE_RANGE_KM:.0} km of that point")
+///
+/// The fence itself is 460 km — the WSR-88D's surveillance range, a physical
+/// fact and not a setting — but the analyst is told about it in whatever unit
+/// they are reading the pane in.
+pub fn no_site_in_range_status(units: UnitSystem) -> String {
+    format!(
+        "No WSR-88D within {} of that point",
+        units.distance(MAX_SITE_RANGE_KM, 0)
+    )
 }
 
 /// Great-circle distance between two positions, in kilometres.
@@ -489,6 +509,59 @@ pub fn nearest_s_band_site(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A finished choice, so the two status lines can be read without a
+    /// catalog behind them. KDVN at 118 km with the 0.5 degree beam 1.4 km
+    /// up is an ordinary Ctrl+click result.
+    fn a_choice() -> SiteChoice {
+        SiteChoice {
+            id: "KDVN".to_owned(),
+            name: Some("Davenport".to_owned()),
+            distance_km: 118.0,
+            beam_height_m: 1_432.0,
+        }
+    }
+
+    /// The shipped line, character for character. Nothing in this wave may
+    /// move a character of it under the default units.
+    #[test]
+    fn the_site_choice_line_is_what_it_has_always_been() {
+        assert_eq!(
+            a_choice().status_line(UnitSystem::default()),
+            "KDVN - nearest WSR-88D, 118 km, 0.5 deg beam 1.4 km"
+        );
+        assert_eq!(
+            no_site_in_range_status(UnitSystem::default()),
+            "No WSR-88D within 460 km of that point"
+        );
+    }
+
+    /// The same choice, announced to an analyst working in miles and feet.
+    ///
+    /// The defect this closes: `status_line` was the site-pick half of the
+    /// unit rollout and was never converted, so Ctrl+click reported
+    /// kilometres into a session whose pane corner read miles.
+    #[test]
+    fn the_site_choice_line_follows_the_unit_settings() {
+        let imperial = UnitSystem {
+            distance: crate::units::DistanceUnit::StatuteMiles,
+            altitude: crate::units::AltitudeUnit::Feet,
+            ..UnitSystem::default()
+        };
+        // 118 km is 73 statute miles; 1432 m is 4698 ft.
+        assert_eq!(
+            a_choice().status_line(imperial),
+            "KDVN - nearest WSR-88D, 73 mi, 0.5 deg beam 4698 ft"
+        );
+        // And the fence is stated in the same unit as everything else.
+        assert_eq!(
+            no_site_in_range_status(imperial),
+            "No WSR-88D within 286 mi of that point"
+        );
+        // The ranking is untouched: the choice still holds the kilometres it
+        // was ranked on.
+        assert_eq!(a_choice().distance_km, 118.0);
+    }
 
     /// The real NWS radar-station catalog, transcribed verbatim from
     /// `https://api.weather.gov/radar/stations` on 2026-08-18: every station
@@ -1504,31 +1577,27 @@ TTUL\t36.071\t-95.827\tTulsa\tTDWR\n\
     }
 
     /// The halo and the opening zoom are restated in this module because the
-    /// crate's layering will not let it reach the private constants that own
-    /// them. Restated numbers rot, so this reads the two owning files and
-    /// fails when either moves.
+    /// crate's layering will not let it reach the values that own them.
+    /// Restated numbers rot, so this recomputes the halo from the shipped
+    /// marker size and the pane's click slack, and reads `app.rs` for the
+    /// opening zoom, failing when any of the three moves.
     #[test]
     fn the_marker_halo_this_module_assumes_is_the_one_the_pane_uses() {
+        let shipped_halo = f64::from(
+            crate::annotation::Annotation::default().site_marker_half()
+                + crate::pane_canvas::SITE_CLICK_SLACK,
+        );
+        assert_eq!(
+            shipped_halo, SITE_MARKER_HIT_POINTS,
+            "the shipped marker halo moved; SITE_MARKER_HIT_POINTS is now a guess"
+        );
+
         let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let pane = source_root.join("pane_canvas.rs");
         let app = source_root.join("app.rs");
-        let (Ok(pane), Ok(app)) = (
-            std::fs::read_to_string(&pane),
-            std::fs::read_to_string(&app),
-        ) else {
-            println!("pane_canvas.rs / app.rs not beside this module; halo not cross-checked");
+        let Ok(app) = std::fs::read_to_string(&app) else {
+            println!("app.rs not beside this module; opening zoom not cross-checked");
             return;
         };
-        for declaration in [
-            "const SITE_MARKER_HALF: f32 = 5.0;",
-            "const SITE_CLICK_SLACK: f32 = 4.0;",
-        ] {
-            assert!(
-                pane.contains(declaration),
-                "pane_canvas.rs no longer declares `{declaration}`; \
-                 SITE_MARKER_HIT_POINTS ({SITE_MARKER_HIT_POINTS}) is now a guess"
-            );
-        }
         assert!(
             app.contains("const PLACEHOLDER_KM_PER_POINT: f32 = 4.0;"),
             "app.rs no longer opens a pane at 4.0 km per point; \

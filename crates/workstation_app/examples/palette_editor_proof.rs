@@ -52,13 +52,16 @@
 #[allow(dead_code)]
 #[path = "../src"]
 mod source {
+    pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod gate_filter_ui;
     pub mod hazards;
     pub mod legend;
     pub mod live_service;
     pub mod load_service;
     pub mod nearest_site;
+    pub mod net_tuning;
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
@@ -72,6 +75,7 @@ mod source {
     pub mod sites_service;
     pub mod sweep;
     pub mod theme;
+    pub mod units;
     pub mod user_tables;
     pub mod vol3d;
     pub mod vrot;
@@ -83,10 +87,10 @@ mod source {
 // modules resolves; this example itself only reaches for a few of them.
 #[allow(unused_imports)]
 pub(crate) use source::{
-    app, app_support, hazards, legend, live_service, load_service, nearest_site, palette_editor,
-    palettes, pane_canvas, popup, probe, product, product_availability, product_picker,
-    render_service, settings_ui, sites_service, sweep, theme, user_tables, vol3d, vrot,
-    warnings_service, xsection,
+    annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
+    nearest_site, net_tuning, palette_editor, palettes, pane_canvas, popup, probe, product,
+    product_availability, product_picker, render_service, settings_ui, sites_service, sweep, theme,
+    units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};
@@ -100,7 +104,7 @@ use palette_editor::store;
 use palette_editor::ui::{PaletteEditorInput, PaletteEditorState, draw_palette_editor};
 use radar_core::{MomentType, RadarVolume};
 use render2d::RasterOptions;
-use theme::Variant;
+use theme::Appearance;
 
 /// Big enough that a band edge is a band edge and not a rounding artefact.
 const RASTER: RasterOptions = RasterOptions {
@@ -494,9 +498,15 @@ fn photograph_window(volume: &RadarVolume, out_dir: &Path) {
         return;
     };
 
-    for (variant, name) in [(Variant::Dark, "dark"), (Variant::Light, "light")] {
+    // Every registered theme, not the two by name: the editor window is
+    // chrome like any other, and a theme that lands on a branch of its own
+    // gets photographed here without this file being edited.
+    for theme in theme::catalog::THEMES {
         for scale in [1.0_f32, 2.0] {
-            let (width, height, pixels) = render_window(&device, &queue, volume, variant, scale);
+            let appearance = Appearance::by_id(theme.id);
+            let (width, height, pixels) =
+                render_window(&device, &queue, volume, &appearance, scale);
+            let name = theme.id;
             let file = out_dir.join(format!("editor_{name}_{scale}x.png"));
             image::RgbaImage::from_raw(width, height, pixels)
                 .expect("readback size matches the target")
@@ -512,14 +522,14 @@ fn render_window(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     volume: &RadarVolume,
-    variant: Variant,
+    appearance: &Appearance,
     scale: f32,
 ) -> (u32, u32, Vec<u8>) {
     let width_px = (SHOT_POINTS.x * scale) as u32;
     let height_px = (SHOT_POINTS.y * scale) as u32;
 
     let context = egui::Context::default();
-    theme::apply(&context, variant);
+    theme::apply(&context, appearance);
     context.set_pixels_per_point(scale);
     let mut state = PaletteEditorState::default();
     state.edit_or_duplicate(

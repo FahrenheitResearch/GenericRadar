@@ -70,6 +70,21 @@ pub fn user_colortables_dir() -> PathBuf {
     app_config_root().join("colortables")
 }
 
+/// The directory named settings profiles live in.
+///
+/// Under the **config** root beside `settings.json`, for the same reason the
+/// colour table folder is: a profile someone built their working day around is
+/// not re-downloadable, and the cache root is documented as something the OS
+/// may empty.
+///
+/// Declared here rather than in `crate::profiles` because the path belongs to
+/// the same platform contract as every other path in this module - an iOS
+/// shell that injects a config root moves the profiles with it - and because
+/// a directory two modules name has to be named once.
+pub fn profiles_dir() -> PathBuf {
+    app_config_root().join("profiles")
+}
+
 fn default_config_root() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

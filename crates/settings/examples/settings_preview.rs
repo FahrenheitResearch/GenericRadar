@@ -17,6 +17,12 @@
 #[allow(dead_code)]
 #[path = "../../workstation_app/src/settings_ui.rs"]
 mod settings_ui;
+// The Appearance page is declared by the theme module, because its options
+// are derived from the theme catalog. Included here so this harness renders
+// and checks the REAL settings window rather than one page short of it.
+#[allow(dead_code)]
+#[path = "../../workstation_app/src/theme.rs"]
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -108,7 +114,7 @@ fn main() -> eframe::Result {
     }
     let preview = Preview {
         ui_state,
-        registry: settings_ui::catalog::registry(),
+        registry: settings_ui::full_registry(theme::settings::settings_category()),
         store: settings::SettingsStore::open(store_dir.join("settings.json")),
         color_tables: Arc::new(color_tables::ColorTableSet::default()),
         shot_path,

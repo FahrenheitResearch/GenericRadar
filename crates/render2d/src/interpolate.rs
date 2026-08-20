@@ -736,46 +736,189 @@ mod tests {
         assert_eq!(up.row_azimuths_deg.len(), 91 + 90 * 3);
     }
 
+    /// Cost has to stay proportional to the CELLS PRODUCED, and to nothing
+    /// else. The inner loop is O(1) per output cell by construction -- two
+    /// row slices hoisted out, four indexed parents, one blend -- so the only
+    /// way this gets slow is a regression that puts a search, an allocation
+    /// or a re-materialization inside it. Any of those makes the cost per
+    /// cell depend either on how MANY cells there are or on the NATIVE
+    /// geometry they came from, and the four shapes below are picked so that
+    /// each of those shows up as a ratio.
+    ///
+    /// The bounds are therefore ratios measured inside one run, never a
+    /// millisecond count. A millisecond count measures the machine, not this
+    /// code: these passes take about 3.3 / 2.3 / 8.0 / 10.4 ms on an idle
+    /// 32-core box, and the `< 2000 ms` ceiling this replaced -- a 240x
+    /// margin -- still went red at 2584.71 ms with several cargo builds
+    /// running beside it, on a branch that had not touched this crate at all.
+    /// A threshold raised until it stops failing is the same flake with a
+    /// longer fuse, so there is no absolute time threshold here: machine
+    /// speed and machine load divide out of a ratio.
+    ///
+    /// THE FOUR SHAPES. All four produce 1440 rows. The two big ones produce
+    /// an identical 11.52M cells from opposite native geometries, which is
+    /// what makes them comparable to each other rather than only to a
+    /// yardstick.
+    ///
+    /// | shape        | native      | factors | out cells |
+    /// |--------------|-------------|---------|-----------|
+    /// | super-res    | 720 x 1832  | 2 x 1   |  2.64M    |
+    /// | euro         | 360 x 960   | 4 x 2   |  2.76M    |
+    /// | long-range   | 360 x 2000  | 4 x 4   | 11.52M    |
+    /// | fine-azimuth | 1440 x 2000 | 1 x 4   | 11.52M    |
+    ///
+    /// THE SCALE RATIO: the long-range shape against the cheaper of the two
+    /// small ones, per cell. It produces 4.37x their cells, so linear cost is
+    /// 1x per cell and cost quadratic in output cells would be 4.37x. Read
+    /// 0.94x idle and 0.41-1.11x across ten runs under load.
+    ///
+    /// THE GEOMETRY RATIO: the two 11.52M-cell shapes against each other.
+    /// Same output size, same allocation, same chunk count -- only the native
+    /// grid differs, 1440 rows against 360. A search over native rows would
+    /// put a 4x between them. Read 1.30x idle and 1.02-1.52x under load.
+    ///
+    /// "Under load" above means 96 memory-streaming burner processes on 32
+    /// cores, which inflated the absolute figures 5-7x. Both ceilings were
+    /// also checked from the other side, by injecting the regression each is
+    /// meant to catch into the inner loop: work proportional to the output
+    /// row width took the scale ratio to 3.39x, and work proportional to the
+    /// native row count took the geometry ratio to 3.48x. Each fired its own
+    /// assertion and left the other ratio flat.
+    ///
+    /// Two things keep both ratios steady under load. The shapes are
+    /// round-robined and the FASTEST pass of each is kept -- load arrives in
+    /// bursts that inflate some passes enormously and leave others alone, so
+    /// a minimum over many interleaved passes sits near the unloaded cost
+    /// where a single sample does not. And the scale ratio is ONE-SIDED
+    /// against the small shapes, whose finer rayon chunks (7 KB against
+    /// 32 KB) suffer most from contention -- that raises the denominator and
+    /// can only make the assertion easier.
+    ///
+    /// WHAT THIS DOES NOT CATCH, said plainly so nobody trusts it further
+    /// than it goes: a constant-factor slowdown that hits every shape alike,
+    /// and a search over native GATES (1832 against 2000 here -- the shapes
+    /// barely differ on that axis). The exact output shapes asserted below
+    /// pin how much work there is, and
+    /// `every_range_step_down_keeps_integer_metre_geometry_exact` pins it
+    /// against `INTERP_MAX_GRID_BYTES`; this test pins how that work scales.
     #[test]
     fn upsample_cost_smoke() {
-        // NEXRAD super-res-shaped cut (720 x 1832 at 0.5 deg x 250 m ->
-        // 2x1) and a European-shaped cut (360 x 960 at 1.0 deg x 500 m ->
-        // 4x2): one pass each, wall-clock printed for the perf report.
-        let azimuths = full_sweep_azimuths(720);
-        let data: Vec<f32> = (0..720 * 1832).map(|i| (i % 70) as f32).collect();
-        let (cut, grid) = cut_and_grid(MomentType::Reflectivity, &azimuths, 1832, 250, data);
-        let start = std::time::Instant::now();
-        let up = upsample_moment_grid(&cut, &grid).expect("upsamples");
-        let super_res_ms = start.elapsed().as_secs_f32() * 1000.0;
-        assert_eq!(up.grid.radial_count(), 1440);
-        assert_eq!(up.grid.gate_range.gate_count, 1832);
+        /// Interleaved passes per shape; the fastest of each is the estimate.
+        /// Thirty rather than a handful because the estimate is a MINIMUM:
+        /// more passes only ever make it cleaner, and the whole test still
+        /// runs in under a second idle. Under contention the big shapes take
+        /// four times as long per pass as the small ones and so are four
+        /// times likelier to be caught by any one burst, which is what the
+        /// extra samples are buying.
+        const PASSES: usize = 30;
+        /// Linear is 1x and quadratic-in-cells is 4.37x; the worst reading
+        /// under load was 1.11x and an injected regression reached 3.39x.
+        const MAX_SCALE_RATIO: f64 = 3.0;
+        /// Identical output from opposite native grids: 1x is the honest
+        /// answer and a per-native-row search would be 4x; the worst reading
+        /// under load was 1.52x and an injected regression reached 3.48x.
+        const MAX_GEOMETRY_RATIO: f64 = 2.5;
+        const SMALL: [usize; 2] = [0, 1];
+        const BIG: [usize; 2] = [2, 3];
 
-        let azimuths = full_sweep_azimuths(360);
-        let data: Vec<f32> = (0..360 * 960).map(|i| (i % 70) as f32).collect();
-        let (cut, grid) = cut_and_grid(MomentType::Reflectivity, &azimuths, 960, 500, data);
-        let start = std::time::Instant::now();
-        let up = upsample_moment_grid(&cut, &grid).expect("upsamples");
-        let euro_ms = start.elapsed().as_secs_f32() * 1000.0;
-        assert_eq!(up.grid.radial_count(), 1440);
-        assert_eq!(up.grid.gate_range.gate_count, 1920);
+        fn shape(rows: usize, gates: usize, spacing_m: i32) -> (ElevationCut, MomentGrid) {
+            let azimuths = full_sweep_azimuths(rows);
+            let data: Vec<f32> = (0..rows * gates).map(|i| (i % 70) as f32).collect();
+            cut_and_grid(MomentType::Reflectivity, &azimuths, gates, spacing_m, data)
+        }
 
-        // Worst realistic 4x4 case: a long-range 1.0 deg x 1000 m cut
-        // (360 x 2000 -> 1440 x 8000 = 11.5M cells, 46 MB F32).
-        let azimuths = full_sweep_azimuths(360);
-        let data: Vec<f32> = (0..360 * 2000).map(|i| (i % 70) as f32).collect();
-        let (cut, grid) = cut_and_grid(MomentType::Reflectivity, &azimuths, 2000, 1000, data);
-        let start = std::time::Instant::now();
-        let up = upsample_moment_grid(&cut, &grid).expect("upsamples");
-        let long_range_ms = start.elapsed().as_secs_f32() * 1000.0;
-        assert_eq!(up.grid.radial_count(), 1440);
-        assert_eq!(up.grid.gate_range.gate_count, 8000);
+        // Real geometries: NEXRAD super-res (0.5 deg x 250 m -> 2x1), a
+        // European cut (1.0 deg x 500 m -> 4x2), the worst realistic 4x4 case
+        // -- a long-range 1.0 deg x 1000 m cut landing at 46 MB, just inside
+        // INTERP_MAX_GRID_BYTES -- and the same output reached the other way,
+        // from a 0.25 deg sweep that needs no azimuth refinement at all.
+        let prepared = [
+            (
+                "super-res 720x1832 (2x1)",
+                shape(720, 1832, 250),
+                1440,
+                1832,
+            ),
+            ("euro 360x960 (4x2)", shape(360, 960, 500), 1440, 1920),
+            (
+                "long-range 360x2000 (4x4)",
+                shape(360, 2000, 1000),
+                1440,
+                8000,
+            ),
+            (
+                "fine-azimuth 1440x2000 (1x4)",
+                shape(1440, 2000, 1000),
+                1440,
+                8000,
+            ),
+        ];
+
+        let mut best_ms = [f64::INFINITY; 4];
+        for _ in 0..PASSES {
+            for (index, (label, (cut, grid), rows_out, gates_out)) in prepared.iter().enumerate() {
+                let start = std::time::Instant::now();
+                let up = upsample_moment_grid(cut, grid).expect("upsamples");
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                // The amount of work, pinned exactly and deterministically:
+                // the ratios below are about how it SCALES, not how much of
+                // it there is.
+                assert_eq!(up.grid.radial_count(), *rows_out, "{label}");
+                assert_eq!(up.grid.gate_range.gate_count, *gates_out, "{label}");
+                best_ms[index] = best_ms[index].min(elapsed_ms);
+            }
+        }
+
+        let cells: [f64; 4] = std::array::from_fn(|i| (prepared[i].2 * prepared[i].3) as f64);
+        // Held off zero: a machine whose timer says a pass took no time at
+        // all must not turn these ratios into NaN or infinity.
+        let ns_per_cell: [f64; 4] =
+            std::array::from_fn(|i| (best_ms[i] * 1.0e6 / cells[i]).max(f64::MIN_POSITIVE));
+        for (index, (label, _, _, _)) in prepared.iter().enumerate() {
+            // Printed so a human reading the run sees the numbers rather than
+            // a claim, and so the perf report still has its figures.
+            println!(
+                "upsample cost: {label} {:.2} ms best of {PASSES} for {:.2}M cells = {:.2} ns/cell",
+                best_ms[index],
+                cells[index] / 1.0e6,
+                ns_per_cell[index],
+            );
+        }
+
+        let cheapest_small = SMALL
+            .iter()
+            .map(|index| ns_per_cell[*index])
+            .fold(f64::INFINITY, f64::min);
+        let scale = ns_per_cell[2] / cheapest_small;
+        let big_low = BIG
+            .iter()
+            .map(|index| ns_per_cell[*index])
+            .fold(f64::INFINITY, f64::min);
+        let big_high = BIG
+            .iter()
+            .map(|index| ns_per_cell[*index])
+            .fold(0.0_f64, f64::max);
+        let geometry = big_high / big_low;
         println!(
-            "upsample cost: super-res 720x1832 (2x1) {super_res_ms:.2} ms, \
-             euro 360x960 (4x2) {euro_ms:.2} ms, \
-             long-range 360x2000 (4x4) {long_range_ms:.2} ms"
+            "upsample cost: scale {scale:.2}x (ceiling {MAX_SCALE_RATIO}x), geometry \
+             {geometry:.2}x (ceiling {MAX_GEOMETRY_RATIO}x)"
         );
-        // Generous bound -- this is a smoke test, not a benchmark gate.
-        assert!(super_res_ms < 2000.0 && euro_ms < 2000.0 && long_range_ms < 2000.0);
+
+        assert!(
+            scale <= MAX_SCALE_RATIO,
+            "the 11.52M-cell long-range shape costs {:.2} ns/cell against {cheapest_small:.2} \
+             ns/cell for a shape a quarter its size in the same run -- {scale:.2}x, over the \
+             {MAX_SCALE_RATIO}x ceiling. Upsampling has stopped being linear in the cells it \
+             produces.",
+            ns_per_cell[2],
+        );
+        assert!(
+            geometry <= MAX_GEOMETRY_RATIO,
+            "the two 11.52M-cell shapes cost {big_high:.2} and {big_low:.2} ns/cell in the same \
+             run -- {geometry:.2}x, over the {MAX_GEOMETRY_RATIO}x ceiling. Identical output \
+             from a 360-row and a 1440-row native grid has to cost the same per cell; something \
+             in the inner loop now scales with the native geometry."
+        );
     }
 
     /// A cut carrying an explicit gate geometry, for the U8/U16 fixtures

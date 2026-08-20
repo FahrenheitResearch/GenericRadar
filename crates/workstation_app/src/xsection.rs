@@ -36,6 +36,38 @@ use render2d::StormMotion;
 pub use build::XsCandidate;
 pub use line::SectionLine;
 
+/// Top of the slice, metres above the radar — the 3D explorer's box top, so
+/// the two vertical tools agree about what "the top" is.
+///
+/// The DEFAULT now rather than the only answer: `Cross-section > Top of the
+/// slice` carries it, because a 12 km top is most of a warm-season storm at
+/// twice the vertical resolution and a 20 km top is what an overshooting top
+/// needs. It stays the shipped value, so a session with no settings file
+/// samples exactly the slice it always sampled.
+pub const DEFAULT_TOP_M: f32 = 18_000.0;
+/// The shallowest and deepest slice this window will draw, metres. The floor
+/// is a real storm depth rather than an arbitrary small number; the ceiling is
+/// above any tropopause a WSR-88D can see through, and above it the picture is
+/// empty air.
+pub const MIN_TOP_M: f32 = 4_000.0;
+pub const MAX_TOP_M: f32 = 24_000.0;
+
+/// The slice top this window will actually use.
+///
+/// Fenced here as well as in the settings catalog, on the same principle the
+/// network tuning follows: the catalog's range is what the MENU offers, and
+/// this is what the code will accept from a hand-edited settings file. A
+/// non-finite top would make every rung's y coordinate `NaN` and paint an
+/// empty window, so it falls back to the shipped slice rather than to a clamp
+/// bound.
+pub fn sanitized_top_m(top_m: f32) -> f32 {
+    if top_m.is_finite() {
+        top_m.clamp(MIN_TOP_M, MAX_TOP_M)
+    } else {
+        DEFAULT_TOP_M
+    }
+}
+
 /// Everything the cross-section needs from the application per frame.
 pub struct XSectionInput<'a> {
     /// Volumes the slice may be built from, oldest first, exactly one marked
@@ -55,6 +87,15 @@ pub struct XSectionInput<'a> {
     pub color_table: &'a color_tables::ColorTable,
     /// Units and formatting for the readout, from the product registry.
     pub domain: product_engine::DisplayDomain,
+    /// How the slice's distance and height are written. Display only: the
+    /// slice is built, sampled and drawn in metres either way.
+    pub units: crate::units::UnitSystem,
+    /// Decimal places on the slice's distance, from Readout & annotation.
+    pub range_decimals: u8,
+    /// How high the slice is drawn, metres above the radar. Unlike `units`
+    /// this is NOT display-only: it is the top of the sampled picture, so
+    /// changing it re-keys the build and the slice is resampled.
+    pub top_m: f32,
 }
 
 /// Cross-section state: the line, the armed placement mode, and the slice
@@ -154,8 +195,27 @@ impl XSection {
         rect: egui::Rect,
         camera: analyst_runtime::Camera2D,
         viewport: analyst_runtime::ViewportMetrics,
+        units: crate::units::UnitSystem,
     ) {
-        line::draw_pane_overlay(self, ui, pane_index, rect, camera, viewport);
+        line::draw_pane_overlay(self, ui, pane_index, rect, camera, viewport, units);
+    }
+
+    /// Whether a finished slice is on screen.
+    ///
+    /// For the offscreen proof tool: a build runs on a worker, so a
+    /// screenshot taken on a frame count can catch an empty plot, and an
+    /// empty plot with correct axes proves nothing about the axes being drawn
+    /// over a real slice. `examples/xsection_proof.rs` waits on this instead.
+    ///
+    /// `dead_code` is allowed for the same reason `main.rs` allows it on the
+    /// modules with a second home: this module is also compiled by
+    /// `examples/xsection_proof.rs` and `tests/xsection_unit.rs`, the caller
+    /// lives there, and the lint is judged per compilation unit and cannot see
+    /// it. The application itself never asks - it draws the window every frame
+    /// either way.
+    #[allow(dead_code)]
+    pub fn has_built_slice(&self) -> bool {
+        self.built.is_some()
     }
 
     /// The cross-section window: drains finished builds, schedules the next
@@ -276,6 +336,7 @@ mod line {
     /// over one pane. See the module docs of [`super`] for why the widget
     /// registration order makes endpoint drags and camera pans
     /// collision-free.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_pane_overlay(
         xs: &mut XSection,
         ui: &mut egui::Ui,
@@ -283,6 +344,7 @@ mod line {
         rect: egui::Rect,
         camera: Camera2D,
         viewport: ViewportMetrics,
+        units: crate::units::UnitSystem,
     ) {
         // Below the pane header, so the title and status stay readable.
         let body = egui::Rect::from_min_max(
@@ -322,7 +384,7 @@ mod line {
             painter.text(
                 mid + egui::vec2(0.0, -10.0),
                 egui::Align2::CENTER_BOTTOM,
-                format!("{:.0} km", section.length_km()),
+                units.distance(section.length_km(), 0),
                 egui::FontId::monospace(11.0),
                 LABEL_INK,
             );
@@ -417,9 +479,6 @@ mod build {
     /// fit.
     pub(super) const SLICE_WIDTH: usize = 640;
     pub(super) const SLICE_HEIGHT: usize = 320;
-    /// Top of the slice, metres above the radar — the 3D explorer's box top,
-    /// so the two vertical tools agree about what "the top" is.
-    pub(super) const SLICE_TOP_M: f32 = 18_000.0;
 
     /// How far back a deeper volume may be pulled from when the displayed one
     /// is still filling. The 3D explorer's rationale: two arrived tilts are
@@ -467,6 +526,12 @@ mod build {
         /// changes the picture without changing the volume, the line or the
         /// palette, and nothing else here would notice.
         fill: SliceVerticalFill,
+        /// Slice top in whole metres. In the key for the same reason `fill`
+        /// is: `Cross-section > Top of the slice` changes what is sampled
+        /// while the volume, the line and the palette all stand still, and
+        /// without it here a changed top would not repaint until something
+        /// else moved.
+        top_m: i32,
     }
 
     /// Dealiased velocity tilts of one volume, indexed by cut. Costs on the
@@ -598,6 +663,7 @@ mod build {
             }),
             dealiased: input.uses_dealiased_velocity,
             fill,
+            top_m: super::sanitized_top_m(input.top_m).round() as i32,
         }
     }
 
@@ -690,7 +756,7 @@ mod build {
                 end_km: (line.b_km.0 as f32, line.b_km.1 as f32),
                 width: SLICE_WIDTH,
                 height: SLICE_HEIGHT,
-                top_m: SLICE_TOP_M,
+                top_m: super::sanitized_top_m(input.top_m),
             },
             fill,
         };
@@ -988,6 +1054,9 @@ mod build {
                 storm_motion: None,
                 color_table: tables.for_family(color_tables::ColorTableFamily::Reflectivity),
                 domain,
+                units: crate::units::UnitSystem::default(),
+                range_decimals: 1,
+                top_m: super::super::DEFAULT_TOP_M,
             };
             drain_and_drive(&mut xs, &context, &input);
             assert!(
@@ -1021,6 +1090,9 @@ mod build {
                 storm_motion: None,
                 color_table: tables.for_family(color_tables::ColorTableFamily::Reflectivity),
                 domain,
+                units: crate::units::UnitSystem::default(),
+                range_decimals: 1,
+                top_m: super::super::DEFAULT_TOP_M,
             };
             let line = super::super::SectionLine {
                 a_km: (-20.0, 5.0),
@@ -1034,6 +1106,43 @@ mod build {
                 slice_key(&volume, &input, line, SliceVerticalFill::Beams),
                 "nothing else about the key drifted"
             );
+
+            // Same argument for the slice top: nothing else moves when the
+            // analyst lowers it, so without it in the key the setting would
+            // change the axis labels and never resample the picture.
+            let lower = XSectionInput {
+                top_m: 12_000.0,
+                candidates: input.candidates,
+                moment: input.moment.clone(),
+                product_label: input.product_label.clone(),
+                uses_dealiased_velocity: input.uses_dealiased_velocity,
+                storm_motion: input.storm_motion,
+                color_table: input.color_table,
+                domain: input.domain,
+                units: input.units,
+                range_decimals: input.range_decimals,
+            };
+            assert_ne!(
+                beams,
+                slice_key(&volume, &lower, line, SliceVerticalFill::Beams),
+                "changing the slice top must schedule a rebuild"
+            );
+        }
+
+        /// The top the sampler is actually handed, against a settings file
+        /// that was edited by hand.
+        #[test]
+        fn the_slice_top_is_fenced_before_it_reaches_the_sampler() {
+            use super::super::{DEFAULT_TOP_M, MAX_TOP_M, MIN_TOP_M, sanitized_top_m};
+            assert_eq!(sanitized_top_m(DEFAULT_TOP_M), DEFAULT_TOP_M);
+            assert_eq!(sanitized_top_m(12_000.0), 12_000.0);
+            assert_eq!(sanitized_top_m(0.0), MIN_TOP_M);
+            assert_eq!(sanitized_top_m(-5.0), MIN_TOP_M);
+            assert_eq!(sanitized_top_m(1e9), MAX_TOP_M);
+            // A NaN top would make every rung's y coordinate NaN and paint an
+            // empty window, so it falls back to the shipped slice rather than
+            // to a clamp bound.
+            assert_eq!(sanitized_top_m(f32::NAN), DEFAULT_TOP_M);
         }
 
         #[test]
@@ -1076,7 +1185,7 @@ mod draw {
     use eframe::egui;
     use render2d::xsection::SliceVerticalFill;
 
-    use super::{XSection, XSectionInput, build};
+    use super::{XSection, XSectionInput};
 
     /// The fill toggle's buttons. Height is the touch floor: the section
     /// window is used on a tablet in the field, and a mode switch that a
@@ -1092,8 +1201,11 @@ mod draw {
     const PAD_TOP: f32 = 8.0;
     const PAD_RIGHT: f32 = 12.0;
 
-    /// Height ladder rung spacing, metres.
-    const HEIGHT_TICK_M: f32 = 2_000.0;
+    // The height ladder's rung spacing used to be a constant here,
+    // `HEIGHT_TICK_M = 2_000.0`. It is now chosen by `nice_height_step` from
+    // the slice top and the analyst's altitude unit, because a fixed metre
+    // spacing cannot label a ladder read in feet. The shipped 18 km slice in
+    // kilometres still resolves to exactly 2 000 m, and a test pins that.
 
     const CANVAS_GROUND: egui::Color32 = egui::Color32::from_rgb(10, 13, 17);
     const GRID_INK: egui::Color32 = egui::Color32::from_rgba_premultiplied(28, 30, 34, 40);
@@ -1196,11 +1308,19 @@ mod draw {
             .built
             .as_ref()
             .map(|built| built.slice.top_m)
-            .unwrap_or(build::SLICE_TOP_M);
+            .unwrap_or_else(|| super::sanitized_top_m(input.top_m));
 
-        // Height ladder, km ARL. Rungs across the plot so a feature's
-        // altitude can be read without leaving it.
-        for z_m in height_ticks_m(top_m) {
+        // Height ladder, in the analyst's own altitude unit. Rungs across the
+        // plot so a feature's altitude can be read without leaving it.
+        //
+        // The ladder is CHOSEN in that unit and then placed on the metre axis
+        // the slice was actually built on, which is why it reads 5 000 /
+        // 10 000 / 15 000 ft rather than the 6 562 / 13 123 / 19 685 a
+        // relabelled kilometre ladder would give.
+        let altitude = input.units.altitude;
+        let (height_ticks, height_step) = height_ladder(top_m, altitude);
+        let height_decimals = tick_decimals(height_step);
+        for z_m in height_ticks {
             let y = plot.bottom() - z_m / top_m * plot.height();
             painter.line_segment(
                 [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
@@ -1209,7 +1329,11 @@ mod draw {
             painter.text(
                 egui::pos2(plot.left() - 6.0, y),
                 egui::Align2::RIGHT_CENTER,
-                format!("{:.0}", z_m / 1000.0),
+                format!(
+                    "{:.*}",
+                    height_decimals,
+                    altitude.convert_metres(f64::from(z_m))
+                ),
                 egui::FontId::monospace(10.0),
                 AXIS_INK,
             );
@@ -1217,18 +1341,21 @@ mod draw {
         painter.text(
             egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            "km ARL",
+            format!("{} ARL", altitude.label()),
             egui::FontId::monospace(10.0),
             AXIS_INK,
         );
 
-        // Distance axis, km from A.
-        let length_km = section.length_km() as f32;
-        if length_km > 0.0 {
-            let step_km = nice_distance_step_km(length_km);
-            let mut d_km = 0.0f32;
-            while d_km <= length_km + 0.01 {
-                let x = plot.left() + (d_km / length_km).min(1.0) * plot.width();
+        // Distance axis, from A, in the analyst's own distance unit. Same
+        // rule as the height ladder: the step is a round number of THAT unit,
+        // and the fraction along the line it lands at is unit-free.
+        let distance = input.units.distance;
+        let length = distance.convert_km(section.length_km()) as f32;
+        if length > 0.0 {
+            let step = nice_distance_step(length);
+            let mut d = 0.0f32;
+            while d <= length + 0.01 {
+                let x = plot.left() + (d / length).min(1.0) * plot.width();
                 painter.line_segment(
                     [
                         egui::pos2(x, plot.bottom()),
@@ -1239,11 +1366,11 @@ mod draw {
                 painter.text(
                     egui::pos2(x, plot.bottom() + 6.0),
                     egui::Align2::CENTER_TOP,
-                    format!("{d_km:.0}"),
+                    format!("{d:.0}"),
                     egui::FontId::monospace(10.0),
                     AXIS_INK,
                 );
-                d_km += step_km;
+                d += step;
             }
         }
         // Which end is which, matching the pane labels.
@@ -1257,7 +1384,7 @@ mod draw {
         painter.text(
             egui::pos2(plot.right(), rect.bottom() - 2.0),
             egui::Align2::RIGHT_BOTTOM,
-            "B  km",
+            format!("B  {}", distance.label()),
             egui::FontId::monospace(10.0),
             READOUT_INK,
         );
@@ -1292,6 +1419,8 @@ mod draw {
                     &input.domain,
                     f64::from(slice.height_m_at_row(row)),
                     f64::from(slice.distance_m_at_col(column)),
+                    input.units,
+                    input.range_decimals,
                 );
                 let anchor = egui::pos2(plot.left() + 8.0, plot.bottom() - 8.0);
                 let galley =
@@ -1310,22 +1439,87 @@ mod draw {
         }
     }
 
-    /// Height rungs from one spacing up to (not including) the top.
-    pub(super) fn height_ticks_m(top_m: f32) -> Vec<f32> {
+    /// The height ladder for a slice `top_m` metres tall, read in `unit`:
+    /// the rungs in METRES (which is what the picture is drawn on) and the
+    /// step in the analyst's own unit (which is what the labels are written
+    /// in).
+    ///
+    /// Rungs run from one step up to, but not including, the top - the top of
+    /// the plot is the frame, and a label sitting on it reads as a rung that
+    /// is half off the picture.
+    pub(super) fn height_ladder(top_m: f32, unit: crate::units::AltitudeUnit) -> (Vec<f32>, f64) {
+        let top = unit.convert_metres(f64::from(top_m));
+        let step = nice_height_step(top);
         let mut ticks = Vec::new();
-        let mut z = HEIGHT_TICK_M;
-        while z < top_m {
-            ticks.push(z);
-            z += HEIGHT_TICK_M;
+        if step <= 0.0 || !top.is_finite() {
+            return (ticks, step.max(1.0));
         }
-        ticks
+        let mut rung = step;
+        while rung < top {
+            ticks.push(unit.to_metres(rung) as f32);
+            rung += step;
+        }
+        (ticks, step)
+    }
+
+    /// The most rungs a height ladder may carry. Twelve labels down a 300-point
+    /// axis is one every 25 points, which is the density the shipped
+    /// 18 km / 2 km ladder already had at eight.
+    const MAX_HEIGHT_RUNGS: f64 = 12.0;
+
+    /// A round step for a ladder that has to reach `top` in at most
+    /// [`MAX_HEIGHT_RUNGS`] rungs, in whatever unit `top` is stated in.
+    ///
+    /// Scale-free on purpose: the same routine has to answer "2" for an 18 km
+    /// top and "5 000" for the same slice read in feet, and a fixed candidate
+    /// list cannot span four orders of magnitude. It walks the 1 / 2 / 2.5 / 5
+    /// ladder inside the decade the answer must live in - the standard
+    /// tick-choosing rule, and the same one `vol3d::annotations::nice_ticks`
+    /// applies to the 3D explorer's kilofoot ladder.
+    ///
+    /// An 18 km top in kilometres gives exactly 2 km, which is the constant
+    /// this replaced (`HEIGHT_TICK_M = 2_000.0`), so the shipped slice is
+    /// unmoved.
+    fn nice_height_step(top: f64) -> f64 {
+        if !(top.is_finite() && top > 0.0) {
+            return 1.0;
+        }
+        let smallest = top / MAX_HEIGHT_RUNGS;
+        let decade = 10f64.powi(smallest.log10().floor() as i32);
+        for factor in [1.0, 2.0, 2.5, 5.0] {
+            let step = factor * decade;
+            if step >= smallest {
+                return step;
+            }
+        }
+        10.0 * decade
+    }
+
+    /// Decimal places a tick label needs to distinguish one rung from the
+    /// next. A whole-number step gets none, which is what keeps the shipped
+    /// kilometre ladder writing "2", "4", "6" and not "2.0", "4.0", "6.0".
+    pub(super) fn tick_decimals(step: f64) -> usize {
+        for (decimals, scale) in [(0usize, 1.0f64), (1, 10.0)] {
+            let scaled = step * scale;
+            if (scaled - scaled.round()).abs() < 1e-9 {
+                return decimals;
+            }
+        }
+        2
     }
 
     /// A distance tick spacing that yields a handful of readable labels at
     /// any line length.
-    pub(super) fn nice_distance_step_km(length_km: f32) -> f32 {
+    ///
+    /// Unit-free: it is handed a length already converted to the analyst's
+    /// distance unit and returns a step in that same unit, so a 100 km line
+    /// read in miles gets ticks every 10 MILES rather than every 10 km
+    /// relabelled. The candidate list is the one the kilometre-only version
+    /// carried, so a session in kilometres gets exactly the ladder it always
+    /// got.
+    pub(super) fn nice_distance_step(length: f32) -> f32 {
         for step in [1.0f32, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0] {
-            if length_km / step <= 8.0 {
+            if length / step <= 8.0 {
                 return step;
             }
         }
@@ -1352,16 +1546,22 @@ mod draw {
 
     /// "47.5 dBZ · 8.2 km ARL · 31.4 km" — or an honest "no data" where the
     /// radar saw nothing, which is different from zero.
+    ///
+    /// `units` and `range_decimals` reach only the two position figures; the
+    /// value itself is the product's own domain and is untouched. Under the
+    /// defaults this writes exactly what it always wrote.
     pub(super) fn format_readout(
         value: f32,
         domain: &product_engine::DisplayDomain,
         height_m: f64,
         distance_m: f64,
+        units: crate::units::UnitSystem,
+        range_decimals: u8,
     ) -> String {
         let position = format!(
-            "{:.1} km ARL · {:.1} km",
-            height_m / 1000.0,
-            distance_m / 1000.0
+            "{} ARL · {}",
+            units.altitude(height_m, 1),
+            units.distance(distance_m / 1000.0, range_decimals)
         );
         if value.is_finite() {
             let unit = domain.display_unit.label();
@@ -1379,26 +1579,267 @@ mod draw {
     mod tests {
         use super::*;
 
+        use crate::units::{AltitudeUnit, DistanceUnit};
+
         #[test]
         fn the_height_ladder_spans_the_slice_without_touching_its_edges() {
-            let ticks = height_ticks_m(18_000.0);
+            // The shipped 18 km slice, read in kilometres: exactly the ladder
+            // the fixed 2 000 m constant produced.
+            let (ticks, step) = height_ladder(18_000.0, AltitudeUnit::Kilometres);
+            assert_eq!(step, 2.0, "the shipped ladder still steps by 2 km");
             assert_eq!(ticks.first().copied(), Some(2_000.0));
             assert_eq!(ticks.last().copied(), Some(16_000.0));
             assert_eq!(ticks.len(), 8);
+            // And the labels those rungs get are the bare integers the axis
+            // has always written.
+            assert_eq!(tick_decimals(step), 0);
+            let written: Vec<String> = ticks
+                .iter()
+                .map(|z| {
+                    format!(
+                        "{:.0}",
+                        AltitudeUnit::Kilometres.convert_metres(f64::from(*z))
+                    )
+                })
+                .collect();
+            assert_eq!(written, ["2", "4", "6", "8", "10", "12", "14", "16"]);
+        }
+
+        /// The defect this closes: the axis was the one cross-section surface
+        /// the unit rollout did not reach, so a session in feet showed a
+        /// readout saying "26903 ft ARL" a few pixels from a ladder labelled
+        /// 0, 2, 4 … 18 under the caption "km ARL".
+        ///
+        /// The ladder is chosen IN feet rather than converted from the
+        /// kilometre one, which is why it reads in round thousands.
+        #[test]
+        fn the_height_ladder_is_chosen_in_the_analysts_own_unit() {
+            let (ticks, step) = height_ladder(18_000.0, AltitudeUnit::Feet);
+            assert_eq!(step, 5_000.0, "an 18 km slice in feet steps by 5 000 ft");
+            let written: Vec<String> = ticks
+                .iter()
+                .map(|z| format!("{:.0}", AltitudeUnit::Feet.convert_metres(f64::from(*z))))
+                .collect();
+            assert_eq!(
+                written,
+                [
+                    "5000", "10000", "15000", "20000", "25000", "30000", "35000", "40000", "45000",
+                    "50000", "55000"
+                ],
+                "a relabelled kilometre ladder would read 6562, 13123, 19685"
+            );
+            // Metres get their own round ladder too.
+            let (_, step) = height_ladder(18_000.0, AltitudeUnit::Metres);
+            assert_eq!(step, 2_000.0);
+        }
+
+        /// Whatever the top and whatever the unit, the ladder stays readable:
+        /// a handful of rungs, all inside the picture.
+        #[test]
+        fn the_height_ladder_stays_readable_at_every_top_and_unit() {
+            for top_m in [4_000.0f32, 8_000.0, 12_000.0, 18_000.0, 24_000.0] {
+                for unit in AltitudeUnit::ALL {
+                    let (ticks, step) = height_ladder(top_m, unit);
+                    assert!(
+                        (3..=12).contains(&ticks.len()),
+                        "{} at {top_m} m: {} rungs",
+                        unit.id(),
+                        ticks.len()
+                    );
+                    assert!(step > 0.0);
+                    for z in &ticks {
+                        assert!(*z > 0.0 && *z < top_m, "rung {z} outside 0..{top_m}");
+                    }
+                }
+            }
         }
 
         #[test]
         fn distance_steps_stay_readable_at_every_line_length() {
             for (length, expected) in [(6.0, 1.0), (30.0, 5.0), (80.0, 10.0), (400.0, 50.0)] {
-                assert_eq!(nice_distance_step_km(length), expected, "{length} km line");
+                assert_eq!(nice_distance_step(length), expected, "{length} km line");
             }
             // Never more than 9 labels, and always at least one.
             for length in [1.0f32, 12.0, 47.0, 133.0, 380.0, 900.0] {
-                let step = nice_distance_step_km(length);
+                let step = nice_distance_step(length);
                 let labels = (length / step).floor() + 1.0;
                 assert!(labels <= 9.0, "{length} km: {labels} labels");
                 assert!(labels >= 1.0);
             }
+        }
+
+        /// The distance axis steps in the analyst's unit as well, so a
+        /// 100 km line read in miles is ticked every 10 miles rather than
+        /// every 6.2.
+        #[test]
+        fn the_distance_axis_steps_in_the_analysts_own_unit() {
+            let length_km = 100.0_f64;
+            let in_miles = DistanceUnit::StatuteMiles.convert_km(length_km) as f32;
+            assert_eq!(nice_distance_step(in_miles), 10.0);
+            // The far end of the axis is the whole line either way: the
+            // fraction along it is unit-free.
+            assert!((in_miles - 62.137_12).abs() < 1e-3, "{in_miles}");
+        }
+
+        /// The two axis captions. They are the half of the miss that no
+        /// conversion would have caught: a correct number under the wrong
+        /// unit name is worse than an unconverted one.
+        #[test]
+        fn the_axis_captions_name_the_unit_they_are_written_in() {
+            assert_eq!(format!("{} ARL", AltitudeUnit::default().label()), "km ARL");
+            assert_eq!(format!("B  {}", DistanceUnit::default().label()), "B  km");
+            assert_eq!(format!("{} ARL", AltitudeUnit::Feet.label()), "ft ARL");
+            assert_eq!(
+                format!("B  {}", DistanceUnit::StatuteMiles.label()),
+                "B  mi"
+            );
+        }
+
+        /// Every string the section window painted, read off a real egui pass.
+        ///
+        /// The tests above pin the tick HELPERS, which is not the same claim:
+        /// the defect being closed here was that the helpers were fine and the
+        /// call sites did not pass `input.units` to them. Only reading the
+        /// frame catches that, which is the same reason `pane_canvas` has
+        /// `chrome_tests`.
+        fn painted_strings(units: crate::units::UnitSystem, top_m: f32) -> Vec<String> {
+            let tables = color_tables::ColorTableSet::default();
+            let domain = product_engine::ProductRegistry::builtin()
+                .get("REF")
+                .expect("REF exists")
+                .domain;
+            let mut xs = XSection {
+                open: true,
+                line: Some(super::super::SectionLine {
+                    a_km: (-60.0, -40.0),
+                    b_km: (60.0, 40.0),
+                }),
+                ..Default::default()
+            };
+            let input = XSectionInput {
+                candidates: &[],
+                moment: radar_core::MomentType::Reflectivity,
+                product_label: "REF".to_owned(),
+                uses_dealiased_velocity: false,
+                storm_motion: None,
+                color_table: tables.for_family(color_tables::ColorTableFamily::Reflectivity),
+                domain,
+                units,
+                range_decimals: 1,
+                top_m,
+            };
+            let context = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 520.0),
+                )),
+                ..Default::default()
+            };
+            // Two passes, because the first builds the font atlas and a
+            // section window is never a session's first frame.
+            let mut strings = Vec::new();
+            for _ in 0..2 {
+                let output = context.run_ui(raw.clone(), |ui| {
+                    // The section is an `egui::Window`, so it is opened
+                    // against the context rather than nested in this `Ui` -
+                    // exactly as `app.rs` opens it.
+                    let context = ui.ctx().clone();
+                    xs.window(&context, &input);
+                });
+                strings = output
+                    .shapes
+                    .into_iter()
+                    .filter_map(|clipped| match clipped.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            strings
+        }
+
+        /// The default window, read off the frame: the ladder and the captions
+        /// the section has always drawn.
+        #[test]
+        fn the_default_window_paints_the_axes_it_always_painted() {
+            let painted = painted_strings(crate::units::UnitSystem::default(), 18_000.0);
+            assert!(painted.iter().any(|text| text == "km ARL"), "{painted:?}");
+            assert!(painted.iter().any(|text| text == "B  km"), "{painted:?}");
+            for rung in ["2", "4", "6", "8", "10", "12", "14", "16"] {
+                assert!(
+                    painted.iter().any(|text| text == rung),
+                    "the {rung} km rung is missing from {painted:?}"
+                );
+            }
+            // A 144.2 km line, ticked every 20 km.
+            for tick in ["0", "20", "40", "60", "80", "100", "120", "140"] {
+                assert!(
+                    painted.iter().any(|text| text == tick),
+                    "the {tick} km tick is missing from {painted:?}"
+                );
+            }
+        }
+
+        /// The same window in feet and miles. THIS is the defect: the readout
+        /// was converted and the axes were not, so the window showed
+        /// "26903 ft ARL" beside a ladder captioned "km ARL".
+        #[test]
+        fn the_window_paints_both_axes_in_the_analysts_own_units() {
+            let imperial = crate::units::UnitSystem {
+                distance: DistanceUnit::StatuteMiles,
+                altitude: AltitudeUnit::Feet,
+                ..crate::units::UnitSystem::default()
+            };
+            let painted = painted_strings(imperial, 18_000.0);
+
+            assert!(
+                painted.iter().any(|text| text == "ft ARL"),
+                "the height caption still claims kilometres: {painted:?}"
+            );
+            assert!(
+                painted.iter().any(|text| text == "B  mi"),
+                "the distance caption still claims kilometres: {painted:?}"
+            );
+            assert!(
+                !painted
+                    .iter()
+                    .any(|text| text == "km ARL" || text == "B  km"),
+                "a kilometre caption survived: {painted:?}"
+            );
+            // Round thousands of feet, not a relabelled kilometre ladder.
+            for rung in ["5000", "10000", "55000"] {
+                assert!(
+                    painted.iter().any(|text| text == rung),
+                    "the {rung} ft rung is missing from {painted:?}"
+                );
+            }
+            assert!(
+                !painted.iter().any(|text| text == "6562" || text == "13123"),
+                "these are a kilometre ladder relabelled: {painted:?}"
+            );
+            // 144.2 km is 89.6 mi, ticked every 20 mi - so 100, 120 and 140
+            // cannot be on the distance axis any more.
+            for gone in ["100", "120", "140"] {
+                assert!(
+                    !painted.iter().any(|text| text == gone),
+                    "the distance axis is still stepping in kilometres: {painted:?}"
+                );
+            }
+        }
+
+        /// A shallower slice re-chooses its own rungs rather than keeping a
+        /// spacing that would crowd or empty the axis.
+        #[test]
+        fn a_shallower_slice_relabels_its_height_ladder() {
+            let painted = painted_strings(crate::units::UnitSystem::default(), 12_000.0);
+            assert!(painted.iter().any(|text| text == "km ARL"), "{painted:?}");
+            // 12 km in kilometres steps by 1, so 11 is a rung and 16 cannot be.
+            assert!(painted.iter().any(|text| text == "11"), "{painted:?}");
+            assert!(
+                !painted.iter().any(|text| text == "16"),
+                "a rung above the slice top was painted: {painted:?}"
+            );
         }
 
         #[test]
@@ -1435,12 +1876,33 @@ mod draw {
                 .get("REF")
                 .expect("REF exists")
                 .domain;
-            let text = format_readout(f32::NAN, &domain, 5_000.0, 12_000.0);
+            let units = crate::units::UnitSystem::default();
+            let text = format_readout(f32::NAN, &domain, 5_000.0, 12_000.0, units, 1);
             assert!(text.starts_with("no data"), "{text}");
             assert!(text.contains("5.0 km ARL"), "{text}");
-            let text = format_readout(47.5, &domain, 8_200.0, 31_400.0);
+            let text = format_readout(47.5, &domain, 8_200.0, 31_400.0, units, 1);
             assert!(text.contains("dBZ"), "{text}");
             assert!(text.contains("47.5"), "{text}");
+            assert!(text.contains("8.2 km ARL · 31.4 km"), "{text}");
+        }
+
+        /// The same slice cell, read in the other units. The dBZ is the
+        /// product's own domain and does not move.
+        #[test]
+        fn the_slice_readout_follows_the_unit_settings() {
+            let domain = product_engine::ProductRegistry::builtin()
+                .get("REF")
+                .expect("REF exists")
+                .domain;
+            let imperial = crate::units::UnitSystem {
+                distance: crate::units::DistanceUnit::StatuteMiles,
+                altitude: crate::units::AltitudeUnit::Feet,
+                ..crate::units::UnitSystem::default()
+            };
+            let text = format_readout(47.5, &domain, 8_200.0, 31_400.0, imperial, 1);
+            assert!(text.contains("47.5"), "{text}");
+            assert!(text.contains("26903 ft ARL"), "{text}");
+            assert!(text.contains("19.5 mi"), "{text}");
         }
     }
 }

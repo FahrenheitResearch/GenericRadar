@@ -1,5 +1,6 @@
 //! Public radar data-source helpers.
 
+pub mod tuning;
 pub mod warnings;
 
 use std::collections::BTreeMap;
@@ -22,10 +23,11 @@ const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const HTTP_USER_AGENT: &str = "GenericRadar/0.1 local-desktop";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
-const REALTIME_CHUNK_DOWNLOAD_BATCH: usize = 8;
-/// Total attempts per S3 object. See [`download_s3_object_to_path`].
-const S3_OBJECT_DOWNLOAD_ATTEMPTS: usize = 3;
-const S3_OBJECT_DOWNLOAD_RETRY_DELAY: StdDuration = StdDuration::from_millis(150);
+// The chunk batch size, the per-object attempt count and the pause between
+// attempts moved to [`tuning`], where they are settable and fenced. Their
+// shipped values are unchanged and live there as
+// `tuning::DEFAULT_CHUNK_DOWNLOAD_BATCH`, `tuning::DEFAULT_DOWNLOAD_ATTEMPTS`
+// and `tuning::DEFAULT_RETRY_BACKOFF`.
 /// How many active volume ids to walk backwards before giving up on finding a
 /// complete predecessor. Four covers a couple of aborted or skipped volumes
 /// without turning a quiet site into a long chain of listings.
@@ -1280,7 +1282,7 @@ pub fn download_realtime_volume_cancellable(
         chunk_paths.push(chunk_path);
     }
 
-    for batch in missing.chunks(REALTIME_CHUNK_DOWNLOAD_BATCH) {
+    for batch in missing.chunks(tuning::chunk_download_batch()) {
         if cancelled() {
             return Err(DataSourceError::DownloadCancelled {
                 site: volume.site.clone(),
@@ -2052,15 +2054,19 @@ fn download_s3_object_to_path_cancellable(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let url = format!("https://{bucket}.s3.amazonaws.com/{}", object.key);
-    for attempt in 1..=S3_OBJECT_DOWNLOAD_ATTEMPTS {
+    // Read once, so one object's whole retry sequence runs under one policy
+    // even if the analyst moves the slider while it is in flight.
+    let attempts = tuning::download_attempts();
+    let backoff = tuning::retry_backoff();
+    for attempt in 1..=attempts {
         match download_s3_object_attempt(&url, object, path, cancelled) {
             Ok(()) => return Ok(()),
             Err(error) => {
-                if attempt == S3_OBJECT_DOWNLOAD_ATTEMPTS || !is_retriable_download_error(&error) {
+                if attempt == attempts || !is_retriable_download_error(&error) {
                     return Err(error);
                 }
                 eprintln!("retrying {url} after attempt {attempt}: {error}");
-                thread::sleep(S3_OBJECT_DOWNLOAD_RETRY_DELAY);
+                thread::sleep(backoff);
             }
         }
     }

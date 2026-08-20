@@ -17,7 +17,18 @@
 //! out a hit target of at least [`MIN_TOUCH_POINTS`] points per side (WCAG
 //! 2.2, SC 2.5.8 "Target Size (Minimum)", 24 CSS px) and nothing depends on
 //! hover to be discoverable: a latched toolbar toggle is sunken and tinted
-//! whether or not a pointer exists.
+//! whether or not a pointer exists. That floor holds in every
+//! [`super::Density`]: a denser instrument buys its density from the gaps
+//! between controls and from the padding inside oversized ones, never from
+//! the size of the target.
+//!
+//! Two of the appearance axes land here rather than in egui's `Style`,
+//! because egui has nowhere to put them: [`super::Density`] supplies the
+//! paddings and margins these helpers lay out with, and
+//! [`super::ChromeEdges`] chooses what [`paint_bevel`] paints inside a rect.
+//! Both are read from the egui context by [`super::chrome`], so a call site
+//! never threads them through - and `Flat` is a change of paint, not of
+//! geometry, so switching it cannot move a control by a pixel.
 
 use eframe::egui::containers::menu::MenuConfig;
 use eframe::egui::emath::GuiRounding as _;
@@ -26,6 +37,7 @@ use eframe::egui::{
     Ui, UiKind, UiStackInfo, WidgetInfo, WidgetText, WidgetType, pos2, vec2,
 };
 
+use super::appearance::ChromeEdges;
 use super::palette::Palette;
 
 /// Minimum side of an interactive element, in points. WCAG 2.2 SC 2.5.8.
@@ -82,10 +94,37 @@ fn ring(painter: &Painter, rect: Rect, px: f32, lit: Color32, shade: Color32) {
 ///
 /// The rect is snapped to the device pixel grid first, so the lines land on
 /// whole pixels at any scale factor and never anti-alias into grey mush.
-pub fn paint_bevel(painter: &Painter, rect: Rect, bevel: Bevel, palette: &Palette) {
+///
+/// `edges` picks the language, and it changes only what is painted: both
+/// modes take the same rect, snap it the same way and paint inside it, so a
+/// layout is identical in either. In [`ChromeEdges::Flat`] the two-line 3D
+/// ring becomes one plain border, and the raised/sunken distinction is
+/// carried by the fill the caller already painted (a button is
+/// `face_raised`, a well is `well`). The border colour is `border_strong`
+/// rather than `border` because in flat mode that line IS the affordance -
+/// it is pinned at ≥ 3:1 against both face and well (W3C WCAG 2.2, 2023,
+/// SC 1.4.11 non-text contrast) by `tests/theme_catalog.rs`, where the
+/// bevelled edges only have to clear 1.3:1.
+pub fn paint_bevel(
+    painter: &Painter,
+    rect: Rect,
+    bevel: Bevel,
+    palette: &Palette,
+    edges: ChromeEdges,
+) {
     let ppp = painter.pixels_per_point();
     let px = 1.0 / ppp;
     let rect = rect.round_to_pixels(ppp);
+    if edges == ChromeEdges::Flat {
+        let color = match bevel {
+            // A groove is decoration between things, not the edge of a
+            // thing: it stays the quieter line.
+            Bevel::Etched => palette.border,
+            _ => palette.border_strong,
+        };
+        ring(painter, rect, px, color, color);
+        return;
+    }
     match bevel {
         Bevel::Raised => {
             ring(painter, rect, px, palette.hi_outer, palette.sh_outer);
@@ -127,12 +166,18 @@ pub fn paint_bevel(painter: &Painter, rect: Rect, bevel: Bevel, palette: &Palett
 /// Fills with the panel face and paints the chunky two-line bevel around the
 /// contents. The inner margin keeps content clear of the bevel lines.
 pub fn raised_frame<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
     let response = eframe::egui::Frame::NONE
-        .fill(palette.face)
-        .inner_margin(Margin::same(6))
+        .fill(chrome.palette.face)
+        .inner_margin(Margin::same(chrome.density.metrics().frame_margin))
         .show(ui, add_contents);
-    paint_bevel(ui.painter(), response.response.rect, Bevel::Raised, palette);
+    paint_bevel(
+        ui.painter(),
+        response.response.rect,
+        Bevel::Raised,
+        &chrome.palette,
+        chrome.edges,
+    );
     response
 }
 
@@ -142,12 +187,18 @@ pub fn raised_frame<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> 
 /// the chrome in the dark one — and paints the sunken bevel, so the area
 /// reads as *behind* the panel surface the way every Win95 list box did.
 pub fn sunken_well<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
     let response = eframe::egui::Frame::NONE
-        .fill(palette.well)
-        .inner_margin(Margin::same(6))
+        .fill(chrome.palette.well)
+        .inner_margin(Margin::same(chrome.density.metrics().frame_margin))
         .show(ui, add_contents);
-    paint_bevel(ui.painter(), response.response.rect, Bevel::Sunken, palette);
+    paint_bevel(
+        ui.painter(),
+        response.response.rect,
+        Bevel::Sunken,
+        &chrome.palette,
+        chrome.edges,
+    );
     response
 }
 
@@ -161,7 +212,9 @@ pub fn group_box<R>(
     caption: &str,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> InnerResponse<R> {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
+    let palette = &chrome.palette;
+    let metrics = chrome.density.metrics();
     let galley = WidgetText::from(caption).into_galley(
         ui,
         Some(TextWrapMode::Extend),
@@ -172,16 +225,16 @@ pub fn group_box<R>(
     let caption_width = galley.size().x;
     // Room above the content for the caption, and enough on the other sides
     // that content never collides with the groove.
-    let top_margin = (caption_height + 6.0).ceil() as i8;
+    let top_margin = (caption_height + metrics.group_caption_gap).ceil() as i8;
     let response = eframe::egui::Frame::NONE
         .inner_margin(Margin {
-            left: 10,
-            right: 10,
+            left: metrics.group_margin_x,
+            right: metrics.group_margin_x,
             top: top_margin,
-            bottom: 8,
+            bottom: metrics.group_margin_bottom,
         })
         .show(ui, |ui| {
-            ui.set_min_width(caption_width + 16.0);
+            ui.set_min_width(caption_width + f32::from(metrics.group_margin_x) * 1.6);
             add_contents(ui)
         });
     let rect = response.response.rect;
@@ -191,10 +244,10 @@ pub fn group_box<R>(
         rect.max,
     );
     let painter = ui.painter();
-    paint_bevel(painter, box_rect, Bevel::Etched, palette);
+    paint_bevel(painter, box_rect, Bevel::Etched, palette, chrome.edges);
     // A face-coloured band under the caption hides the groove behind the
     // text; painted after the bevel so it wins.
-    let caption_pos = pos2(rect.min.x + 10.0, rect.min.y);
+    let caption_pos = pos2(rect.min.x + f32::from(metrics.group_margin_x), rect.min.y);
     let band = Rect::from_min_size(
         pos2(caption_pos.x - 3.0, rect.min.y),
         vec2(caption_width + 6.0, caption_height),
@@ -207,7 +260,16 @@ pub fn group_box<R>(
 /// An etched separator line, horizontal or vertical to match the layout —
 /// the two-hairline groove Win95 drew between toolbar groups and menu items.
 pub fn etched_separator(ui: &mut Ui) {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
+    let palette = &chrome.palette;
+    let thickness = chrome.density.metrics().separator_thickness;
+    // Flat chrome draws ONE plain line where the groove's shade-then-lit
+    // pair goes; the allocation is unchanged either way, so a bar does not
+    // re-flow when the edge language changes.
+    let (near, far) = match chrome.edges {
+        ChromeEdges::Bevelled => (palette.sh_inner, Some(palette.hi_outer)),
+        ChromeEdges::Flat => (palette.border, None),
+    };
     let ppp = ui.painter().pixels_per_point();
     let px = 1.0 / ppp;
     // In a horizontal layout the separator is a vertical line, exactly as
@@ -253,10 +315,10 @@ pub fn etched_separator(ui: &mut Ui) {
     };
     let (rect, _) = if vertical_line {
         let height = length(ui.available_size_before_wrap().y);
-        ui.allocate_exact_size(vec2(7.0, height), Sense::hover())
+        ui.allocate_exact_size(vec2(thickness, height), Sense::hover())
     } else {
         let width = length(ui.available_size_before_wrap().x);
-        ui.allocate_exact_size(vec2(width, 7.0), Sense::hover())
+        ui.allocate_exact_size(vec2(width, thickness), Sense::hover())
     };
     if !ui.is_rect_visible(rect) {
         return;
@@ -268,25 +330,29 @@ pub fn etched_separator(ui: &mut Ui) {
         painter.rect_filled(
             Rect::from_min_max(pos2(x, rect.min.y), pos2(x + px, rect.max.y)),
             0.0,
-            palette.sh_inner,
+            near,
         );
-        painter.rect_filled(
-            Rect::from_min_max(pos2(x + px, rect.min.y), pos2(x + 2.0 * px, rect.max.y)),
-            0.0,
-            palette.hi_outer,
-        );
+        if let Some(far) = far {
+            painter.rect_filled(
+                Rect::from_min_max(pos2(x + px, rect.min.y), pos2(x + 2.0 * px, rect.max.y)),
+                0.0,
+                far,
+            );
+        }
     } else {
         let y = (rect.center().y).round_to_pixels(ppp);
         painter.rect_filled(
             Rect::from_min_max(pos2(rect.min.x, y), pos2(rect.max.x, y + px)),
             0.0,
-            palette.sh_inner,
+            near,
         );
-        painter.rect_filled(
-            Rect::from_min_max(pos2(rect.min.x, y + px), pos2(rect.max.x, y + 2.0 * px)),
-            0.0,
-            palette.hi_outer,
-        );
+        if let Some(far) = far {
+            painter.rect_filled(
+                Rect::from_min_max(pos2(rect.min.x, y + px), pos2(rect.max.x, y + 2.0 * px)),
+                0.0,
+                far,
+            );
+        }
     }
 }
 
@@ -371,12 +437,13 @@ pub fn sunken_readout(
     max_width: f32,
     text: impl Into<WidgetText>,
 ) -> Response {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
+    let palette = &chrome.palette;
     // The vertical padding is small on purpose: the height floor below is
     // what sets the height, so a readout comes out exactly as tall as a
     // `toolbar_button` and the row of controls shares one baseline instead of
     // stepping up and down across the bar.
-    let padding = vec2(7.0, 2.0);
+    let padding = chrome.density.metrics().readout_padding;
     let galley = text.into().into_galley(
         ui,
         Some(TextWrapMode::Truncate),
@@ -395,7 +462,7 @@ pub fn sunken_readout(
         let rect = rect.round_to_pixels(ppp);
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, palette.well);
-        paint_bevel(painter, rect, Bevel::Sunken, palette);
+        paint_bevel(painter, rect, Bevel::Sunken, palette, chrome.edges);
         let text_pos = pos2(
             rect.min.x + padding.x,
             rect.center().y - 0.5 * galley.size().y,
@@ -407,14 +474,18 @@ pub fn sunken_readout(
 }
 
 fn toolbar_control(ui: &mut Ui, text: WidgetText, selected: bool) -> Response {
-    let palette = Palette::detect(ui);
+    let chrome = super::chrome(ui);
+    let palette = &chrome.palette;
     let galley = text.into_galley(
         ui,
         Some(TextWrapMode::Extend),
         f32::INFINITY,
         TextStyle::Button,
     );
-    let padding = vec2(10.0, 4.0);
+    let padding = chrome.density.metrics().control_padding;
+    // The touch floor is applied AFTER the density padding, not scaled with
+    // it: a denser bar has tighter padding around its labels, and a control
+    // whose label is short still ends up 24 points on a side.
     let size = (galley.size() + 2.0 * padding).max(vec2(MIN_TOUCH_POINTS, MIN_TOUCH_POINTS));
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| {
@@ -442,7 +513,7 @@ fn toolbar_control(ui: &mut Ui, text: WidgetText, selected: bool) -> Response {
             painter.rect_filled(rect, 0.0, fill);
         }
         if let Some(bevel) = bevel {
-            paint_bevel(painter, rect, bevel, palette);
+            paint_bevel(painter, rect, bevel, palette, chrome.edges);
         }
         // The classic tactile cue: pressed content shifts one pixel
         // down-right, as if the cap travelled with the finger.

@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use analyst_runtime::{FrameOrigin, FrameStage, Generation, LatestLaneSender, latest_lane_channel};
 use eframe::egui;
+use nexrad_io::SupportedVolumeFormat;
 use radar_core::RadarVolume;
 
 const LOAD_LANE: u8 = 0;
@@ -111,7 +112,14 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
 
     match result {
         Ok(mut volume) => {
-            volume.metadata.source_path = Some(path.display().to_string());
+            // Normally the file is the whole answer. A deployment archive is
+            // not: its reader has already written which member this scan came
+            // from, and that half is the informative one, so the file name is
+            // joined onto it rather than written over it.
+            volume.metadata.source_path = Some(match volume.metadata.source_path.take() {
+                Some(member) => format!("{}::{member}", path.display()),
+                None => path.display().to_string(),
+            });
             let _ = sender.send(LoadUpdate::Volume(LoadedVolume {
                 generation,
                 origin,
@@ -143,7 +151,7 @@ fn decode_with_previews(
     sender: &SyncSender<LoadUpdate>,
     context: &egui::Context,
 ) -> Result<RadarVolume, String> {
-    let mut publish_preview = |mut preview: RadarVolume| {
+    let publish_preview = |mut preview: RadarVolume| {
         preview.metadata.source_path = Some(path.display().to_string());
         let update = LoadUpdate::Volume(LoadedVolume {
             generation,
@@ -158,6 +166,29 @@ fn decode_with_previews(
         }
     };
 
+    // Which decoder owns these bytes is decided once, by magic number, in the
+    // io crate - not here by file extension, because radar volumes are
+    // routinely stored with no extension and the same extension means
+    // different formats on different networks.
+    match nexrad_io::sniff_supported_volume_bytes(raw) {
+        // Unrecognised bytes go to the Archive II decoder on purpose: its
+        // error message is the useful one for a file that is not radar data
+        // at all, and it is what this path did before the seam existed.
+        Some(SupportedVolumeFormat::NexradLevel2) | None => {
+            decode_level2_with_previews(raw, publish_preview)
+        }
+        // Progressive preview is a property of the Archive II record stream;
+        // the other containers decode whole or not at all.
+        Some(_) => nexrad_io::decode_supported_volume_bytes(raw).map_err(|error| error.to_string()),
+    }
+}
+
+/// The Archive II path, which can hand the UI a first displayable cut before
+/// the rest of the volume has been decoded.
+fn decode_level2_with_previews(
+    raw: &[u8],
+    mut publish_preview: impl FnMut(RadarVolume),
+) -> Result<RadarVolume, String> {
     if raw.starts_with(&[0x1f, 0x8b]) {
         nexrad_io::decode_gzip_volume_from_bytes_with_preview(
             raw,
@@ -172,5 +203,280 @@ fn decode_with_previews(
             &mut publish_preview,
         )
         .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use radar_core::MomentType;
+
+    /// Run the load path's decode step on some bytes, discarding previews.
+    ///
+    /// `egui::Context::default()` is a real context and works without a
+    /// window, so this exercises the shipped function rather than a copy of
+    /// its logic.
+    fn decode(raw: &[u8]) -> Result<RadarVolume, String> {
+        let (sender, receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
+        let context = egui::Context::default();
+        let result = decode_with_previews(
+            raw,
+            Generation::default(),
+            Path::new("fixture"),
+            FrameOrigin::Local,
+            "fixture",
+            Instant::now(),
+            &sender,
+            &context,
+        );
+        drop(receiver);
+        result
+    }
+
+    #[test]
+    fn a_broken_file_is_named_by_its_own_format_rather_than_misparsed() {
+        // An HDF5 signature with nothing behind it. Before the seam these
+        // bytes went to the Archive II parser and came back as a complaint
+        // about a short volume header, which sends the analyst looking for a
+        // truncated NEXRAD download that does not exist. Now the ODIM
+        // decoder gets them and the message says so.
+        let error = decode(b"\x89HDF\r\n\x1a\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .unwrap_err();
+        assert!(
+            error.contains("ODIM_H5"),
+            "the error should name the format, got {error:?}"
+        );
+    }
+
+    /// A failed decode names the container it was taken for, whichever
+    /// module owns that container.
+    #[test]
+    fn a_failed_decode_names_the_container_the_seam_chose() {
+        for (bytes, expected) in [
+            (
+                b"CDF\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".as_slice(),
+                "CfRadial",
+            ),
+            (
+                b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".as_slice(),
+                "zip",
+            ),
+        ] {
+            let error = decode(bytes).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} to be named, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_too_short_to_be_a_volume_is_reported_as_an_error() {
+        for bytes in [b"".as_slice(), b"nope".as_slice()] {
+            let error = decode(bytes).unwrap_err();
+            assert!(!error.is_empty(), "the failure must carry a message");
+        }
+    }
+
+    /// Junk longer than a 24-byte volume header decodes to a volume with no
+    /// cuts rather than to an error, because `parse_volume_header` only
+    /// slices bytes and the message loop then finds nothing to read.
+    ///
+    /// This is the surface as it was before the routing seam existed, and the
+    /// seam deliberately preserves it: unrecognised bytes still go to the
+    /// Archive II decoder. It is pinned here because it is surprising - a
+    /// load that "succeeds" with nothing to draw - so that whoever decides to
+    /// change it does so on purpose and sees this test fail.
+    #[test]
+    fn unrecognised_bytes_still_reach_the_archive_ii_decoder_and_never_panic() {
+        let volume = decode(b"this is not a radar volume at all").expect("no panic, no error");
+        assert!(volume.cuts.is_empty());
+        assert_eq!(volume.metadata.decoded_radial_count, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // One real file per format, all the way through the load path.
+    //
+    // These are the pins that say the routing seam is actually wired: each
+    // one starts from a path the way a drop does, lets `app_support` choose
+    // it out of the drop, and lets `process_request` read, sniff, route and
+    // decode it. A regression in any one of the four format modules, or in
+    // the router that reaches them, fails here rather than only inside the
+    // io crate's own tests.
+    // -----------------------------------------------------------------
+
+    /// The io crate's real-data fixtures.
+    ///
+    /// The load path under test is the app's, but the bytes belong to the
+    /// decoders: copying a megabyte of real radar into a second directory to
+    /// test the same bytes twice would waste it, and the two copies would
+    /// drift apart the first time a fixture was refreshed.
+    fn io_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("nexrad_io")
+            .join("tests")
+            .join("data")
+            .join(name)
+    }
+
+    /// Drive one file through the load path exactly as a drop does.
+    ///
+    /// The drop handler picks the file out of what was dropped, the load
+    /// worker reads it, the seam sniffs it and the decoder that owns the
+    /// container decodes it. Returns the complete volume, or the message the
+    /// analyst would have seen.
+    fn load_as_a_drop_would(path: &Path) -> Result<Arc<RadarVolume>, String> {
+        let chosen = crate::app_support::choose_dropped_radar_file([path.to_path_buf()])
+            .expect("a drop of one file chooses that file");
+        let (sender, receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
+        let source_label = chosen.display().to_string();
+        process_request(
+            LoadRequest {
+                generation: Generation::default(),
+                path: chosen,
+                origin: FrameOrigin::Local,
+                final_stage: FrameStage::Complete,
+                source_label,
+            },
+            &sender,
+            &egui::Context::default(),
+        );
+        drop(sender);
+        let mut outcome = Err("the load path produced no result at all".to_owned());
+        while let Ok(update) = receiver.try_recv() {
+            match update {
+                LoadUpdate::Volume(loaded) if loaded.stage == FrameStage::Complete => {
+                    outcome = Ok(loaded.volume);
+                }
+                LoadUpdate::Failed { message, .. } => outcome = Err(message),
+                _ => {}
+            }
+        }
+        outcome
+    }
+
+    #[test]
+    fn the_load_path_decodes_a_real_odim_h5_volume() {
+        // SMHI Angelholm, 2026-08-20 00:00 UTC, one 0.5 deg sweep of
+        // DBZH + TH + VRADH (OPERA ORD, CC BY 4.0).
+        let volume = load_as_a_drop_would(&io_fixture("seang.scan.20260820.dbzh_th_vradh.h5"))
+            .expect("ODIM_H5 should decode through the load path");
+        assert_eq!(volume.site.id, "SEANG");
+        assert_eq!(volume.cuts.len(), 1);
+        assert_eq!(volume.metadata.decoded_radial_count, 360);
+        assert!(
+            volume.cuts[0].moments.contains_key(&MomentType::Velocity),
+            "the velocity plane must survive the copied-what-group recovery"
+        );
+    }
+
+    #[test]
+    fn the_load_path_decodes_a_real_cfradial_volume() {
+        // ARM X-SAPR at SGP, 2011-05-20, a 40-ray classic-netCDF PPI.
+        let volume = load_as_a_drop_would(&io_fixture("cfrad.xsapr_sgp_ppi_20110520.classic.nc"))
+            .expect("CfRadial 1.x should decode through the load path");
+        assert_eq!(volume.site.id, "xsapr-sgp");
+        assert_eq!(volume.cuts.len(), 1);
+        assert_eq!(volume.metadata.decoded_radial_count, 40);
+        assert!(
+            volume.cuts[0]
+                .moments
+                .contains_key(&MomentType::Reflectivity)
+        );
+    }
+
+    #[test]
+    fn the_load_path_decodes_a_real_dorade_sweepfile() {
+        // VORTEX-2 NOXP, 2009-05-09 (Zenodo doi:10.5281/zenodo.14194361,
+        // CC BY 4.0). Its name has no usable extension, which is why the
+        // drop handler has to know the `swp.` convention.
+        let path = io_fixture("swp.1090509143923.NOXPRVP.0.0.5_PPI_v1.head3");
+        let volume = load_as_a_drop_would(&path)
+            .expect("a DORADE sweepfile should decode through the load path");
+        assert_eq!(volume.site.id, "NOXPRVP");
+        assert_eq!(volume.cuts.len(), 1);
+        assert_eq!(volume.metadata.decoded_radial_count, 3);
+        assert_eq!(
+            volume.cuts[0].moments[&MomentType::Reflectivity]
+                .gate_range
+                .gate_count,
+            1001,
+            "the trailing block-padding word is not a gate"
+        );
+    }
+
+    #[test]
+    fn the_load_path_decodes_a_real_deployment_archive_and_says_which_sweep() {
+        // A CPython `zipfile` archive of two real sweepfiles. A pane draws
+        // one volume, so the load path opens the earliest scan in the
+        // bundle - the 2009 NOXP sweep, not the 2026 COW2 one.
+        let path = io_fixture("deployment_python_zipfile.zip.bin");
+        let volume = load_as_a_drop_would(&path)
+            .expect("a deployment archive should decode through the load path");
+        assert_eq!(volume.site.id, "NOXPRVP");
+        assert_eq!(volume.metadata.decoded_radial_count, 3);
+
+        // The member is the informative half of "where did this come from",
+        // so the archive path keeps it instead of letting the file name
+        // overwrite it.
+        let source = volume
+            .metadata
+            .source_path
+            .as_deref()
+            .expect("a load records where it came from");
+        assert!(
+            source.starts_with(&path.display().to_string()),
+            "the archive file should still be named, got {source:?}"
+        );
+        assert!(
+            source.ends_with("swp.1090509143923.NOXPRVP.0.0.5_PPI_v1"),
+            "the member should be named too, got {source:?}"
+        );
+    }
+
+    /// The Level II path, on the real volume the renders are pinned to.
+    ///
+    /// Not checked in: an operational NEXRAD volume is eleven megabytes, and
+    /// this repository does not carry one. Point `NEXRAD_LEVEL2_SAMPLE` at a
+    /// real Archive II file to run it.
+    #[test]
+    fn the_load_path_decodes_a_real_level2_volume() {
+        let Ok(path) = std::env::var("NEXRAD_LEVEL2_SAMPLE") else {
+            eprintln!(
+                "skipping: set NEXRAD_LEVEL2_SAMPLE to a real Archive II volume to run this test"
+            );
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            eprintln!(
+                "skipping: NEXRAD_LEVEL2_SAMPLE points at {}, which is not there",
+                path.display()
+            );
+            return;
+        }
+        let volume =
+            load_as_a_drop_would(&path).expect("Archive II should decode through the load path");
+        assert!(
+            volume.metadata.decoded_radial_count > 1_000,
+            "an operational volume carries thousands of radials, got {}",
+            volume.metadata.decoded_radial_count
+        );
+        assert!(volume.cuts.len() > 1, "an operational volume has many cuts");
+        assert_eq!(
+            volume.metadata.source_path.as_deref(),
+            Some(path.display().to_string().as_str()),
+            "a single-scan container records the file and nothing else"
+        );
+    }
+
+    #[ignore = "set NEXRAD_LEGACY_SAMPLE to a pre-2008 Archive II file path to run manually"]
+    #[test]
+    fn the_load_path_decodes_a_real_legacy_volume() {
+        let path = std::env::var("NEXRAD_LEGACY_SAMPLE").expect("NEXRAD_LEGACY_SAMPLE is not set");
+        let raw = std::fs::read(path).expect("read sample");
+        let volume = decode(&raw).expect("legacy volume should decode through the load path");
+        assert!(volume.metadata.decoded_radial_count > 1_000);
     }
 }

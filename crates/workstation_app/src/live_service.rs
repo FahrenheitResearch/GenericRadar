@@ -12,9 +12,16 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use data_source::{ArchiveLevel2Volume, FeedFreshness, RealtimeLevel2Volume};
 use eframe::egui;
 
+use crate::net_tuning::{NetTuning, SharedNetTuning};
+
 const COMMAND_LANE: u8 = 0;
 const RESULT_QUEUE_CAPACITY: usize = 16;
-const POLL_INTERVAL: Duration = Duration::from_millis(1_200);
+/// The shipped live poll cadence, and the source of
+/// [`crate::net_tuning::NetTuning`]'s `live_poll` default - the policy struct
+/// READS this rather than restating it, so there is one copy of the number and
+/// it lives next to the reasoning. The poll loop runs at the session's own
+/// policy, which Settings > Data & network moves without restarting anything.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(1_200);
 const COMMAND_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the backfill will wait for room in the result queue before giving
 /// up. It cannot block on `send` the way the live poll does: the live poll is
@@ -51,7 +58,7 @@ const LIVE_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// an empty `start-after` listing - one S3 envelope, ~350 bytes - so an hour of
 /// fallback costs about 25 KB of listings. See
 /// `data_source::archive_listing_plan` for what one poll actually lists.
-const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How far ahead of the dead chunk feed the archive has to be before a session
 /// abandons the chunk feed for it, minutes.
@@ -68,7 +75,7 @@ const ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// for 215, up to 10 for the clear-air VCPs. Five minutes is inside the common
 /// case and comfortably outside zero. KUEX on 2026-08-19 cleared it by three
 /// days.
-const ARCHIVE_MUST_LEAD_MINUTES: i64 = 5;
+pub(crate) const ARCHIVE_MUST_LEAD_MINUTES: i64 = 5;
 
 /// How long the chunk listing has to keep failing before the failure counts as
 /// a stall, and the archive becomes the better source.
@@ -80,7 +87,7 @@ const ARCHIVE_MUST_LEAD_MINUTES: i64 = 5;
 /// any transient needs - and is still short enough that a session pointed at a
 /// site whose chunk prefix has been deleted outright reaches the archive
 /// inside the first minute rather than showing an error for ever.
-const CHUNK_LISTING_FAILURE_STALL_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const CHUNK_LISTING_FAILURE_STALL_AFTER: Duration = Duration::from_secs(60);
 
 /// Which of the two buckets a session is publishing from.
 ///
@@ -140,10 +147,15 @@ impl ChunkFeedState {
     }
 
     /// Whether the chunk feed has stopped being a source worth staying on.
-    fn warrants_fallback(self) -> bool {
+    ///
+    /// `stall_after` is the session's own threshold - shipped
+    /// [`CHUNK_LISTING_FAILURE_STALL_AFTER`], settable in Data & network - and
+    /// it is passed in rather than read from a const so this stays a pure
+    /// function of what one poll saw.
+    fn warrants_fallback(self, stall_after: Duration) -> bool {
         match self {
             Self::Listed { freshness, .. } => freshness.is_stalled(),
-            Self::Unavailable { failing_for } => failing_for >= CHUNK_LISTING_FAILURE_STALL_AFTER,
+            Self::Unavailable { failing_for } => failing_for >= stall_after,
         }
     }
 }
@@ -169,14 +181,15 @@ impl ChunkFeedState {
 /// flips when a volume arrives or when fifteen minutes of silence pass, the
 /// fastest alternation this can produce is bounded by the feed's own volume
 /// interval, not by the 1.2 s poll.
-fn next_source(
+fn next_source_tuned(
     current: LiveSource,
     chunks: ChunkFeedState,
     archive_newest: Option<DateTime<Utc>>,
+    tuning: NetTuning,
 ) -> LiveSource {
     match current {
         LiveSource::Chunks => {
-            if !chunks.warrants_fallback() {
+            if !chunks.warrants_fallback(tuning.stall_after) {
                 return LiveSource::Chunks;
             }
             let Some(archive) = archive_newest else {
@@ -188,7 +201,7 @@ fn next_source(
             match chunks.volume_time() {
                 Some(chunk_time)
                     if archive
-                        <= chunk_time + chrono::Duration::minutes(ARCHIVE_MUST_LEAD_MINUTES) =>
+                        <= chunk_time + chrono::Duration::minutes(tuning.archive_lead_minutes) =>
                 {
                     LiveSource::Chunks
                 }
@@ -208,6 +221,22 @@ fn next_source(
             }
         }
     }
+}
+
+/// [`next_source_tuned`] under the shipped policy.
+///
+/// The hysteresis tests below are about the DECISION - which source wins, and
+/// that two identical polls cannot move it twice - rather than about the
+/// numbers, so they ask under the defaults and stay readable.
+/// `next_source_tuned` is what the poll loop calls, and a test of its own
+/// moves the lead threshold to prove the setting reaches the decision.
+#[cfg(test)]
+fn next_source(
+    current: LiveSource,
+    chunks: ChunkFeedState,
+    archive_newest: Option<DateTime<Utc>>,
+) -> LiveSource {
+    next_source_tuned(current, chunks, archive_newest, NetTuning::default())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,6 +308,11 @@ struct LiveSession {
     /// When the live cache was last swept against its budget, so the sweep
     /// runs on [`LIVE_CACHE_PRUNE_INTERVAL`] rather than per poll.
     last_prune: Option<Instant>,
+    /// The network policy this session runs under, snapshotted at the top of
+    /// each poll from the shared handle the settings pass writes. A snapshot
+    /// rather than a live read, so one poll - its listing, its source
+    /// decision, its prune - runs under one consistent set of numbers.
+    tuning: NetTuning,
     /// What was last reported to the app about the feed itself: the newest
     /// volume time the bucket is holding, and whether that counts as current.
     ///
@@ -308,6 +342,7 @@ impl LiveSession {
             archive_polls: 0,
             archive_fetch: Arc::new(ArchiveFetchSlot::default()),
             last_prune: None,
+            tuning: NetTuning::default(),
             last_feed: None,
         }
     }
@@ -345,9 +380,9 @@ impl LiveSession {
     /// so. Every archive request in the module goes through here, which is
     /// what makes the cadence a bound rather than an intention.
     fn take_archive_poll_slot(&mut self, monotonic_now: Instant) -> bool {
-        let due = self
-            .last_archive_poll
-            .is_none_or(|at| monotonic_now.saturating_duration_since(at) >= ARCHIVE_POLL_INTERVAL);
+        let due = self.last_archive_poll.is_none_or(|at| {
+            monotonic_now.saturating_duration_since(at) >= self.tuning.archive_poll
+        });
         if due {
             self.last_archive_poll = Some(monotonic_now);
             self.archive_polls += 1;
@@ -520,20 +555,33 @@ pub enum LiveUpdate {
 pub struct LiveService {
     sender: LatestLaneSender<u8, LiveCommand>,
     receiver: Receiver<LiveUpdate>,
+    /// The network policy the worker reads. Held here so the settings pass has
+    /// somewhere to write it without restarting the session; see
+    /// [`crate::net_tuning`] for why it is shared rather than passed.
+    tuning: SharedNetTuning,
 }
 
 impl LiveService {
     pub fn new(context: egui::Context) -> Self {
         let (command_sender, command_receiver) = latest_lane_channel::<u8, LiveCommand>();
         let (result_sender, result_receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
+        let tuning = SharedNetTuning::default();
+        let worker_tuning = tuning.clone();
         let _worker = thread::Builder::new()
             .name("radar-workstation-live".to_owned())
-            .spawn(move || run_worker(command_receiver, result_sender, context))
+            .spawn(move || run_worker(command_receiver, result_sender, context, worker_tuning))
             .expect("failed to start live Level II worker");
         Self {
             sender: command_sender,
             receiver: result_receiver,
+            tuning,
         }
+    }
+
+    /// The handle the settings pass writes the network policy into. Cheap to
+    /// clone; every clone names the same policy.
+    pub fn tuning(&self) -> SharedNetTuning {
+        self.tuning.clone()
     }
 
     pub fn start(
@@ -593,6 +641,7 @@ fn run_worker(
     commands: LatestLaneReceiver<u8, LiveCommand>,
     results: SyncSender<LiveUpdate>,
     context: egui::Context,
+    tuning: SharedNetTuning,
 ) {
     let mut session: Option<LiveSession> = None;
     loop {
@@ -610,9 +659,14 @@ fn run_worker(
         let Some(active) = session.as_mut() else {
             continue;
         };
+        // One snapshot per turn: the poll and the sleep that follows it run
+        // under the same policy, so a slider moved mid-poll takes effect on
+        // the next turn instead of splitting this one in half.
+        let policy = tuning.get();
+        active.tuning = policy;
         poll_session(active, &results, &context);
 
-        let checks = (POLL_INTERVAL.as_millis() / COMMAND_CHECK_INTERVAL.as_millis()).max(1);
+        let checks = (policy.live_poll.as_millis() / COMMAND_CHECK_INTERVAL.as_millis()).max(1);
         for _ in 0..checks {
             thread::sleep(COMMAND_CHECK_INTERVAL);
             if let Some((_lane, command)) = commands.try_recv() {
@@ -661,7 +715,8 @@ fn poll_session(
     // staying on, and then only on its own cadence. A healthy site therefore
     // never touches the archive bucket at all - see `archive_polls`, which a
     // test asserts is zero for KOAX.
-    if chunks.warrants_fallback() || session.source == LiveSource::Archive {
+    if chunks.warrants_fallback(session.tuning.stall_after) || session.source == LiveSource::Archive
+    {
         refresh_archive_knowledge(session, now);
     }
     retarget_source(session, chunks);
@@ -763,10 +818,7 @@ fn prune_cache_if_due(session: &mut LiveSession) {
     if !session.take_prune_slot() {
         return;
     }
-    let report = data_source::prune_live_cache(
-        &session.cache_dir,
-        data_source::DEFAULT_LIVE_CACHE_BUDGET_BYTES,
-    );
+    let report = data_source::prune_live_cache(&session.cache_dir, session.tuning.live_cache_bytes);
     if report.entries_removed > 0 {
         eprintln!(
             "{} live cache pruned: {} entries removed, {:.1} -> {:.1} MiB",
@@ -824,7 +876,12 @@ fn refresh_archive_knowledge(session: &mut LiveSession, now: DateTime<Utc>) {
 /// session that silently changed bucket would be just as hard to explain
 /// afterwards.
 fn retarget_source(session: &mut LiveSession, chunks: ChunkFeedState) {
-    let next = next_source(session.source, chunks, session.archive_newest());
+    let next = next_source_tuned(
+        session.source,
+        chunks,
+        session.archive_newest(),
+        session.tuning,
+    );
     if next == session.source {
         return;
     }
@@ -2190,17 +2247,20 @@ mod tests {
                 failing_for: Duration::ZERO
             }
         );
-        assert!(!first.warrants_fallback(), "one failure decides nothing");
+        assert!(
+            !first.warrants_fallback(CHUNK_LISTING_FAILURE_STALL_AFTER),
+            "one failure decides nothing"
+        );
         assert!(
             !session
                 .observe_chunk_feed(None, now, start + Duration::from_secs(59))
-                .warrants_fallback(),
+                .warrants_fallback(CHUNK_LISTING_FAILURE_STALL_AFTER),
             "nor does a minute of them, one second short"
         );
         assert!(
             session
                 .observe_chunk_feed(None, now, start + CHUNK_LISTING_FAILURE_STALL_AFTER)
-                .warrants_fallback(),
+                .warrants_fallback(CHUNK_LISTING_FAILURE_STALL_AFTER),
             "a prefix that cannot be listed for a whole minute is a source worth leaving"
         );
 
@@ -2213,7 +2273,54 @@ mod tests {
         assert!(
             !session
                 .observe_chunk_feed(None, now, start + Duration::from_secs(62))
-                .warrants_fallback()
+                .warrants_fallback(CHUNK_LISTING_FAILURE_STALL_AFTER)
+        );
+    }
+
+    /// The wiring, end to end: the setting reaches the source DECISION.
+    ///
+    /// A dead chunk feed whose newest scan is 11:08:02Z, against an archive
+    /// holding 11:12:14Z - four minutes and twelve seconds ahead. Under the
+    /// shipped five-minute lead that is inside the dead band and the session
+    /// stays put; an analyst who has told the application that three minutes
+    /// is enough gets the switch. Same inputs, different policy, different
+    /// answer - which is what a wired setting means.
+    #[test]
+    fn the_archive_lead_setting_moves_where_a_session_gives_up_on_the_chunk_feed() {
+        let dead = chunks_listed("2026-08-16T11:08:02Z", FeedFreshness::Stalled);
+        let archive = Some(at("2026-08-16T11:12:14Z"));
+        let shipped = crate::net_tuning::NetTuning::default();
+        assert_eq!(
+            next_source_tuned(LiveSource::Chunks, dead, archive, shipped),
+            LiveSource::Chunks,
+            "4m12s is inside the shipped 5-minute dead band"
+        );
+        let impatient = crate::net_tuning::NetTuning {
+            archive_lead_minutes: 3,
+            ..shipped
+        }
+        .clamped();
+        assert_eq!(
+            next_source_tuned(LiveSource::Chunks, dead, archive, impatient),
+            LiveSource::Archive,
+            "the same gap clears a 3-minute lead"
+        );
+    }
+
+    /// The same, for the other half of the fallback decision: how long a
+    /// listing has to keep failing before it counts as a stall.
+    #[test]
+    fn the_stall_threshold_setting_moves_when_a_failing_listing_counts() {
+        let failing = ChunkFeedState::Unavailable {
+            failing_for: Duration::from_secs(30),
+        };
+        assert!(
+            !failing.warrants_fallback(CHUNK_LISTING_FAILURE_STALL_AFTER),
+            "half the shipped minute decides nothing"
+        );
+        assert!(
+            failing.warrants_fallback(Duration::from_secs(20)),
+            "an analyst who set twenty seconds gets the verdict at thirty"
         );
     }
 

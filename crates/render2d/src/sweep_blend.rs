@@ -82,11 +82,11 @@ use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType};
 use rayon::prelude::*;
 
 use crate::{
-    AzimuthLookup, ColorTable, ColorTableSet, RenderError, Result, StormMotion, StormMotionBasis,
-    ViewportLookupRow, ViewportLookupTable, ViewportRasterOptions, azimuth_from_xy,
-    build_storm_relative_u8_row_palettes, build_u8_palette, build_u16_palette, clockwise_delta_deg,
-    color_family_for_moment, dealias_velocity_grid, ensure_rgba_buffer, viewport_dimensions,
-    viewport_geometry,
+    AzimuthLookup, ColorTable, ColorTableSet, GateFilterMask, RenderError, Result, StormMotion,
+    StormMotionBasis, ViewportLookupRow, ViewportLookupTable, ViewportRasterOptions,
+    azimuth_from_xy, build_storm_relative_u8_row_palettes, build_u8_palette, build_u16_palette,
+    clockwise_delta_deg, color_family_for_moment, dealias_velocity_grid, ensure_rgba_buffer,
+    viewport_dimensions, viewport_geometry,
 };
 
 /// Two sweeps of one tilt: the one arriving, and the last complete one.
@@ -114,6 +114,26 @@ pub struct SweepBlend<'a> {
     pub revealed_deg: f32,
 }
 
+/// The gates a [`crate::gate_filter::GateFilter`] removed from each layer of a
+/// blend.
+///
+/// Each mask is indexed against the grid that layer carries, which for a
+/// dealiased blend is the UNFOLDED grid the caller handed over and not the one
+/// in the cut. Both layers are censored, and by the same rule: the under-paint
+/// came from an earlier volume, so filtering only the arriving wedge would
+/// leave the analyst looking at one picture with two different rules in it,
+/// split along a line that moves with the antenna.
+///
+/// A censor here does what it does everywhere else in this crate - it stops the
+/// candidate walk rather than blanking a value - so a removed gate leaves the
+/// pixel empty instead of being replaced by the beam next to it. See
+/// `AzimuthLookup::censors`.
+#[derive(Clone, Copy, Default)]
+pub struct SweepBlendCensor<'a> {
+    pub incoming: Option<&'a GateFilterMask>,
+    pub previous: Option<&'a GateFilterMask>,
+}
+
 /// Rasterise the blend into `rgba`, which must be exactly
 /// `viewport_rgba_buffer_len(options)` bytes long. Returns the raster size.
 ///
@@ -130,7 +150,28 @@ pub fn render_sweep_blend_rgba_into(
     color_tables: &ColorTableSet,
     rgba: &mut [u8],
 ) -> Result<(u32, u32)> {
-    render_blend(blend, Shading::Plain, options, color_tables, rgba)
+    render_blend(
+        blend,
+        SweepBlendCensor::default(),
+        Shading::Plain,
+        options,
+        color_tables,
+        rgba,
+    )
+}
+
+/// The same blend with a pane's gate filter applied to both layers.
+///
+/// [`SweepBlendCensor::default`] is byte-for-byte
+/// [`render_sweep_blend_rgba_into`].
+pub fn render_sweep_blend_rgba_into_censored(
+    blend: &SweepBlend<'_>,
+    censor: SweepBlendCensor<'_>,
+    options: ViewportRasterOptions,
+    color_tables: &ColorTableSet,
+    rgba: &mut [u8],
+) -> Result<(u32, u32)> {
+    render_blend(blend, censor, Shading::Plain, options, color_tables, rgba)
 }
 
 /// Rasterise the same blend with a storm motion taken out of both layers, for
@@ -170,6 +211,26 @@ pub fn render_storm_relative_sweep_blend_rgba_into(
     color_tables: &ColorTableSet,
     rgba: &mut [u8],
 ) -> Result<(u32, u32)> {
+    render_storm_relative_sweep_blend_rgba_into_censored(
+        blend,
+        SweepBlendCensor::default(),
+        storm_motion,
+        options,
+        color_tables,
+        rgba,
+    )
+}
+
+/// The same storm-relative blend with a pane's gate filter applied to both
+/// layers.
+pub fn render_storm_relative_sweep_blend_rgba_into_censored(
+    blend: &SweepBlend<'_>,
+    censor: SweepBlendCensor<'_>,
+    storm_motion: StormMotion,
+    options: ViewportRasterOptions,
+    color_tables: &ColorTableSet,
+    rgba: &mut [u8],
+) -> Result<(u32, u32)> {
     // Checking the incoming grid covers the previous one as well: `render_blend`
     // drops any previous layer whose moment is not the incoming one, so past
     // this line either both layers are velocity or there is no second layer.
@@ -181,6 +242,7 @@ pub fn render_storm_relative_sweep_blend_rgba_into(
     }
     render_blend(
         blend,
+        censor,
         Shading::StormRelative(storm_motion),
         options,
         color_tables,
@@ -190,6 +252,7 @@ pub fn render_storm_relative_sweep_blend_rgba_into(
 
 fn render_blend(
     blend: &SweepBlend<'_>,
+    censor: SweepBlendCensor<'_>,
     shading: Shading,
     options: ViewportRasterOptions,
     color_tables: &ColorTableSet,
@@ -214,6 +277,7 @@ fn render_blend(
         incoming: SweepLayer::new(
             blend.incoming,
             blend.incoming_grid,
+            censor.incoming,
             shading,
             options,
             color_tables,
@@ -221,7 +285,9 @@ fn render_blend(
         previous: blend
             .previous
             .filter(|(_, grid)| grid.moment == blend.incoming_grid.moment)
-            .map(|(cut, grid)| SweepLayer::new(cut, grid, shading, options, color_tables)),
+            .map(|(cut, grid)| {
+                SweepLayer::new(cut, grid, censor.previous, shading, options, color_tables)
+            }),
         options,
         start_deg: blend.start_deg,
         revealed_deg: blend.revealed_deg,
@@ -333,6 +399,31 @@ impl<'a> DealiasedSweepBlend<'a> {
             start_deg,
             revealed_deg,
         })
+    }
+
+    /// Take a pair of grids that have already been unfolded, and possibly
+    /// altered afterwards.
+    ///
+    /// [`DealiasedSweepBlend::new`] unfolds and keeps the result, which is what
+    /// a caller wants when nothing else happens to the velocity. A caller that
+    /// must censor gates after unfolding - a pane with an active
+    /// [`crate::gate_filter::GateFilter`] - cannot use it, because the grids it
+    /// needs to hand over do not exist until after the unfold. This is the same
+    /// structure, built from grids the caller owns.
+    pub fn from_unfolded_grids(
+        incoming: &'a ElevationCut,
+        incoming_grid: MomentGrid,
+        previous: Option<(&'a ElevationCut, MomentGrid)>,
+        start_deg: f32,
+        revealed_deg: f32,
+    ) -> Self {
+        Self {
+            incoming,
+            incoming_grid,
+            previous,
+            start_deg,
+            revealed_deg,
+        }
     }
 
     /// Borrow the unfolded pair as an ordinary blend, for either entry point.
@@ -476,13 +567,14 @@ impl<'a> SweepLayer<'a> {
     fn new(
         cut: &ElevationCut,
         grid: &'a MomentGrid,
+        censor: Option<&GateFilterMask>,
         shading: Shading,
         options: ViewportRasterOptions,
         color_tables: &ColorTableSet,
     ) -> Self {
         Self {
             grid,
-            azimuths: AzimuthLookup::new(cut, grid),
+            azimuths: AzimuthLookup::new(cut, grid).with_censor(censor.cloned()),
             lookup: ViewportLookupTable::new(grid, viewport_geometry(grid, options)),
             colors: LayerColors::new(cut, grid, shading, color_tables),
         }
@@ -557,15 +649,21 @@ fn union_x_range(
 /// differ from an unblended one inside the arc where the two must be identical.
 fn sample_layer_color(layer: &SweepLayer<'_>, row: &ViewportLookupRow, x: u32) -> Option<[u8; 4]> {
     let sample = row.lookup(x, &layer.azimuths)?;
-    layer
-        .azimuths
-        .candidates_for_bin(sample.azimuth_bin)
-        .iter()
-        .find_map(|candidate| {
-            layer
-                .colors
-                .color_at(layer.grid, candidate.row, sample.gate)
-        })
+    for candidate in layer.azimuths.candidates_for_bin(sample.azimuth_bin) {
+        // A gate this layer's filter removed ends the walk. Falling through
+        // would paint the beam beside it, which is how a censored blend would
+        // come to show a value from an azimuth the analyst never asked about.
+        if layer.azimuths.censors(candidate.row, sample.gate) {
+            return None;
+        }
+        if let Some(color) = layer
+            .colors
+            .color_at(layer.grid, candidate.row, sample.gate)
+        {
+            return Some(color);
+        }
+    }
+    None
 }
 
 /// Per-sweep colour lookup, built once instead of per pixel.

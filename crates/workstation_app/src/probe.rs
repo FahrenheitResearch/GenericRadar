@@ -29,7 +29,10 @@
 use product_engine::domain::DisplayDomain;
 use product_engine::stats::CellState;
 use radar_core::{ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarVolume};
+use render2d::GateFilterMask;
 use render2d::beam;
+
+use crate::units::UnitSystem;
 
 /// How far from a radial a cursor may be and still be reading that radial.
 ///
@@ -153,6 +156,26 @@ impl ProbeReading {
 /// alternative is a probe whose number does not belong to the colour it is
 /// pointing at. Callers that need a true ground range must ask
 /// [`beam::ground_arc_m`] for it and label it as such.
+///
+/// # The gate filter
+///
+/// `censor` is the pane's [`GateFilterMask`], which
+/// [`render2d::ViewportMomentCache::gate_filter_mask`] hands back indexed
+/// against the grid as it sits in the cut - the same grid this function reads -
+/// so a censored gate can be recognised here without the readout having to know
+/// anything about how it was censored.
+///
+/// It is a parameter and not an option because forgetting it is the failure
+/// this whole module is written against: without it the readout answers a
+/// censored gate with its true value and `CellState::Valid`, at a pixel the
+/// pane deliberately drew empty, and the analyst is told a number that is not
+/// on the screen. `None` is the honest answer for a pane with no filter on.
+// Eight arguments, one over clippy's threshold. Every one of them is a thing a
+// caller must decide for itself and none of them has a safe default: bundling
+// them into a struct would move that decision into a `Default` impl, where a
+// forgotten `censor` becomes an invisible field rather than a compile error.
+// The compile error is the point.
+#[allow(clippy::too_many_arguments)]
 pub fn probe_polar(
     volume: &RadarVolume,
     cut_index: usize,
@@ -161,6 +184,7 @@ pub fn probe_polar(
     site_elevation_m: Option<f32>,
     east_km: f64,
     north_km: f64,
+    censor: Option<&GateFilterMask>,
 ) -> ProbeReading {
     let location = ProbeLocation {
         east_km,
@@ -184,6 +208,17 @@ pub fn probe_polar(
 
     let slant_range_m = gate_centre_range_m(&grid.gate_range, gate);
     let beam_height_arl_m = beam::beam_height_arl_m(slant_range_m, f64::from(elevation_deg));
+
+    // A gate the pane's filter removed is not there as far as the readout is
+    // concerned. Reporting its value would put a number under the cursor at a
+    // pixel that was deliberately left empty, which is the one thing a censored
+    // display must never do.
+    if censor.is_some_and(|censor| censor.hides(row, gate)) {
+        return ProbeReading::Absent {
+            state: CellState::QualityMasked,
+            location,
+        };
+    }
 
     match grid.scaled_value(row, gate) {
         Some(engine_value) if engine_value.is_finite() => ProbeReading::Value(ProbeValue {
@@ -215,10 +250,23 @@ pub fn probe_polar(
 /// A one-line readout, e.g.
 /// `REF 52.5 dBZ | 41.1 km 247.4 deg | row 712 gate 164 | beam 0.73 km ARL`
 ///
-/// The kilometres are the screen distance from the radar, which is what the
-/// range rings measure. The MSL height is appended only when the site elevation
-/// is known.
-pub fn format_reading(reading: &ProbeReading, domain: &DisplayDomain, short_name: &str) -> String {
+/// The distance is the screen distance from the radar, which is what the range
+/// rings measure. The MSL height is appended only when the site elevation is
+/// known.
+///
+/// `units` decides only how the distance and the two heights are WRITTEN - the
+/// sampled gate, the slant range and the beam height are all unchanged, which
+/// is why they are passed in as the metres and kilometres the geometry
+/// produced. Under [`UnitSystem::default`] every character is what this
+/// function has always written; the annotation's `range_decimals` is likewise
+/// the `1` the format string carried.
+pub fn format_reading(
+    reading: &ProbeReading,
+    domain: &DisplayDomain,
+    short_name: &str,
+    units: UnitSystem,
+    range_decimals: u8,
+) -> String {
     match reading {
         ProbeReading::Value(value) => {
             let qualifier = match value.state.label() {
@@ -226,33 +274,65 @@ pub fn format_reading(reading: &ProbeReading, domain: &DisplayDomain, short_name
                 label => format!("{label} "),
             };
             let mut text = format!(
-                "{short_name} {qualifier}{} | {:.1} km {:.1} deg | row {} gate {} | beam {:.2} km ARL",
+                "{short_name} {qualifier}{} | {} {:.1} deg | row {} gate {} | beam {} ARL",
                 domain.format_display(value.engine_value),
-                value.location.screen_range_km,
+                units.distance(value.location.screen_range_km, range_decimals),
                 value.location.azimuth_deg,
                 value.row,
                 value.gate,
-                value.beam_height_arl_m / 1000.0,
+                units.altitude(value.beam_height_arl_m, 2),
             );
             if let Some(msl_m) = value.beam_height_msl_m {
-                text.push_str(&format!(" / {:.2} km MSL", msl_m / 1000.0));
+                text.push_str(&format!(" / {} MSL", units.altitude(msl_m, 2)));
             }
             text
         }
-        ProbeReading::Absent { state, location } => format_absent(short_name, *state, location),
-        ProbeReading::OutsideSweep(location) => {
-            format_absent(short_name, CellState::NoCoverage, location)
+        ProbeReading::Absent { state, location } => {
+            format_absent(short_name, *state, location, units, range_decimals)
         }
+        ProbeReading::OutsideSweep(location) => format_absent(
+            short_name,
+            CellState::NoCoverage,
+            location,
+            units,
+            range_decimals,
+        ),
     }
 }
 
-fn format_absent(short_name: &str, state: CellState, location: &ProbeLocation) -> String {
+fn format_absent(
+    short_name: &str,
+    state: CellState,
+    location: &ProbeLocation,
+    units: UnitSystem,
+    range_decimals: u8,
+) -> String {
     format!(
-        "{short_name} {} | {:.1} km {:.1} deg",
-        state.label(),
-        location.screen_range_km,
+        "{short_name} {} | {} {:.1} deg",
+        absent_label(state),
+        units.distance(location.screen_range_km, range_decimals),
         location.azimuth_deg,
     )
+}
+
+/// What an absent gate is called on the glass.
+///
+/// [`CellState::label`] everywhere except one: `QualityMasked` reads "QUALITY
+/// MASKED", which names a judgement the RADAR made about its own data, and
+/// inside this module it means the opposite - the only thing that produces it
+/// in [`probe_polar`] is the pane's own gate filter, because `absent_state`
+/// spends its words on range folding, no-echo and no-data and never returns
+/// it.
+///
+/// So it is named after the thing that caused it, in the same word the pane's
+/// band and the legend badge use. An analyst who hovers a gap they created and
+/// reads "QUALITY MASKED" has been told the radar threw the gate away; the
+/// readout, the band and the badge now agree, and they agree in one vocabulary.
+fn absent_label(state: CellState) -> &'static str {
+    match state {
+        CellState::QualityMasked => crate::gate_filter_ui::FILTERED_WORD,
+        other => other.label(),
+    }
 }
 
 /// The gate the renderer would paint at this range, or `None` when the range
@@ -477,6 +557,7 @@ mod tests {
             site_elevation_m,
             east_km,
             north_km,
+            None,
         )
     }
 
@@ -484,6 +565,130 @@ mod tests {
         match reading {
             ProbeReading::Value(value) => value,
             other => panic!("expected a gate value, got {other:?}"),
+        }
+    }
+
+    /// A gate the pane's filter removed reads as absent, not as its true value.
+    ///
+    /// This is the same gate `a_cursor_on_a_gate_centre_reads_that_gate` reads
+    /// 52.5 dBZ out of, so the only thing that changes here is the censor. The
+    /// pane draws that pixel empty; a readout that answered 52.5 dBZ over it
+    /// would be telling the analyst a number that is not on the screen, and
+    /// would be doing it at the exact moment they are asking what is there.
+    #[test]
+    fn a_gate_the_filter_removed_reads_as_absent_rather_than_as_its_value() {
+        let volume = test_volume();
+        let (east_km, north_km) = point_at(247.4, HOT_GATE_RANGE_KM);
+        let source = volume.cuts[0]
+            .moments
+            .get(&MomentType::Reflectivity)
+            .expect("reflectivity");
+
+        // A filter that hides everything, so the mask certainly covers the gate
+        // the cursor is over. What is under test is the readout, not the
+        // criterion.
+        let outcome = render2d::evaluate_gate_filter(
+            &volume,
+            0,
+            source,
+            &render2d::GateFilter {
+                min_reflectivity_dbz: Some(1_000.0),
+                ..render2d::GateFilter::OFF
+            },
+        );
+        let censor = outcome.mask.expect("every gate is below 1000 dBZ");
+        assert!(censor.hides(247, HOT_GATE));
+
+        let uncensored = expect_value(probe_reflectivity(&volume, 0.5, None, east_km, north_km));
+        assert_eq!(uncensored.engine_value, 52.5);
+
+        let reading = probe_polar(
+            &volume,
+            0,
+            &MomentType::Reflectivity,
+            0.5,
+            None,
+            east_km,
+            north_km,
+            Some(&censor),
+        );
+        assert_eq!(
+            reading,
+            ProbeReading::Absent {
+                state: CellState::QualityMasked,
+                location: *uncensored_location(&uncensored),
+            }
+        );
+        assert!(reading.value().is_none());
+    }
+
+    fn uncensored_location(value: &ProbeValue) -> &ProbeLocation {
+        &value.location
+    }
+
+    /// And it says so in the pane's own word.
+    ///
+    /// The band over the pane, the legend badge and this readout are three
+    /// different pieces of furniture describing one decision, so they use one
+    /// word for it. "QUALITY MASKED" - `CellState`'s own label - would name a
+    /// judgement the radar made about its data, at a gate the radar reported
+    /// perfectly well and the ANALYST removed.
+    #[test]
+    fn a_filtered_gate_reads_under_the_cursor_in_the_word_the_pane_uses() {
+        let reading = ProbeReading::Absent {
+            state: CellState::QualityMasked,
+            location: ProbeLocation {
+                east_km: 10.0,
+                north_km: 0.0,
+                azimuth_deg: 90.0,
+                screen_range_km: 10.0,
+            },
+        };
+        let text = format_reading(
+            &reading,
+            &reflectivity_domain(),
+            "REF",
+            UnitSystem::default(),
+            1,
+        );
+        assert!(
+            text.starts_with(&format!("REF {}", crate::gate_filter_ui::FILTERED_WORD)),
+            "the readout does not use the pane's word: {text:?}"
+        );
+        assert!(
+            !text.contains("QUALITY"),
+            "the readout blames the radar for the analyst's filter: {text:?}"
+        );
+        // Every other absence keeps its own name.
+        for state in [
+            CellState::RangeFolded,
+            CellState::NoEcho,
+            CellState::NoData,
+            CellState::NoCoverage,
+        ] {
+            let text = format_reading(
+                &ProbeReading::Absent {
+                    state,
+                    location: ProbeLocation {
+                        east_km: 10.0,
+                        north_km: 0.0,
+                        azimuth_deg: 90.0,
+                        screen_range_km: 10.0,
+                    },
+                },
+                &reflectivity_domain(),
+                "REF",
+                UnitSystem::default(),
+                1,
+            );
+            assert!(
+                text.contains(state.label()),
+                "{state:?} lost its own name: {text:?}"
+            );
+            assert!(
+                !text.contains(crate::gate_filter_ui::FILTERED_WORD),
+                "{state:?} is being reported as the analyst's filter: {text:?}"
+            );
         }
     }
 
@@ -633,7 +838,8 @@ mod tests {
                 0.5,
                 None,
                 east_km,
-                north_km
+                north_km,
+                None
             ),
             ProbeReading::OutsideSweep(_)
         ));
@@ -645,7 +851,8 @@ mod tests {
                 0.5,
                 None,
                 east_km,
-                north_km
+                north_km,
+                None
             ),
             ProbeReading::OutsideSweep(_)
         ));
@@ -734,7 +941,13 @@ mod tests {
         let (east_km, north_km) = point_at(247.4, HOT_GATE_RANGE_KM);
         let reading = probe_reflectivity(&volume, 0.5, None, east_km, north_km);
         assert_eq!(
-            format_reading(&reading, &reflectivity_domain(), "REF"),
+            format_reading(
+                &reading,
+                &reflectivity_domain(),
+                "REF",
+                UnitSystem::default(),
+                1
+            ),
             "REF 52.5 dBZ | 43.1 km 247.4 deg | row 247 gate 164 | beam 0.49 km ARL"
         );
     }
@@ -745,8 +958,69 @@ mod tests {
         let (east_km, north_km) = point_at(247.4, HOT_GATE_RANGE_KM);
         let reading = probe_reflectivity(&volume, 0.5, Some(SITE_ELEVATION_M), east_km, north_km);
         assert_eq!(
-            format_reading(&reading, &reflectivity_domain(), "REF"),
+            format_reading(
+                &reading,
+                &reflectivity_domain(),
+                "REF",
+                UnitSystem::default(),
+                1
+            ),
             "REF 52.5 dBZ | 43.1 km 247.4 deg | row 247 gate 164 | beam 0.49 km ARL / 0.86 km MSL"
+        );
+    }
+
+    /// The same gate, read in another set of units.
+    ///
+    /// This is the property the whole units feature rests on: 43.1 km is 26.8
+    /// statute miles and 485.9 m ARL is 1594 ft, and NOTHING else about the
+    /// line changes - same row, same gate, same 52.5 dBZ, same azimuth. The
+    /// conversion happens at the character boundary and nowhere earlier.
+    #[test]
+    fn the_same_gate_reads_in_miles_and_feet_without_moving() {
+        let volume = test_volume();
+        let (east_km, north_km) = point_at(247.4, HOT_GATE_RANGE_KM);
+        let reading = probe_reflectivity(&volume, 0.5, Some(SITE_ELEVATION_M), east_km, north_km);
+        let imperial = UnitSystem {
+            distance: crate::units::DistanceUnit::StatuteMiles,
+            altitude: crate::units::AltitudeUnit::Feet,
+            ..UnitSystem::default()
+        };
+        assert_eq!(
+            format_reading(&reading, &reflectivity_domain(), "REF", imperial, 1),
+            "REF 52.5 dBZ | 26.8 mi 247.4 deg | row 247 gate 164 | beam 1594 ft ARL / 2808 ft MSL"
+        );
+        // The reading itself never learned about miles.
+        let ProbeReading::Value(value) = &reading else {
+            panic!("the hot gate holds a value");
+        };
+        assert!((value.location.screen_range_km - 43.125).abs() < 0.01);
+    }
+
+    /// The precision setting reaches the same line.
+    #[test]
+    fn the_range_decimal_setting_changes_the_readout_and_nothing_else() {
+        let volume = test_volume();
+        let (east_km, north_km) = point_at(247.4, HOT_GATE_RANGE_KM);
+        let reading = probe_reflectivity(&volume, 0.5, None, east_km, north_km);
+        assert_eq!(
+            format_reading(
+                &reading,
+                &reflectivity_domain(),
+                "REF",
+                UnitSystem::default(),
+                0
+            ),
+            "REF 52.5 dBZ | 43 km 247.4 deg | row 247 gate 164 | beam 0.49 km ARL"
+        );
+        assert_eq!(
+            format_reading(
+                &reading,
+                &reflectivity_domain(),
+                "REF",
+                UnitSystem::default(),
+                3
+            ),
+            "REF 52.5 dBZ | 43.125 km 247.4 deg | row 247 gate 164 | beam 0.49 km ARL"
         );
     }
 
@@ -758,21 +1032,21 @@ mod tests {
         let (east_km, north_km) = point_at(247.4, 43.625);
         let no_echo = probe_reflectivity(&volume, 0.5, None, east_km, north_km);
         assert_eq!(
-            format_reading(&no_echo, &domain, "REF"),
+            format_reading(&no_echo, &domain, "REF", UnitSystem::default(), 1),
             "REF NO ECHO - BEAM SAMPLED THIS LOCATION | 43.6 km 247.4 deg"
         );
 
         let (east_km, north_km) = point_at(247.4, 43.375);
         let folded = probe_reflectivity(&volume, 0.5, None, east_km, north_km);
         assert_eq!(
-            format_reading(&folded, &domain, "REF"),
+            format_reading(&folded, &domain, "REF", UnitSystem::default(), 1),
             "REF RANGE FOLDED | 43.4 km 247.4 deg"
         );
 
         let (east_km, north_km) = point_at(247.4, 120.0);
         let outside = probe_reflectivity(&volume, 0.5, None, east_km, north_km);
         assert_eq!(
-            format_reading(&outside, &domain, "REF"),
+            format_reading(&outside, &domain, "REF", UnitSystem::default(), 1),
             "REF OUTSIDE SWEEP - RADAR DID NOT SAMPLE THIS LOCATION | 120.0 km 247.4 deg"
         );
     }

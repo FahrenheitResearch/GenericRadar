@@ -119,9 +119,26 @@ pub(crate) fn age_repaint_interval(age: TimeDelta) -> Duration {
 /// volume says where to look.
 const PLACEHOLDER_KM_PER_POINT: f32 = 4.0;
 
+/// What the Open field and the drop target will take.
+///
+/// Named formats rather than named extensions, because the decoder routes on
+/// magic bytes: an extensionless archive object works, and a `.gz` is opened
+/// by what is inside it.
+const OPEN_PATH_HINT: &str = "NEXRAD Level II (.ar2v/.gz/.bz2/_V06, or no extension at all), \
+     GR2Analyst .msg31, ODIM_H5 (.h5/.hdf/.hd5), CfRadial (.nc), or a mobile deployment .zip. \
+     Files can also be dropped on the window.";
+
 const MAX_LOAD_RESULTS_PER_FRAME: usize = 4;
 const MAX_RENDER_RESULTS_PER_FRAME: usize = 4;
 const TIMELINE_HEIGHT: f32 = 34.0;
+/// How long the loop holds each frame, by default.
+///
+/// The DEFAULT now rather than the only answer: `Data > Loop frame time`
+/// carries it. A loop speed is the most-used control the application still
+/// could not change anywhere, and the argument for leaving it out - that a
+/// loop speed belongs on the toolbar - argued against the quiet toolbar this
+/// application is built around. It stays 700 ms, so a session with no
+/// settings file loops exactly as it always did.
 const PLAYBACK_FRAME_TIME: Duration = Duration::from_millis(700);
 
 /// Why a pane has no render in flight and will not be given one for a stamp.
@@ -257,6 +274,24 @@ struct SettingsCache {
     sweep_speed: f32,
     /// The Analysis page's unit-order choice for the Vrot readouts.
     vrot_mps_first: bool,
+    /// Units & time: how every distance, height and volume time is written.
+    /// Display only - see [`crate::units`].
+    units: crate::units::UnitSystem,
+    /// Readout & annotation: the ring ladder, the marker and label sizes, the
+    /// readout precision and what the pane corner writes.
+    annotation: crate::annotation::Annotation,
+    /// Cross-section: how high the slice window is drawn, metres above the
+    /// radar. Not display-only - it is what the sampler is asked for.
+    xsection_top_m: f32,
+    /// Data: how long the timeline holds each frame while looping.
+    loop_frame_time: Duration,
+    /// Which gates are allowed to be painted. `GateFilter::OFF` is the shipped
+    /// value; anything else and every pane draws a FILTERED band saying so.
+    /// Cached here because the paint path reads it once per pane per frame -
+    /// for the band, for the badge and for the render request - and five
+    /// string-keyed store lookups per pane per frame is exactly what this
+    /// cache exists to avoid.
+    gate_filter: render2d::GateFilter,
 }
 
 impl Default for SettingsCache {
@@ -270,8 +305,40 @@ impl Default for SettingsCache {
             sweep_animation: true,
             sweep_speed: 1.0,
             vrot_mps_first: false,
+            units: crate::units::UnitSystem::default(),
+            annotation: crate::annotation::Annotation::default(),
+            xsection_top_m: crate::xsection::DEFAULT_TOP_M,
+            loop_frame_time: PLAYBACK_FRAME_TIME,
+            gate_filter: render2d::GateFilter::OFF,
         }
     }
+}
+
+/// The gate-filter mask a readout consults, kept beside the sweep it belongs to.
+///
+/// The mask the renderer built lives on the render worker and dies with the
+/// frame, so the readout path builds its own against the sweep as it sits in
+/// the cut - which is the indexing
+/// [`render2d::ViewportMomentCache::gate_filter_mask`] documents, and the same
+/// grid [`crate::probe::probe_polar`] reads. It is memoised on everything it
+/// depends on, because hovering recomputes the readout every frame and a
+/// super-resolution sweep is over a million gates.
+///
+/// This is not a display decision. It exists so a readout can never answer a
+/// censored gate with its true value at a pixel the pane deliberately drew
+/// empty: the number under the cursor has to be a number that is on the
+/// screen.
+struct ProbeCensor {
+    /// Volume identity by content rather than by pointer, so a freed and
+    /// reallocated `Arc` cannot pass for the frame this was computed from.
+    site: String,
+    volume_time: DateTime<Utc>,
+    cut_index: usize,
+    moment: radar_core::MomentType,
+    filter: render2d::GateFilter,
+    /// `None` when the filter ran and hid nothing here - the same meaning
+    /// `GateFilterOutcome::mask` gives it.
+    mask: Option<render2d::GateFilterMask>,
 }
 
 pub struct WorkstationApp {
@@ -362,6 +429,13 @@ pub struct WorkstationApp {
     settings_store: settings::SettingsStore,
     /// The settings window's own state: open, selected page, search.
     settings_ui: crate::settings_ui::SettingsUi,
+    /// The toolbar's gate-filter chip: whether its panel is down. The filter
+    /// itself lives in the settings store, so the chip is stateless beyond
+    /// this and a restart reopens on the same criteria.
+    gate_filter_ui: crate::gate_filter_ui::GateFilterUi,
+    /// The censor the probe and the Vrot sampler read, memoised. Empty
+    /// whenever the filter is off, which is the shipped state.
+    probe_censor: Option<ProbeCensor>,
     /// Frame-rate mirrors of the handful of settings the paint path reads.
     settings_cache: SettingsCache,
 }
@@ -456,9 +530,13 @@ impl WorkstationApp {
             placed_hazards: Vec::new().into(),
             placed_hazards_projection: None,
             placed_hazards_at: None,
-            settings_registry: crate::settings_ui::catalog::registry(),
+            settings_registry: crate::settings_ui::full_registry(
+                crate::theme::settings::settings_category(),
+            ),
             settings_store,
             settings_ui: crate::settings_ui::SettingsUi::default(),
+            gate_filter_ui: crate::gate_filter_ui::GateFilterUi::default(),
+            probe_censor: None,
             settings_cache: SettingsCache::default(),
         };
         // Open on a map instead of an empty pane. The placeholder anchor, and
@@ -496,6 +574,68 @@ impl WorkstationApp {
     /// history policy exists before the first install and a restored pane
     /// never renders once in its default shape first.
     fn apply_settings_on_start(&mut self) {
+        use crate::settings_ui::catalog::keys;
+
+        self.apply_settings_document();
+
+        // Only on start: `VolumeHistory::new` builds an empty history, so
+        // this line belongs to a session that has not loaded anything yet. A
+        // profile switch changes the same two settings through
+        // `apply_changed_setting`, which calls `set_policy` and evicts down to
+        // it rather than throwing away every volume the analyst has.
+        let frames = self.settings_store.effective_int(
+            &self.settings_registry,
+            keys::data::CATEGORY,
+            keys::data::HISTORY_MAX_FRAMES,
+        ) as usize;
+        let megabytes = self.settings_store.effective_int(
+            &self.settings_registry,
+            keys::data::CATEGORY,
+            keys::data::HISTORY_MAX_MB,
+        ) as usize;
+        self.history = VolumeHistory::new(analyst_runtime::HistoryPolicy::new(
+            frames,
+            megabytes * 1024 * 1024,
+        ));
+
+        // The shipped profile is "how this build behaves with nothing
+        // stored", and only the application can say what that includes: the
+        // default pane layout and the default colour tables are structured
+        // snapshot state, not scalar knobs.
+        self.settings_ui
+            .profiles
+            .set_shipped(Self::shipped_settings_document());
+    }
+
+    /// The document this build behaves as when nothing is stored - what the
+    /// shipped profile installs.
+    fn shipped_settings_document() -> settings::SettingsDocument {
+        let mut document = settings::SettingsDocument::default();
+        // No `values` at all: every declared setting then resolves to the
+        // default its own module declared, which is the definition of "as
+        // shipped" and stays correct when a setting is added.
+        let mut workspace = crate::settings_ui::sync::capture_workspace(
+            &analyst_runtime::WorkspaceState::default(),
+        );
+        workspace.palettes =
+            crate::settings_ui::palettes::capture_palettes(&color_tables::ColorTableSet::default());
+        workspace.show_warnings = Some(true);
+        document.workspace = workspace;
+        document
+    }
+
+    /// Apply the whole settings document to live state.
+    ///
+    /// Everything a settings file can say that is not a scalar knob the
+    /// per-setting path already handles: the colour tables, the workspace
+    /// snapshot, and the handful of values read once rather than watched.
+    ///
+    /// Run at startup and again on every profile switch - a switch replaces
+    /// the document, so it needs exactly what a freshly read file needs. It
+    /// deliberately touches nothing that belongs to the session rather than to
+    /// the settings (the volume history, the live feed): switching from the
+    /// chase profile to the office profile must not throw away the storm.
+    fn apply_settings_document(&mut self) {
         use crate::settings_ui::catalog::keys;
 
         // Palettes before anything renders, resolved against the shipped
@@ -559,23 +699,6 @@ impl WorkstationApp {
         if let Some(show) = self.settings_store.workspace().show_warnings {
             self.show_warnings = show;
         }
-
-        // Before any volume installs, so the first frame is admitted under
-        // the policy the analyst chose rather than evicted into it.
-        let frames = self.settings_store.effective_int(
-            &self.settings_registry,
-            keys::data::CATEGORY,
-            keys::data::HISTORY_MAX_FRAMES,
-        ) as usize;
-        let megabytes = self.settings_store.effective_int(
-            &self.settings_registry,
-            keys::data::CATEGORY,
-            keys::data::HISTORY_MAX_MB,
-        ) as usize;
-        self.history = VolumeHistory::new(analyst_runtime::HistoryPolicy::new(
-            frames,
-            megabytes * 1024 * 1024,
-        ));
 
         self.apply_storm_motion_settings();
         self.apply_vol3d_settings();
@@ -720,6 +843,29 @@ impl WorkstationApp {
         self.vol3d.show_labels = toggle(k::SHOW_LABELS);
     }
 
+    /// The appearance the store asks for: theme plus the four axes.
+    ///
+    /// Resolved through the registry, so a stranger id (a theme from a newer
+    /// build, a hand-edited file) reads back as the declared default without
+    /// the stored string being touched - the analyst's choice comes back the
+    /// moment the build that has it runs again. The rule itself lives once,
+    /// in `theme::settings::appearance_from_ids`, which `main.rs` also calls
+    /// before the first frame.
+    fn appearance(&self) -> crate::theme::Appearance {
+        use crate::theme::settings::keys;
+        let text = |id: &str| {
+            self.settings_store
+                .effective_text(&self.settings_registry, keys::CATEGORY, id)
+        };
+        crate::theme::settings::appearance_from_ids(
+            Some(&text(keys::THEME)),
+            Some(&text(keys::ACCENT)),
+            Some(&text(keys::CHROME_EDGES)),
+            Some(&text(keys::DENSITY)),
+            Some(&text(keys::UI_SCALE)),
+        )
+    }
+
     /// Rebuild [`SettingsCache`] from the store. Once at start and again on
     /// any reported change; never per frame.
     fn recompute_settings_cache(&mut self) {
@@ -789,7 +935,174 @@ impl WorkstationApp {
                 keys::analysis::CATEGORY,
                 keys::analysis::VROT_UNITS,
             ) == "mps",
+            units: crate::units::UnitSystem {
+                distance: crate::units::DistanceUnit::from_id(&store.effective_text(
+                    registry,
+                    keys::units::CATEGORY,
+                    keys::units::DISTANCE,
+                )),
+                altitude: crate::units::AltitudeUnit::from_id(&store.effective_text(
+                    registry,
+                    keys::units::CATEGORY,
+                    keys::units::ALTITUDE,
+                )),
+                zone: crate::units::TimeZoneChoice::from_id(&store.effective_text(
+                    registry,
+                    keys::units::CATEGORY,
+                    keys::units::TIME_ZONE,
+                )),
+                clock: crate::units::ClockFormat::from_id(&store.effective_text(
+                    registry,
+                    keys::units::CATEGORY,
+                    keys::units::CLOCK,
+                )),
+            },
+            annotation: {
+                let annotation_int =
+                    |id: &str| store.effective_int(registry, keys::annotation::CATEGORY, id);
+                let annotation_float = |id: &str| {
+                    store.effective_float(registry, keys::annotation::CATEGORY, id) as f32
+                };
+                crate::annotation::Annotation {
+                    ring_ladder: crate::annotation::RingLadder::from_id(&store.effective_text(
+                        registry,
+                        keys::annotation::CATEGORY,
+                        keys::annotation::RING_LADDER,
+                    )),
+                    // The store has already clamped these into the ranges the
+                    // catalog declares, so the `max(0)` is only about the cast:
+                    // `i64 as usize` on a negative number is a very large
+                    // positive one, and a ring count of 18 million would be a
+                    // frozen frame rather than a wrong picture.
+                    ring_count: annotation_int(keys::annotation::RING_COUNT).max(0) as usize,
+                    ring_labels: store.effective_bool(
+                        registry,
+                        keys::annotation::CATEGORY,
+                        keys::annotation::RING_LABELS,
+                    ),
+                    site_marker_points: annotation_float(keys::annotation::SITE_MARKER_SIZE),
+                    site_label_points: annotation_float(keys::annotation::SITE_LABEL_SIZE),
+                    site_declutter_max: annotation_int(keys::annotation::SITE_DECLUTTER_MAX).max(0)
+                        as usize,
+                    site_marker_max: annotation_int(keys::annotation::SITE_MARKER_MAX).max(0)
+                        as usize,
+                    range_decimals: annotation_int(keys::annotation::RANGE_DECIMALS).clamp(0, 9)
+                        as u8,
+                    coordinate_decimals: annotation_int(keys::annotation::COORDINATE_DECIMALS)
+                        .clamp(0, 9) as u8,
+                    corner_readout: crate::annotation::CornerReadout::from_id(
+                        &store.effective_text(
+                            registry,
+                            keys::annotation::CATEGORY,
+                            keys::annotation::CORNER_READOUT,
+                        ),
+                    ),
+                }
+            },
+            // Kilometres in the menu, metres to the sampler. Fenced twice, on
+            // the same principle as the network tuning: the store has already
+            // clamped this into the catalog's declared 4-24 km, and
+            // `xsection::sanitized_top_m` is the fence the code itself will
+            // accept from a hand-edited settings file.
+            xsection_top_m: crate::xsection::sanitized_top_m(
+                (store.effective_int(registry, keys::xsection::CATEGORY, keys::xsection::TOP_KM)
+                    * 1_000) as f32,
+            ),
+            // The store has already clamped this into the catalog's 100-3000 ms
+            // range; `max(0)` is only about the `i64 as u64` cast.
+            loop_frame_time: Duration::from_millis(
+                store
+                    .effective_int(registry, keys::data::CATEGORY, keys::data::LOOP_FRAME_MS)
+                    .max(0) as u64,
+            ),
+            // Read, never written back. Unlike quality and the basemap, the
+            // filter is not mirrored from live state every frame - it has no
+            // live state other than the store - so a settings file carrying an
+            // out-of-range or hand-edited value resolves to something sane on
+            // screen and keeps its own text on disk.
+            gate_filter: crate::gate_filter_ui::filter_from_settings(registry, store),
         };
+        self.apply_network_settings();
+    }
+
+    /// Push the network policy at the two places that own network behaviour:
+    /// the live worker's shared handle, and the data layer's transfer
+    /// globals. Both clamp again on the way in, so this cannot be the step
+    /// that lets a bad value through.
+    fn apply_network_settings(&self) {
+        use crate::settings_ui::catalog::keys;
+        let store = &self.settings_store;
+        let registry = &self.settings_registry;
+        let seconds = |category: &str, id: &str| {
+            Duration::from_secs_f64(store.effective_float(registry, category, id).max(0.0))
+        };
+        let tuning = crate::net_tuning::NetTuning {
+            live_poll: seconds(keys::data::CATEGORY, keys::data::POLL_SECONDS),
+            archive_poll: Duration::from_secs(
+                store
+                    .effective_int(
+                        registry,
+                        keys::network::CATEGORY,
+                        keys::network::ARCHIVE_POLL_SECONDS,
+                    )
+                    .max(0) as u64,
+            ),
+            archive_lead_minutes: store.effective_int(
+                registry,
+                keys::network::CATEGORY,
+                keys::network::ARCHIVE_LEAD_MINUTES,
+            ),
+            stall_after: Duration::from_secs(
+                store
+                    .effective_int(
+                        registry,
+                        keys::network::CATEGORY,
+                        keys::network::STALL_AFTER_SECONDS,
+                    )
+                    .max(0) as u64,
+            ),
+            live_cache_bytes: (store
+                .effective_int(
+                    registry,
+                    keys::data::CATEGORY,
+                    keys::data::LIVE_CACHE_LIMIT_MB,
+                )
+                .max(0) as u64)
+                .saturating_mul(1024 * 1024),
+            download_batch: store
+                .effective_int(
+                    registry,
+                    keys::network::CATEGORY,
+                    keys::network::DOWNLOAD_BATCH,
+                )
+                .max(0) as usize,
+            download_attempts: store
+                .effective_int(
+                    registry,
+                    keys::network::CATEGORY,
+                    keys::network::DOWNLOAD_ATTEMPTS,
+                )
+                .max(0) as usize,
+            retry_backoff: Duration::from_millis(
+                store
+                    .effective_int(
+                        registry,
+                        keys::network::CATEGORY,
+                        keys::network::RETRY_BACKOFF_MS,
+                    )
+                    .max(0) as u64,
+            ),
+        }
+        .clamped();
+        self.live_service.tuning().set(tuning);
+        // The data layer's half. Read back out of the clamped policy rather
+        // than out of the store, so the two halves cannot disagree about what
+        // the analyst asked for.
+        data_source::tuning::set_transfer_tuning(
+            tuning.download_batch,
+            tuning.download_attempts,
+            tuning.retry_backoff,
+        );
     }
 
     /// Apply one changed setting to live state. The cache rebuild runs once
@@ -864,10 +1177,128 @@ impl WorkstationApp {
                     megabytes * 1024 * 1024,
                 ));
             }
+            (
+                keys::radar::CATEGORY,
+                keys::radar::FILTER_MIN_DBZ
+                | keys::radar::FILTER_VEL_NEEDS_DBZ
+                | keys::radar::FILTER_MIN_RHO
+                | keys::radar::FILTER_HIDE_RF
+                | keys::radar::FILTER_MIN_RANGE_KM,
+            ) => {
+                // Same data, different picture - the same invalidation a
+                // quality change gets. The cache rebuild that actually reads
+                // the new numbers is the caller's, once per change batch; this
+                // arm only has to make the panes ask for a new raster.
+                self.invalidate_view_panes(self.workspace.visible_panes());
+            }
             (keys::vol3d::CATEGORY, _) => self.apply_vol3d_settings(),
+            // The network policy lives in the live worker and the data layer
+            // rather than in the cache, so it is pushed rather than read.
+            // `recompute_settings_cache` already does this for every change;
+            // naming the arms keeps the dispatch honest about what each key
+            // touches instead of relying on that side effect.
+            (keys::network::CATEGORY, _)
+            | (keys::data::CATEGORY, keys::data::POLL_SECONDS | keys::data::LIVE_CACHE_LIMIT_MB) => {
+                self.apply_network_settings();
+            }
+            // A unit or an annotation change repaints the chrome, which the
+            // pane draws every frame anyway - but the probe readout is cached
+            // from the previous frame's sample, so it would keep its old units
+            // until the pointer moved.
+            (keys::units::CATEGORY, _) | (keys::annotation::CATEGORY, _) => {
+                for pane in self.panes.iter_mut() {
+                    pane.probe_text = None;
+                }
+            }
+            // The slice top is the one setting on this list that is not a
+            // display choice: it changes what the sampler is asked for. It
+            // needs nothing here because `xsection` carries the top in its own
+            // rebuild key and compares it against the recomputed cache on the
+            // next frame - named so the dispatch stays honest about that.
+            (keys::xsection::CATEGORY, _)
+            // Same for the loop's frame time: `advance_playback` reads it from
+            // the cache on the frame after the change.
+            | (keys::data::CATEGORY, keys::data::LOOP_FRAME_MS) => {}
             // Everything else is either cache-backed (rebuilt by the caller),
             // read at startup, or declared pending its wiring seam.
             _ => {}
+        }
+    }
+
+    /// The settings window's own state.
+    ///
+    /// `pub(crate)` for `examples/profiles_proof.rs`, which opens the window on
+    /// the Profiles page and then photographs and CLICKS the real page - the
+    /// same reason `toolbar` is `pub(crate)`. Opening a window is not the
+    /// behaviour that proof is about, and steering it through simulated clicks
+    /// on a title bar would make the proof about egui instead.
+    ///
+    /// `allow`, not `expect`: dead code is judged per compilation unit, and
+    /// this method has a caller in one (the example) and none in the other
+    /// (the binary), so an `expect` would be unfulfilled in the example.
+    #[allow(dead_code)]
+    pub(crate) fn settings_ui_mut(&mut self) -> &mut crate::settings_ui::SettingsUi {
+        &mut self.settings_ui
+    }
+
+    /// The one line the running application says about profiles: which one is
+    /// active and whether the settings have moved away from it since.
+    ///
+    /// `None` when the analyst has never met a profile and has changed
+    /// nothing - a fresh install has no profile worth naming - and when the
+    /// Profiles page's own setting says not to show it.
+    fn active_profile_line(&mut self) -> Option<String> {
+        use crate::settings_ui::catalog::keys;
+        if !self.settings_store.effective_bool(
+            &self.settings_registry,
+            keys::profiles::CATEGORY,
+            keys::profiles::SHOW_IN_STATUS,
+        ) {
+            return None;
+        }
+        let (name, modified) = self
+            .settings_ui
+            .profiles
+            .summary(&self.settings_registry, &self.settings_store)?;
+        Some(if modified {
+            format!("Profile: {name} (modified)")
+        } else {
+            format!("Profile: {name}")
+        })
+    }
+
+    /// A profile switch: the settings document has already been replaced, and
+    /// this is where it reaches live state.
+    ///
+    /// Two halves, and neither of them is a list of settings:
+    ///
+    /// * [`Self::apply_settings_document`], which is the same function a
+    ///   freshly read settings file goes through at startup - colour tables,
+    ///   the workspace snapshot, the values read once;
+    /// * every setting the REGISTRY declares, pushed into `outcome.changed` so
+    ///   the caller's existing per-setting dispatch runs over all of them.
+    ///
+    /// The second half is the point. A setting added by any later piece of
+    /// work is declared in the catalog and wired into `apply_changed_setting`
+    /// (or into the settings cache) because that is what makes it work when
+    /// someone drags its slider; enumerating the registry here means a profile
+    /// switch inherits that wiring for free, on the day it lands, with no
+    /// change to this function. A hand-written list of keys would have to be
+    /// remembered instead - and would fail silently when it was not.
+    fn apply_switched_profile(&mut self, outcome: &mut crate::settings_ui::SettingsOutcome) {
+        self.apply_settings_document();
+        for category in self.settings_registry.categories() {
+            for spec in &category.settings {
+                outcome.changed.push((category.id.clone(), spec.id.clone()));
+            }
+        }
+        // The document brought its own colour tables and its own panes: the
+        // same invalidation a palette change and a product change each get,
+        // because a switch can be both at once.
+        outcome.palette_changed = true;
+        self.invalidate_semantic_panes(self.workspace.visible_panes());
+        if let Some(name) = settings::profiles::active_profile(self.settings_store.document()) {
+            self.status = format!("Profile '{name}' applied");
         }
     }
 
@@ -875,7 +1306,7 @@ impl WorkstationApp {
     /// the debounced autosave: the whole persistence pass, once per frame.
     fn settings_frame(&mut self, context: &egui::Context) {
         use crate::settings_ui::catalog::keys;
-        let outcome = crate::settings_ui::draw_settings_window(
+        let mut outcome = crate::settings_ui::draw_settings_window(
             context,
             &mut self.settings_ui,
             crate::settings_ui::SettingsWindowInput {
@@ -885,6 +1316,9 @@ impl WorkstationApp {
                 user_tables: Some(self.user_tables.library()),
             },
         );
+        if outcome.profile_switched {
+            self.apply_switched_profile(&mut outcome);
+        }
         if outcome.user_tables_rescan {
             self.rescan_user_tables();
         }
@@ -904,23 +1338,16 @@ impl WorkstationApp {
         }
         for (category, id) in &outcome.changed {
             self.apply_changed_setting(category, id);
-            // The theme needs the context, which `apply_changed_setting`
-            // deliberately does not carry - it is the one setting that
-            // restyles egui itself rather than the app's own state.
-            if (category.as_str(), id.as_str())
-                == (keys::appearance::CATEGORY, keys::appearance::THEME)
+            // The appearance axes need the context, which
+            // `apply_changed_setting` deliberately does not carry - they are
+            // the settings that restyle egui itself rather than the app's own
+            // state. All five re-install together: they are one
+            // `theme::Appearance`, and installing half of one is how a theme
+            // change loses somebody's density.
+            if category.as_str() == crate::theme::settings::keys::CATEGORY
+                && crate::theme::settings::keys::ALL.contains(&id.as_str())
             {
-                let variant = if self.settings_store.effective_text(
-                    &self.settings_registry,
-                    keys::appearance::CATEGORY,
-                    keys::appearance::THEME,
-                ) == "dark"
-                {
-                    crate::theme::Variant::Dark
-                } else {
-                    crate::theme::Variant::Light
-                };
-                crate::theme::apply(context, variant);
+                crate::theme::apply(context, &self.appearance());
             }
         }
         if !outcome.changed.is_empty() {
@@ -1012,15 +1439,16 @@ impl WorkstationApp {
     /// et al. 2017) is about the science, and this is the display layer,
     /// which is exactly what the setting governs.
     fn vrot_report_line(&self, measurement: &crate::vrot::VrotMeasurement) -> String {
+        let units = self.settings_cache.units;
         if !self.settings_cache.vrot_mps_first {
-            return crate::vrot::report(measurement);
+            return crate::vrot::report(measurement, units);
         }
         let mut text = format!(
-            "{} | delta-V {:.1} m/s | separation {:.2} km | height {:.2} km ARL | {:.1} deg cut {}",
+            "{} | delta-V {:.1} m/s | separation {} | height {} ARL | {:.1} deg cut {}",
             self.vrot_readout(measurement),
             measurement.delta_v_mps,
-            measurement.separation_km,
-            measurement.couplet_height_arl_m / 1000.0,
+            units.distance(measurement.separation_km, 2),
+            units.altitude(measurement.couplet_height_arl_m, 2),
             measurement.first.elevation_deg,
             measurement.first.cut_index,
         );
@@ -1315,10 +1743,8 @@ impl WorkstationApp {
                         total_size as f64 / (1_024.0 * 1_024.0),
                         if cache_hit { "cached" } else { "downloaded" }
                     );
-                    let source_label = format!(
-                        "{site} {}",
-                        volume_time.to_rfc3339_opts(SecondsFormat::Secs, true)
-                    );
+                    let source_label =
+                        format!("{site} {}", self.settings_cache.units.time(volume_time));
                     if let Err(request) = self.load_service.request(LoadRequest {
                         generation,
                         path,
@@ -1501,7 +1927,7 @@ impl WorkstationApp {
                 break;
             };
             match update {
-                RenderUpdate::Completed(rendered) => self.install_render(context, rendered),
+                RenderUpdate::Completed(rendered) => self.install_render(context, *rendered),
                 RenderUpdate::Failed {
                     pane,
                     stamp,
@@ -1600,7 +2026,16 @@ impl WorkstationApp {
         if exact {
             runtime.pending_stamp = None;
             runtime.terminal = None;
-            runtime.status = format!("{:.1} ms", rendered.elapsed_ms);
+            // A frame with gates removed says so here, every time, in the words
+            // the filter itself uses. This is the floor, not the finished
+            // treatment: a persistent badge on the pane belongs on the pane.
+            // But no build of this application may ever draw a censored sweep
+            // and say nothing at all, because the only other evidence an
+            // analyst would have is the absence of the echo that was removed.
+            runtime.status = match rendered.gate_filter.badge() {
+                Some(badge) => format!("{:.1} ms | {badge}", rendered.elapsed_ms),
+                None => format!("{:.1} ms", rendered.elapsed_ms),
+            };
         }
         // A view-stale install leaves `pending_stamp` alone on purpose: the
         // exact-stamp render is still owed, and `ensure_render_requested`
@@ -1614,18 +2049,20 @@ impl WorkstationApp {
     /// One drop can carry several files, and a folder of palettes is exactly
     /// the kind of thing an analyst drags in one go, so every colour table in
     /// the drop is imported rather than only the first. A volume is still one
-    /// at a time - a pane draws one - so the first non-palette path wins.
+    /// at a time - a pane draws one - so the first non-palette path that
+    /// looks like radar data wins, which keeps a screenshot dragged alongside
+    /// the volume from clearing the session.
     fn handle_dropped_files(&mut self, context: &egui::Context) {
         let dropped = context.input(|input| input.raw.dropped_files.clone());
         if dropped.is_empty() {
             return;
         }
-        let (tables, volume) =
+        let (tables, candidates) =
             crate::user_tables::split_drop(dropped.into_iter().filter_map(|file| file.path));
         if !tables.is_empty() && self.user_tables.import_all(&tables) {
             self.reresolve_palettes_from_user_tables();
         }
-        if let Some(path) = volume {
+        if let Some(path) = crate::app_support::choose_dropped_radar_file(candidates) {
             self.begin_load(path);
         }
     }
@@ -1672,9 +2109,10 @@ impl WorkstationApp {
             context.request_repaint_after(Duration::from_millis(16));
             return;
         }
+        let frame_time = self.settings_cache.loop_frame_time;
         let elapsed = self.last_playback_step.elapsed();
-        if elapsed < PLAYBACK_FRAME_TIME {
-            context.request_repaint_after(PLAYBACK_FRAME_TIME - elapsed);
+        if elapsed < frame_time {
+            context.request_repaint_after(frame_time - elapsed);
             return;
         }
         let before = self.current_frame_signature();
@@ -1713,6 +2151,10 @@ impl WorkstationApp {
     fn toolbar_menus(&mut self, ui: &mut egui::Ui) {
         use crate::theme::bevel;
 
+        // Before the bar is built, not inside the File menu's closure: the
+        // summary reads the profile library and the settings store together,
+        // and computing it here keeps the closure borrowing one field.
+        let profile_line = self.active_profile_line();
         let active = self.workspace.active_pane;
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
@@ -1721,6 +2163,7 @@ impl WorkstationApp {
         let mut selected_product = current_product;
         let mut quality_changed = false;
         let mut palette_changed = false;
+        let mut filter_changed = false;
         let mut tilt_delta = 0_isize;
         let visible = self.workspace.visible_panes();
         let cameras_linked = visible
@@ -1758,18 +2201,30 @@ impl WorkstationApp {
             ui.horizontal_wrapped(|ui| {
                 bevel::toolbar_menu(ui, "File", |ui| {
                     ui.set_min_width(300.0);
-                    ui.label("Open a Level II archive");
+                    ui.label("Open a radar volume");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.source_path_text)
                             .desired_width(260.0)
-                            .hint_text("Level II file path"),
-                    );
+                            .hint_text("Radar volume file path"),
+                    )
+                    .on_hover_text(OPEN_PATH_HINT);
                     if ui.button("Load file").clicked() && !self.source_path_text.trim().is_empty()
                     {
                         requested_load = Some(PathBuf::from(self.source_path_text.trim()));
                         ui.close();
                     }
                     bevel::etched_separator(ui);
+                    // The one place a running application names the active
+                    // profile: unobtrusive - a menu nobody has to open - and
+                    // findable, right above the window it is managed in.
+                    if let Some(line) = &profile_line {
+                        ui.label(egui::RichText::new(line).small().weak());
+                    }
+                    if ui.button("Profiles…").clicked() {
+                        self.settings_ui
+                            .open_category(crate::settings_ui::catalog::keys::profiles::CATEGORY);
+                        ui.close();
+                    }
                     if ui.button("Settings…").clicked() {
                         self.settings_ui.open = true;
                         ui.close();
@@ -2010,6 +2465,21 @@ impl WorkstationApp {
                     }
                 }
 
+                // The gate filter, beside the product and the palette because
+                // it belongs to the same question those two answer: what am I
+                // actually being shown. It is on the bar and not filed under a
+                // menu for the reason `crate::gate_filter_ui` documents - a
+                // control that hides weather has to be visible while it is on,
+                // and the chip latches while it is.
+                filter_changed |= crate::gate_filter_ui::draw_gate_filter_control(
+                    ui,
+                    crate::gate_filter_ui::GateFilterControl {
+                        state: &mut self.gate_filter_ui,
+                        registry: &self.settings_registry,
+                        store: &mut self.settings_store,
+                    },
+                );
+
                 // A stepper: two keys with the measurement inset between them.
                 // The well holds a floor width so the whole right-hand half of
                 // the bar does not shuffle sideways when 0.48° becomes 19.51°.
@@ -2108,7 +2578,14 @@ impl WorkstationApp {
             });
         });
 
-        if quality_changed || palette_changed {
+        if filter_changed {
+            // The chip wrote straight to the store, so the cache the paint
+            // path reads is one frame stale until this runs. Before the
+            // invalidation below, so the re-render it asks for is requested
+            // under the new filter rather than the old one.
+            self.recompute_settings_cache();
+        }
+        if quality_changed || palette_changed || filter_changed {
             // Same data, different picture: every pane's view generation moves,
             // which discards the in-flight render and asks for a new one
             // without throwing away the texture that is currently on screen.
@@ -2163,6 +2640,7 @@ impl WorkstationApp {
         let mut selected_product = current_product;
         let mut quality_changed = false;
         let mut palette_changed = false;
+        let mut filter_changed = false;
         let mut tilt_delta = 0_isize;
         let visible = self.workspace.visible_panes();
         let cameras_linked = visible
@@ -2175,8 +2653,9 @@ impl WorkstationApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.source_path_text)
                     .desired_width(260.0)
-                    .hint_text("Level II file path"),
-            );
+                    .hint_text("Radar volume file path"),
+            )
+            .on_hover_text(OPEN_PATH_HINT);
             if ui.button("Load").clicked() && !self.source_path_text.trim().is_empty() {
                 requested_load = Some(PathBuf::from(self.source_path_text.trim()));
             }
@@ -2388,6 +2867,21 @@ impl WorkstationApp {
                 quality_changed = true;
             }
 
+            // The same control the menu bar carries, in the same bevelled
+            // chip. This row is otherwise stock egui widgets, and that is
+            // deliberate for the ordinary ones; a chip that has to stay
+            // visibly latched in a screenshot while it is hiding weather is
+            // not an ordinary one, which is the same exception the stall
+            // notice above already takes.
+            filter_changed |= crate::gate_filter_ui::draw_gate_filter_control(
+                ui,
+                crate::gate_filter_ui::GateFilterControl {
+                    state: &mut self.gate_filter_ui,
+                    registry: &self.settings_registry,
+                    store: &mut self.settings_store,
+                },
+            );
+
             if ui.button("− Tilt").clicked() {
                 tilt_delta = -1;
             }
@@ -2476,7 +2970,14 @@ impl WorkstationApp {
             ui.label(format!("Pane {}", active.get() + 1));
         });
 
-        if quality_changed || palette_changed {
+        if filter_changed {
+            // The chip wrote straight to the store, so the cache the paint
+            // path reads is one frame stale until this runs. Before the
+            // invalidation below, so the re-render it asks for is requested
+            // under the new filter rather than the old one.
+            self.recompute_settings_cache();
+        }
+        if quality_changed || palette_changed || filter_changed {
             // Same data, different picture: every pane's view generation moves,
             // which discards the in-flight render and asks for a new one
             // without throwing away the texture that is currently on screen.
@@ -2644,6 +3145,9 @@ impl WorkstationApp {
             storm_motion,
             color_table: &table,
             domain: descriptor.domain,
+            units: self.settings_cache.units,
+            range_decimals: self.settings_cache.annotation.range_decimals,
+            top_m: self.settings_cache.xsection_top_m,
         };
         self.xsection.window(context, &input);
     }
@@ -2657,6 +3161,20 @@ impl WorkstationApp {
             .history
             .current()
             .map(|frame| Arc::clone(&frame.volume));
+        // Every pane is filtered by the SAME criteria - there is one filter,
+        // not four - but not every pane can obey them: a volume-derived
+        // product is integrated out of the whole volume rather than rastered
+        // from one sweep, and `render_service` answers that pane with
+        // `GateFilterReport::not_applicable`. So the band is built per pane,
+        // from the pane's own product, and a pane the filter did not run on
+        // says that rather than claiming gates are hidden in it.
+        //
+        // Whether it ran is known here, synchronously, from the product alone -
+        // it is not read back off the render, which would put the honest
+        // version of this band a frame or two behind the picture it describes.
+        // `render_service::render_request` routes on exactly the same
+        // `derived_volume()`, and a test pins the two to each other.
+        let mut clear_filter = false;
         for (pane, pane_rect) in pane_rects(rect, self.workspace.layout) {
             let camera = self.workspace.pane(pane).camera;
             let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
@@ -2681,10 +3199,19 @@ impl WorkstationApp {
                 chrome: map_scene::MapChrome::for_style(self.map_scene.style()),
                 sites: Arc::clone(&self.placed_sites),
                 site_labels: self.settings_cache.site_labels,
+                annotation: self.settings_cache.annotation,
+                units: self.settings_cache.units,
                 active_site: self.live_site.clone(),
                 hazards: Arc::clone(&self.placed_hazards),
             };
             let badges = self.pane_badges(product, now);
+            let filter_notice = crate::gate_filter_ui::pane_banner_text_for(
+                &self.settings_cache.gate_filter,
+                product
+                    .derived_volume()
+                    .is_some()
+                    .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED),
+            );
             let interaction = {
                 let texture =
                     self.panes[pane.index()]
@@ -2716,6 +3243,7 @@ impl WorkstationApp {
                     product_name: product.descriptor().short_name,
                     badges: &badges,
                     probe: self.panes[pane.index()].probe_text.as_deref(),
+                    filter_notice: filter_notice.as_deref(),
                 };
                 draw_pane(
                     ui,
@@ -2742,8 +3270,18 @@ impl WorkstationApp {
                 pane_rect,
                 interaction.camera,
                 interaction.viewport,
+                self.settings_cache.units,
             );
 
+            // The one obvious way out, taken where the evidence is. `draw_pane`
+            // has already withheld this click from `interaction.clicked`, from
+            // `clicked_site` and from `ctrl_clicked_lon_lat`, so clearing the
+            // filter cannot also drop a Vrot endpoint, drop a section handle,
+            // or change which radar this pane is showing.
+            if interaction.clear_filter_clicked {
+                clear_filter = true;
+                self.workspace.set_active(pane);
+            }
             if self.vrot_active && interaction.clicked {
                 self.take_vrot_sample(pane, volume.as_deref(), cut_index, product);
             } else if self.xsection.wants_pane_clicks()
@@ -2766,14 +3304,17 @@ impl WorkstationApp {
                 self.workspace.set_active(pane);
                 match crate::nearest_site::nearest_s_band_site(lat, lon, &self.sites) {
                     Some(choice) => {
-                        let status = choice.status_line();
+                        let status = choice.status_line(self.settings_cache.units);
                         self.site_text = choice.id.to_uppercase();
                         self.start_live(choice.id);
                         // AFTER the load kick: `start_live` writes its own
                         // status, so setting this first would be invisible.
                         self.status = status;
                     }
-                    None => self.status = crate::nearest_site::no_site_in_range_status(),
+                    None => {
+                        self.status =
+                            crate::nearest_site::no_site_in_range_status(self.settings_cache.units)
+                    }
                 }
             } else if interaction.clicked {
                 self.workspace.set_active(pane);
@@ -2788,6 +3329,19 @@ impl WorkstationApp {
             if let Some(volume) = &volume {
                 self.ensure_render_requested(pane, Arc::clone(volume), interaction.viewport);
             }
+        }
+        if clear_filter {
+            // After the loop, not inside it: every visible pane has already
+            // asked for a render under the old filter this frame, and the
+            // invalidation below has to be the last word so the request that
+            // actually reaches the worker is the unfiltered one.
+            crate::gate_filter_ui::write_values(
+                &mut self.settings_store,
+                crate::gate_filter_ui::FilterValues::OFF,
+            );
+            self.recompute_settings_cache();
+            self.invalidate_view_panes(self.workspace.visible_panes());
+            self.status = "Gate filter cleared - every gate is being drawn".to_owned();
         }
     }
 
@@ -2958,6 +3512,19 @@ impl WorkstationApp {
             color_tables: Arc::clone(&self.color_tables),
             quality: self.quality,
             sweep,
+            // The analyst's own criteria, straight off the settings cache and
+            // into the worker that reads the gates. `GateFilter::OFF` until
+            // they ask for something else, and OFF renders down the path this
+            // application always used.
+            //
+            // Whatever is here, the pane must show
+            // `RenderedPane::gate_filter` when it comes back active: a
+            // filtered picture may never be distinguishable from a quiet sky
+            // only by the absence of echo. The pane's FILTERED band and the
+            // legend badge are built from this same cached value, and
+            // `install_render` cross-checks them against what the engine
+            // reports it actually removed.
+            gate_filter: self.settings_cache.gate_filter,
         };
         match self.render_service.request(request) {
             Ok(()) => {
@@ -3265,14 +3832,22 @@ impl WorkstationApp {
             .map(|cut| cut.nominal_elevation_deg)
             .or_else(|| volume.cuts.get(cut_index).map(|cut| cut.elevation_deg))
             .unwrap_or_default();
+        let moment = descriptor.computation.source_moment();
+        // The pane's own censor. Without it the readout answers a censored
+        // gate with its true value at a pixel the pane drew empty, and the
+        // analyst is told a number that is not on the screen. The PRODUCT goes
+        // in as well as the moment, because a volume-derived pane is not
+        // censored by the renderer either - see `probe_censor`.
+        let censor = self.probe_censor(volume, cut_index, &moment, product);
         let reading = crate::probe::probe_polar(
             volume,
             cut_index,
-            &descriptor.computation.source_moment(),
+            &moment,
             elevation_deg,
             volume.site.elevation_m,
             east_km,
             north_km,
+            censor,
         );
         let crate::probe::ProbeReading::Value(value) = reading else {
             self.status = "Vrot: that point has no velocity".to_owned();
@@ -3305,6 +3880,91 @@ impl WorkstationApp {
     ///
     /// Uses the pointer position captured during the previous paint, so the
     /// volume is never scanned while laying out a frame.
+    /// The mask the pane's filter is currently removing gates with, for the
+    /// sweep a readout is about to read.
+    ///
+    /// `None` means nothing is censored there: the filter is off, it hid
+    /// nothing on this sweep, or the sweep does not carry the moment. All
+    /// three are the same answer to a readout - this gate is not one the pane
+    /// hid.
+    ///
+    /// Recomputed only when the sweep, the moment or the criteria move. The
+    /// off path recomputes nothing and drops the memo, so an unfiltered
+    /// session pays for none of this.
+    ///
+    /// One honesty note: for a dealiased-velocity product the picture is
+    /// censored after unfolding while this reads the folded sweep, because
+    /// that is the sweep [`crate::probe::probe_polar`] itself reads. The two
+    /// can only disagree on a gate the radar flagged range-folded, and only
+    /// while `hide_range_folded` is on. Matching the grid the readout reads is
+    /// the lesser error: the alternative reports a censor against numbers the
+    /// readout never quotes.
+    ///
+    /// # Why the product, and not just the moment
+    ///
+    /// The readout has to be censored by exactly what the RENDERER censored,
+    /// and the renderer does not censor a volume-derived product at all:
+    /// `render_request` routes those to `render_derived`, which answers
+    /// `GateFilterReport::not_applicable` and paints every gate. All seven of
+    /// them - composite reflectivity, echo tops, VIL, VIL density, MESH, POH,
+    /// POSH - report `MomentType::Reflectivity` as their source moment, so a
+    /// censor keyed on the moment alone finds a reflectivity mask and applies
+    /// it to a picture that was never filtered.
+    ///
+    /// What that shipped as: Storm mode on, a Composite Reflectivity pane,
+    /// the cursor over a gate the REF criterion would hide - the readout read
+    /// `CREF FILTERED` at a pixel `render_derived` had painted from the whole
+    /// volume, on a pane whose own band correctly read `FILTER NOT APPLIED
+    /// HERE`. Two indicators on one pane telling opposite stories, which is
+    /// the failure this whole integration exists to prevent, arriving from the
+    /// other direction: claiming data is hidden where it is shown.
+    ///
+    /// So the routing fact is `DisplayProduct::derived_volume()`, which is the
+    /// same fact `render_service::render_request` routes on and the same one
+    /// the pane band is built from (see `central_panel`). One fact, three
+    /// readers, and `the_readout_and_the_renderer_censor_the_same_panes` pins
+    /// them to each other.
+    fn probe_censor(
+        &mut self,
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: &radar_core::MomentType,
+        product: DisplayProduct,
+    ) -> Option<&render2d::GateFilterMask> {
+        let filter = self.settings_cache.gate_filter;
+        if !filter.is_active() || product.derived_volume().is_some() {
+            self.probe_censor = None;
+            return None;
+        }
+        let fresh = self.probe_censor.as_ref().is_some_and(|censor| {
+            censor.site == volume.site.id
+                && censor.volume_time == volume.volume_time
+                && censor.cut_index == cut_index
+                && censor.moment == *moment
+                && censor.filter == filter
+        });
+        if !fresh {
+            let mask = volume
+                .cuts
+                .get(cut_index)
+                .and_then(|cut| cut.moments.get(moment))
+                .and_then(|grid| {
+                    render2d::evaluate_gate_filter(volume, cut_index, grid, &filter).mask
+                });
+            self.probe_censor = Some(ProbeCensor {
+                site: volume.site.id.clone(),
+                volume_time: volume.volume_time,
+                cut_index,
+                moment: moment.clone(),
+                filter,
+                mask,
+            });
+        }
+        self.probe_censor
+            .as_ref()
+            .and_then(|censor| censor.mask.as_ref())
+    }
+
     fn refresh_probe(
         &mut self,
         pane: PaneId,
@@ -3330,19 +3990,29 @@ impl WorkstationApp {
             .map(|cut| cut.nominal_elevation_deg)
             .or_else(|| volume.cuts.get(cut_index).map(|cut| cut.elevation_deg))
             .unwrap_or_default();
+        let moment = descriptor.computation.source_moment();
+        // The pane's own censor. Without it the readout answers a censored
+        // gate with its true value at a pixel the pane drew empty, and the
+        // analyst is told a number that is not on the screen. The PRODUCT goes
+        // in as well as the moment, because a volume-derived pane is not
+        // censored by the renderer either - see `probe_censor`.
+        let censor = self.probe_censor(volume, cut_index, &moment, product);
         let reading = crate::probe::probe_polar(
             volume,
             cut_index,
-            &descriptor.computation.source_moment(),
+            &moment,
             elevation_deg,
             volume.site.elevation_m,
             east_km,
             north_km,
+            censor,
         );
         self.panes[pane.index()].probe_text = Some(crate::probe::format_reading(
             &reading,
             &descriptor.domain,
             descriptor.short_name,
+            self.settings_cache.units,
+            self.settings_cache.annotation.range_decimals,
         ));
     }
 
@@ -3602,9 +4272,7 @@ impl WorkstationApp {
         let Some(feed) = self.live_feed.as_ref() else {
             return String::new();
         };
-        let when = feed
-            .newest_volume_time
-            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let when = self.settings_cache.units.time(feed.newest_volume_time);
         // Two different situations, two different sets of advice. On the
         // fallback the picture is being kept current from the other bucket,
         // so "pick another radar" would be telling the analyst to walk away
@@ -3658,6 +4326,16 @@ impl WorkstationApp {
                 Some(age) => format!("{words} · {} OLD", format_age(age)),
                 None => words.to_owned(),
             });
+        }
+        // Second, directly under the stall badge and ahead of PARTIAL: "what
+        // you are looking at is not all of it" is the same class of claim as
+        // "what you are looking at is not now", and the stack is truncated to
+        // `legend::MAX_BADGES`. This is the legend's copy of the statement -
+        // the loud one is the FILTERED band `canvas` draws under the header,
+        // which is not affected by the colour legend being switched off.
+        if let Some(text) = crate::gate_filter_ui::pane_badge_text(&self.settings_cache.gate_filter)
+        {
+            badges.push(text);
         }
         if let Some(frame) = self.history.current()
             && frame.stage != FrameStage::Complete
@@ -3719,10 +4397,7 @@ impl WorkstationApp {
             index,
             self.history.len(),
             frame.stage,
-            frame
-                .identity
-                .volume_time
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            self.settings_cache.units.time(frame.identity.volume_time),
             format_age(data_source::volume_age_at(frame.identity.volume_time, now))
         )
     }
@@ -3808,8 +4483,27 @@ impl eframe::App for WorkstationApp {
 
         let available = ui.available_size();
         let canvas_height = (available.y - TIMELINE_HEIGHT).max(120.0);
+        // Never wider than the window, whatever the bar above did.
+        //
+        // `Ui::allocate_space` expands its parent's `max_rect` to contain a
+        // child that overflows, and the Everything bar can overflow: it is a
+        // wrapped row of stock widgets whose widths follow their contents, and
+        // a latched "Filter: Storm mode" chip is wider than "Filter: off". So
+        // `available_size().x` can report a width larger than the viewport,
+        // and a canvas allocated at it puts every pane's RIGHT-aligned
+        // furniture past the window edge.
+        //
+        // That furniture includes the legend's FILTERED badge. Measured at
+        // 1408 points with the full bar in Storm mode, the pane ran about 18
+        // points over: the colour ramp was off screen entirely and the badge
+        // was clipped to "FIL". An indicator that exists to say data is being
+        // hidden must not itself be pushed out of sight, so the canvas is
+        // clamped to the distance from here to the window's right edge and
+        // the bar is left to be the thing that clips.
+        let to_window_edge = (context.content_rect().right() - ui.cursor().left()).max(1.0);
+        let canvas_width = available.x.min(to_window_edge).max(1.0);
         let (canvas_rect, _) = ui.allocate_exact_size(
-            egui::vec2(available.x.max(1.0), canvas_height),
+            egui::vec2(canvas_width, canvas_height),
             egui::Sense::hover(),
         );
         self.canvas(ui, canvas_rect);
@@ -3882,6 +4576,203 @@ impl eframe::App for WorkstationApp {
 
 #[cfg(test)]
 mod tests {
+    /// The catalog declares these choices as plain strings, because it is
+    /// also compiled by the `settings` crate's own preview harness and cannot
+    /// see this module. This is the seam where the two halves are checked
+    /// against each other: every option the menu offers must resolve to an
+    /// enum here, every enum must be offered, and the declared default must be
+    /// the shipped unit.
+    #[test]
+    fn every_menu_option_matches_an_enum_and_the_defaults_agree() {
+        use crate::settings_ui::catalog::{keys, registry};
+        let registry = registry();
+        let category = keys::units::CATEGORY;
+
+        let offered = |id: &str| -> (Vec<String>, String) {
+            let spec = registry
+                .setting(category, id)
+                .unwrap_or_else(|| panic!("the catalog declares units/{id}"));
+            match &spec.kind {
+                settings::SettingKind::Choice {
+                    options,
+                    default_id,
+                } => (
+                    options.iter().map(|option| option.id.clone()).collect(),
+                    default_id.clone(),
+                ),
+                other => panic!("units/{id} is {other:?}, not a choice"),
+            }
+        };
+
+        let (ids, default) = offered(keys::units::DISTANCE);
+        assert_eq!(
+            ids,
+            crate::units::DistanceUnit::ALL
+                .iter()
+                .map(|unit| unit.id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::units::DistanceUnit::from_id(&default),
+            crate::units::DistanceUnit::default()
+        );
+
+        let (ids, default) = offered(keys::units::ALTITUDE);
+        assert_eq!(
+            ids,
+            crate::units::AltitudeUnit::ALL
+                .iter()
+                .map(|unit| unit.id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::units::AltitudeUnit::from_id(&default),
+            crate::units::AltitudeUnit::default()
+        );
+
+        let (ids, default) = offered(keys::units::TIME_ZONE);
+        assert_eq!(
+            ids,
+            crate::units::TimeZoneChoice::ALL
+                .iter()
+                .map(|zone| zone.id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::units::TimeZoneChoice::from_id(&default),
+            crate::units::TimeZoneChoice::default()
+        );
+
+        let (ids, default) = offered(keys::units::CLOCK);
+        assert_eq!(
+            ids,
+            crate::units::ClockFormat::ALL
+                .iter()
+                .map(|clock| clock.id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::units::ClockFormat::from_id(&default),
+            crate::units::ClockFormat::default()
+        );
+    }
+
+    /// The two rows this repair added, checked against the code that reads
+    /// them: the menu must not offer a slice top the sampler would clamp, and
+    /// both defaults must be the constants they replaced.
+    ///
+    /// Same seam and same reason as the units test above. The catalog is also
+    /// compiled by the `settings` crate's preview harness, which cannot see
+    /// this module, so the two halves are declared apart and pinned here.
+    #[test]
+    fn the_new_rows_agree_with_the_code_that_reads_them() {
+        use crate::settings_ui::catalog::{keys, registry};
+        let registry = registry();
+        let integer = |category: &str, id: &str| -> (i64, i64, i64) {
+            let spec = registry
+                .setting(category, id)
+                .unwrap_or_else(|| panic!("the catalog declares {category}/{id}"));
+            match &spec.kind {
+                settings::SettingKind::Integer {
+                    min, max, default, ..
+                } => (*min, *max, *default),
+                other => panic!("{category}/{id} is {other:?}, not an integer"),
+            }
+        };
+
+        // Cross-section > Top of the slice. Declared in kilometres, fenced in
+        // metres: the menu's own ends must survive the fence untouched, or the
+        // window would silently draw something other than what the row says.
+        let (min, max, default) = integer(keys::xsection::CATEGORY, keys::xsection::TOP_KM);
+        assert_eq!(
+            (min * 1_000) as f32,
+            crate::xsection::MIN_TOP_M,
+            "the menu's floor is the sampler's floor"
+        );
+        assert_eq!(
+            (max * 1_000) as f32,
+            crate::xsection::MAX_TOP_M,
+            "the menu's ceiling is the sampler's ceiling"
+        );
+        assert_eq!(
+            (default * 1_000) as f32,
+            crate::xsection::DEFAULT_TOP_M,
+            "the default is the 18 km slice the window always drew"
+        );
+
+        // Data > Loop frame time. The default is the constant the loop ran at
+        // before it was settable.
+        let (min, max, default) = integer(keys::data::CATEGORY, keys::data::LOOP_FRAME_MS);
+        assert_eq!(
+            Duration::from_millis(default as u64),
+            PLAYBACK_FRAME_TIME,
+            "the default is the 700 ms step the loop always took"
+        );
+        assert!(min > 0, "a zero-length frame time is a 60 Hz spin");
+        assert!(min <= 700 && max >= 700);
+
+        // And a fresh session - no settings file - resolves to exactly those
+        // two constants, so nothing about the shipped behaviour moved.
+        let app = test_app();
+        assert_eq!(
+            app.settings_cache.xsection_top_m,
+            crate::xsection::DEFAULT_TOP_M
+        );
+        assert_eq!(app.settings_cache.loop_frame_time, PLAYBACK_FRAME_TIME);
+    }
+
+    /// The Vrot report line follows the analyst's units, on BOTH of the two
+    /// paths through it.
+    ///
+    /// `vrot::report` has its own test; this is the mirrored path in
+    /// `vrot_report_line`, which rebuilds the same sentence when
+    /// `analysis/vrot_units` puts m/s first. It was the copy that was missed:
+    /// a session in miles and feet read its pane corner converted and its Vrot
+    /// report in kilometres.
+    #[test]
+    fn the_vrot_report_line_follows_the_units_on_both_paths() {
+        let crate::vrot::VrotState::Complete(measurement) = completed_vrot() else {
+            panic!("completed_vrot returns a finished measurement");
+        };
+        let mut app = test_app();
+
+        // Default units, both orders: character-for-character what shipped.
+        assert!(
+            app.vrot_report_line(&measurement)
+                .contains("separation 0.80 km | height 0.30 km ARL"),
+            "{}",
+            app.vrot_report_line(&measurement)
+        );
+        app.settings_cache.vrot_mps_first = true;
+        assert!(
+            app.vrot_report_line(&measurement)
+                .contains("separation 0.80 km | height 0.30 km ARL"),
+            "{}",
+            app.vrot_report_line(&measurement)
+        );
+
+        // Miles and feet. 0.80 km is 0.50 mi; 300 m is 984 ft.
+        app.settings_cache.units = crate::units::UnitSystem {
+            distance: crate::units::DistanceUnit::StatuteMiles,
+            altitude: crate::units::AltitudeUnit::Feet,
+            ..crate::units::UnitSystem::default()
+        };
+        for mps_first in [false, true] {
+            app.settings_cache.vrot_mps_first = mps_first;
+            let line = app.vrot_report_line(&measurement);
+            assert!(
+                line.contains("separation 0.50 mi | height 984 ft ARL"),
+                "mps_first={mps_first}: {line}"
+            );
+            assert!(
+                !line.contains(" km"),
+                "mps_first={mps_first}: a kilometre survived: {line}"
+            );
+            // The measurement itself is unmoved.
+            assert!(line.contains("delta-V 60.0 m/s"), "{line}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -4009,10 +4900,11 @@ mod tests {
     /// the accessor `wgpu_integration.rs` uses.
     #[test]
     fn the_application_paints_its_own_ground_and_clears_to_it() {
-        for variant in [crate::theme::Variant::Light, crate::theme::Variant::Dark] {
-            let palette = crate::theme::palette::Palette::of(variant);
+        for theme_ground in [crate::theme::Ground::Light, crate::theme::Ground::Dark] {
+            let appearance = crate::theme::Appearance::on_ground(theme_ground);
+            let palette = appearance.palette();
             let context = egui::Context::default();
-            crate::theme::apply(&context, variant);
+            crate::theme::apply(&context, &appearance);
             let mut app = WorkstationApp::with_context(
                 context.clone(),
                 None,
@@ -4042,7 +4934,7 @@ mod tests {
             });
             let ground = ground.unwrap_or_else(|| {
                 panic!(
-                    "{variant:?}: no shape in the frame fills the whole viewport with the panel \
+                    "{theme_ground:?}: no shape in the frame fills the whole viewport with the panel \
                      face - `WorkstationApp::ui` is not painting its ground, and every bare \
                      label on the bar is back on eframe's near-black"
                 )
@@ -4054,7 +4946,7 @@ mod tests {
             if let Some(first_text) = first_text {
                 assert!(
                     ground < first_text,
-                    "{variant:?}: the ground is painted at shape {ground}, after the first text \
+                    "{theme_ground:?}: the ground is painted at shape {ground}, after the first text \
                      run at {first_text} - it would cover the chrome instead of backing it"
                 );
             }
@@ -4065,12 +4957,12 @@ mod tests {
             assert_eq!(
                 clear,
                 palette.face.to_opaque().to_normalized_gamma_f32(),
-                "{variant:?}: the window clear colour is not the ground the app paints - every \
+                "{theme_ground:?}: the window clear colour is not the ground the app paints - every \
                  resize tears a seam of eframe's near-black default"
             );
             assert_eq!(
                 clear[3], 1.0,
-                "{variant:?}: a see-through clear colour lets the desktop through"
+                "{theme_ground:?}: a see-through clear colour lets the desktop through"
             );
         }
     }
@@ -4088,6 +4980,262 @@ mod tests {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         settings::SettingsStore::open(std::env::temp_dir().join(unique))
+    }
+
+    /// A directory of its own for a test that writes profile files.
+    fn scratch_profile_dir(what: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "radar-workstation-test-profiles-{what}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the profile directory");
+        dir
+    }
+
+    /// Every string one `draw_pane` pass emitted, with the settings cache the
+    /// application would be holding driving it.
+    ///
+    /// This is the whole point of the profile test below: it reads glyphs off
+    /// a real egui pass rather than reading the store back. `geometry` and
+    /// `tiles` are `None` because a basemap is not what is being measured -
+    /// the ring labels are drawn by `draw_range_rings` from `map.units`
+    /// whether or not anything is under them.
+    fn pane_strings(app: &WorkstationApp) -> Vec<String> {
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let text = text.galley.text().trim();
+                    if !text.is_empty() {
+                        found.push(text.to_owned());
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let map = PaneMap {
+            geometry: None,
+            projection: None,
+            tiles: None,
+            chrome: map_scene::MapChrome::default(),
+            sites: Arc::from(Vec::new()),
+            site_labels: app.settings_cache.site_labels,
+            annotation: app.settings_cache.annotation,
+            units: app.settings_cache.units,
+            active_site: None,
+            hazards: Arc::from(Vec::new()),
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 600.0));
+        let context = egui::Context::default();
+        let mut found = Vec::new();
+        // Twice: the first egui pass builds the font atlas, and a pane is
+        // never a session's first frame.
+        for _ in 0..2 {
+            found.clear();
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    // Off the same cache the live path reads, and with the same
+                    // `None` reason a moment pane passes: REF is not a derived
+                    // volume, so the band this helper sees is the band the
+                    // application would draw over these very pixels.
+                    let filter_notice = crate::gate_filter_ui::pane_banner_text_for(
+                        &app.settings_cache.gate_filter,
+                        None,
+                    );
+                    let overlay = crate::pane_canvas::PaneOverlay {
+                        legend: None,
+                        table: None,
+                        product_name: "REF",
+                        badges: &[],
+                        probe: None,
+                        filter_notice: filter_notice.as_deref(),
+                    };
+                    draw_pane(
+                        ui,
+                        PaneId::new(0).expect("pane 0"),
+                        rect,
+                        true,
+                        analyst_runtime::Camera2D::default(),
+                        app.settings_cache.nav,
+                        None,
+                        &map,
+                        "1 - REF (dBZ)",
+                        "",
+                        &overlay,
+                    );
+                });
+            });
+            for shape in output.shapes {
+                walk(&shape.shape, &mut found);
+            }
+        }
+        found
+    }
+
+    /// The ring labels off a pane pass: `"50 km"`, `"31 mi"`. Recognised by
+    /// shape - digits, one space, a unit label - so the pane title and the
+    /// status line cannot be mistaken for one.
+    fn ring_labels(app: &WorkstationApp) -> Vec<String> {
+        pane_strings(app)
+            .into_iter()
+            .filter(|text| {
+                text.split_once(' ').is_some_and(|(number, unit)| {
+                    !number.is_empty()
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                        && crate::units::DistanceUnit::ALL
+                            .iter()
+                            .any(|candidate| candidate.label() == unit)
+                })
+            })
+            .collect()
+    }
+
+    /// Write a Units & time choice the way the settings window writes it, and
+    /// take the application through the recompute the window's own dispatch
+    /// runs afterwards.
+    fn choose_distance_unit(app: &mut WorkstationApp, id: &str) {
+        use crate::settings_ui::catalog::keys;
+        app.settings_store.set(
+            keys::units::CATEGORY,
+            keys::units::DISTANCE,
+            settings::SettingValue::Text(id.to_owned()),
+        );
+        app.apply_changed_setting(keys::units::CATEGORY, keys::units::DISTANCE);
+        app.recompute_settings_cache();
+    }
+
+    /// A profile switch has to reach the glass, not just the file.
+    ///
+    /// The cheap version of this test reads the stored value back and calls
+    /// it proved. It would pass over a pane still painting the old unit:
+    /// between `settings.json` and a glyph there are two more steps -
+    /// `recompute_settings_cache` and the paint pass - and this wave built
+    /// the unit setting, the window that resets it and the profile that
+    /// restores it on three separate branches that never compiled together.
+    /// So this asserts on the strings `draw_pane` emitted.
+    ///
+    /// It stands for the whole Units & time page rather than for one row.
+    /// [`WorkstationApp::apply_switched_profile`] enumerates the registry
+    /// instead of a list of keys, so a page that is registered is a page a
+    /// profile carries - and the audit's four pages are registered.
+    #[test]
+    fn switching_back_to_a_profile_restores_the_drawn_unit_not_only_the_stored_one() {
+        use crate::settings_ui::catalog::keys;
+
+        let dir = scratch_profile_dir("drawn-unit");
+        let context = egui::Context::default();
+        let mut app = WorkstationApp::with_context(
+            context.clone(),
+            None,
+            None,
+            WarningsSource::Daemon {
+                base_url: "http://127.0.0.1:9".to_owned(),
+            },
+            test_settings_store(),
+        );
+        // Ring labels on, so the pane writes a distance at all: off is the
+        // shipped pane, which has never written a number on a ring.
+        app.settings_store.set(
+            keys::annotation::CATEGORY,
+            keys::annotation::RING_LABELS,
+            settings::SettingValue::Bool(true),
+        );
+        app.recompute_settings_cache();
+
+        let mut library = settings::ProfileLibrary::open(
+            &dir,
+            WorkstationApp::shipped_settings_document(),
+            &app.settings_registry,
+        );
+
+        // --- miles on the glass, saved under a name --------------------
+        choose_distance_unit(&mut app, "mi");
+        let in_miles = ring_labels(&app);
+        assert!(
+            !in_miles.is_empty(),
+            "the pane wrote no ring labels at all, so this test measures nothing"
+        );
+        assert!(
+            in_miles.iter().all(|text| text.ends_with(" mi")),
+            "every ring label should be in miles: {in_miles:?}"
+        );
+        library
+            .save_as(
+                "Field",
+                app.settings_store.document(),
+                &app.settings_registry,
+            )
+            .expect("save the profile");
+
+        // --- kilometres, which has to actually move the glass -----------
+        choose_distance_unit(&mut app, "km");
+        let in_km = ring_labels(&app);
+        assert!(
+            in_km.iter().all(|text| text.ends_with(" km")),
+            "every ring label should be in kilometres: {in_km:?}"
+        );
+        assert_ne!(
+            in_miles, in_km,
+            "the two units painted the same strings, so the unit is not \
+             reaching the pane and neither half of this test means anything"
+        );
+
+        // --- switch back, through the application's own two calls -------
+        //
+        // Exactly what `settings_ui::profiles::apply_switch` and
+        // `settings_frame` do, in that order: merge the profile over the live
+        // document, then let the application apply it. The switch is not
+        // clicked here - `examples/profiles_proof.rs` clicks it on a real
+        // volume - but nothing between those calls and the paint is stubbed.
+        let profile = library
+            .find("Field")
+            .expect("the profile was just saved")
+            .clone();
+        let merged = settings::profiles::merge_for_switch(
+            app.settings_store.document(),
+            &profile.document,
+            "Field",
+        );
+        app.settings_store.replace_document(merged);
+        let mut outcome = crate::settings_ui::SettingsOutcome::default();
+        app.apply_switched_profile(&mut outcome);
+        for (category, id) in &outcome.changed {
+            app.apply_changed_setting(category, id);
+        }
+        // Guarded exactly as `settings_frame` guards it, and that guard is
+        // what gives this test teeth. `recompute_settings_cache` reads the
+        // store, and the switch has already written miles back into the
+        // store - so an unconditional recompute here would repaint the right
+        // unit even if `apply_switched_profile` reported nothing at all, and
+        // this test would pass over a profile switch that reached the file
+        // and stopped there. It only recomputes if the switch said something
+        // changed.
+        if !outcome.changed.is_empty() {
+            app.recompute_settings_cache();
+        }
+
+        assert_eq!(
+            ring_labels(&app),
+            in_miles,
+            "coming back to the profile has to repaint the pane in the unit \
+             it was saved in, character for character"
+        );
+        assert_eq!(
+            settings::profiles::active_profile(app.settings_store.document()),
+            Some("Field"),
+            "the switch also names the profile it landed on"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every text run one toolbar frame drew, flattened - `Shape::Vec` nests.
@@ -4109,7 +5257,7 @@ mod tests {
             }
         }
         let context = egui::Context::default();
-        crate::theme::apply(&context, crate::theme::Variant::Light);
+        crate::theme::apply(&context, &crate::theme::Appearance::default());
         let output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -4132,6 +5280,144 @@ mod tests {
     /// what a fresh install draws. Pinned in both places a
     /// silent flip could come from: the registry default and the cache the
     /// paint path actually reads.
+    /// The Appearance page is declared in two files - the theme module owns
+    /// the theme/accent/edges/density/scale axes, `settings_ui::catalog`
+    /// owns the toolbar setting - and the registry merges them only if both
+    /// spell the category id the same way. Nothing else would notice the
+    /// day they stopped agreeing: the settings window would simply grow a
+    /// second Appearance page.
+    #[test]
+    fn the_appearance_page_is_one_page_declared_in_two_files() {
+        assert_eq!(
+            crate::theme::settings::keys::CATEGORY,
+            crate::settings_ui::catalog::keys::appearance::CATEGORY
+        );
+        let registry =
+            crate::settings_ui::full_registry(crate::theme::settings::settings_category());
+        let appearance = registry
+            .categories()
+            .iter()
+            .filter(|category| category.id == crate::theme::settings::keys::CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(appearance.len(), 1, "the page split into two");
+        let ids = appearance[0]
+            .settings
+            .iter()
+            .map(|spec| spec.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                crate::theme::settings::keys::THEME,
+                crate::theme::settings::keys::ACCENT,
+                crate::theme::settings::keys::CHROME_EDGES,
+                crate::theme::settings::keys::DENSITY,
+                crate::theme::settings::keys::UI_SCALE,
+                crate::settings_ui::catalog::keys::appearance::TOOLBAR,
+            ],
+            "the look, then the size, then the layout"
+        );
+        assert_eq!(
+            registry
+                .categories()
+                .first()
+                .map(|category| category.id.as_str()),
+            Some(crate::theme::settings::keys::CATEGORY),
+            "Appearance is the first page in the category list"
+        );
+    }
+
+    /// The application's registry is the theme's Appearance page plus
+    /// EVERYTHING the catalog declares, in the catalog's own order.
+    ///
+    /// `settings_ui::full_registry` registers the Appearance page itself and
+    /// then hands the registry to `catalog::register_into`, which returns
+    /// nothing and registers by side effect. That shape is the seam where a
+    /// page goes missing without anyone noticing: `register_into` is a wall
+    /// of `registry.register(...)` lines, one page each, and a line lost to a
+    /// bad merge takes its whole page - its rows, its search hits, its reset
+    /// and its share of every profile - out of the application while
+    /// `catalog::registry()` and every test written against THAT keep
+    /// passing, because they go through the same lost line.
+    ///
+    /// So this pins the merged list, by name and in order, against the only
+    /// registry the application actually runs on.
+    #[test]
+    fn the_application_registry_is_the_appearance_page_and_the_whole_catalog() {
+        use crate::settings_ui::catalog::keys;
+        let registry =
+            crate::settings_ui::full_registry(crate::theme::settings::settings_category());
+        let ids = registry
+            .categories()
+            .iter()
+            .map(|category| category.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                // The theme's page and the catalog's merge into this one.
+                crate::theme::settings::keys::CATEGORY,
+                keys::map::CATEGORY,
+                keys::radar::CATEGORY,
+                keys::navigation::CATEGORY,
+                keys::vol3d::CATEGORY,
+                keys::analysis::CATEGORY,
+                keys::data::CATEGORY,
+                // The four pages the settings audit added...
+                keys::units::CATEGORY,
+                keys::network::CATEGORY,
+                keys::annotation::CATEGORY,
+                keys::xsection::CATEGORY,
+                // ...and the page about all the other pages, last.
+                keys::profiles::CATEGORY,
+            ],
+            "the category list is the window's left column, in registration order"
+        );
+        // Every page carries rows. A page registered empty is a page that
+        // reads as present and does nothing.
+        for category in registry.categories() {
+            assert!(
+                !category.settings.is_empty(),
+                "the {} page is registered with no rows",
+                category.id
+            );
+        }
+    }
+
+    /// A fresh store, resolved through the real registry, must ask for
+    /// exactly the look the application drew before any of this was
+    /// settable - the same claim `theme_catalog.rs` makes about the axes'
+    /// defaults, made here against the STORE, which is the thing that can
+    /// actually disagree with them.
+    #[test]
+    fn a_fresh_store_resolves_to_the_shipped_appearance() {
+        let app = test_app();
+        assert_eq!(app.appearance(), crate::theme::Appearance::default());
+        assert_eq!(app.appearance().theme.id, "light");
+    }
+
+    /// ...and a stored id this build does not know resolves around, without
+    /// a panic and without the analyst's stored string being replaced.
+    #[test]
+    fn a_stranger_theme_in_the_store_falls_back_without_overwriting_it() {
+        let mut app = test_app();
+        let stranger = "amber-crt-from-a-newer-build";
+        app.settings_store.set(
+            crate::theme::settings::keys::CATEGORY,
+            crate::theme::settings::keys::THEME,
+            settings::SettingValue::Text(stranger.to_owned()),
+        );
+        assert_eq!(app.appearance(), crate::theme::Appearance::default());
+        assert_eq!(
+            app.settings_store.value(
+                crate::theme::settings::keys::CATEGORY,
+                crate::theme::settings::keys::THEME
+            ),
+            Some(settings::SettingValue::Text(stranger.to_owned())),
+            "the stored choice must survive a build that does not have the theme"
+        );
+    }
+
     #[test]
     fn the_default_toolbar_style_is_the_menu_bar() {
         assert_eq!(SettingsCache::default().toolbar_style, ToolbarStyle::Menus);
@@ -4211,7 +5497,9 @@ mod tests {
         let texts = toolbar_texts(&mut app);
 
         let mut wanted = vec![
-            "Level II file path".to_owned(),
+            // The field takes every container the routing seam accepts, not
+            // only Level II, and says so.
+            "Radar volume file path".to_owned(),
             "Load".to_owned(),
             "KRTX".to_owned(),
             "Start live".to_owned(),
@@ -4567,6 +5855,7 @@ mod tests {
                 height,
                 rgba: vec![9; width as usize * height as usize * 4],
                 elapsed_ms: 2.0,
+                gate_filter: render2d::GateFilterReport::INACTIVE,
             },
         );
         let texture = app.panes[pane.index()].texture.as_ref().expect("a texture");
@@ -4602,6 +5891,7 @@ mod tests {
                 height,
                 rgba: vec![1; width as usize * height as usize * 4],
                 elapsed_ms: 2.0,
+                gate_filter: render2d::GateFilterReport::INACTIVE,
             },
         );
         let texture = app.panes[pane.index()].texture.as_ref().expect("a texture");
@@ -4870,6 +6160,29 @@ mod tests {
         LiveFeed {
             site: "KUEX".to_owned(),
             newest_volume_time: kuex_last_volume_time(),
+            freshness: FeedFreshness::Stalled,
+        }
+    }
+
+    /// The same stalled feed, but aged off the REAL clock rather than off a
+    /// fixed instant.
+    ///
+    /// Every other test here is handed an explicit `now` (see
+    /// `observed_now`), so a frozen fixture is exactly right for them. The
+    /// one that paints the toolbar cannot be: it drives the shipped
+    /// `App::toolbar`, which reads `Utc::now()` itself, so a fixture pinned
+    /// to a date gets one day older every day and the banner it asserts
+    /// eventually reads a different number. That is not hypothetical - the
+    /// "3 d old" assertion was written against a fixture three days old and
+    /// began failing the morning the fixture turned four.
+    ///
+    /// Three days and an hour: comfortably inside the "3 d" bucket, which
+    /// `format_age` floors, so the banner reads the same at any hour of any
+    /// day this ever runs.
+    fn stalled_kuex_feed_three_days_before_now() -> LiveFeed {
+        LiveFeed {
+            site: "KUEX".to_owned(),
+            newest_volume_time: Utc::now() - TimeDelta::days(3) - TimeDelta::hours(1),
             freshness: FeedFreshness::Stalled,
         }
     }
@@ -5166,7 +6479,7 @@ mod tests {
     #[test]
     fn the_shipped_toolbar_paints_the_stall_banner_legibly_in_both_variants() {
         use crate::theme::palette::{DARK, LIGHT, Palette};
-        use crate::theme::{Variant, apply};
+        use crate::theme::{Appearance, apply};
 
         fn luminance(color: egui::Color32) -> f64 {
             fn channel(byte: u8) -> f64 {
@@ -5238,9 +6551,9 @@ mod tests {
             }
         }
 
-        for (variant, palette) in [(Variant::Light, &LIGHT), (Variant::Dark, &DARK)] {
+        for (variant, palette) in [("light", &LIGHT), ("dark", &DARK)] {
             let context = egui::Context::default();
-            apply(&context, variant);
+            apply(&context, &Appearance::by_id(variant));
             let mut app = WorkstationApp::with_context(
                 context.clone(),
                 None,
@@ -5254,7 +6567,11 @@ mod tests {
             // The line the banner has to contradict, in the words the analyst
             // was actually shown on 2026-08-19.
             app.live_status = "82 chunk(s) · 14.3 MiB · downloaded".to_owned();
-            app.live_feed = Some(stalled_kuex_feed());
+            // Aged off the real clock: this test paints the real bar, which asks
+            // the real clock what time it is. Pinning an instant instead of an age
+            // made this test fail on 2026-08-20 for calendar reasons alone - the
+            // banner it asserts silently went from "3 d old" to "4 d old".
+            app.live_feed = Some(stalled_kuex_feed_three_days_before_now());
 
             let output = context.run_ui(
                 egui::RawInput {
@@ -5497,6 +6814,858 @@ mod tests {
             }
             println!();
         }
+    }
+
+    // --- the gate filter's safety rule --------------------------------------
+    //
+    // A filter that hides weather must never be inferable only from the
+    // absence of echo. These drive the REAL application - its own
+    // `eframe::App::ui` pass and its own `toolbar` - and read the words back
+    // out of the shapes it emitted, so they measure what an analyst would
+    // actually see rather than what a helper returns.
+
+    use crate::gate_filter_ui::{FILTERED_WORD, FilterValues, PRESETS};
+
+    fn storm_mode() -> FilterValues {
+        PRESETS
+            .iter()
+            .find(|preset| preset.id == "storm")
+            .expect("storm mode is declared")
+            .values
+    }
+
+    /// An application whose settings file already carries these criteria, as
+    /// if it had been closed and reopened on them.
+    fn app_with_filter(
+        context: &egui::Context,
+        values: FilterValues,
+        toolbar: &str,
+    ) -> WorkstationApp {
+        let mut store = test_settings_store();
+        crate::gate_filter_ui::write_values(&mut store, values);
+        store.set(
+            crate::settings_ui::catalog::keys::appearance::CATEGORY,
+            crate::settings_ui::catalog::keys::appearance::TOOLBAR,
+            settings::SettingValue::Text(toolbar.to_owned()),
+        );
+        WorkstationApp::with_context(
+            context.clone(),
+            None,
+            None,
+            WarningsSource::Daemon {
+                base_url: "http://127.0.0.1:9".to_owned(),
+            },
+            store,
+        )
+    }
+
+    fn shape_texts(shapes: &[egui::Shape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let text = text.galley.text().trim();
+                    if !text.is_empty() {
+                        found.push(text.to_owned());
+                    }
+                }
+                egui::Shape::Vec(nested) => {
+                    for shape in nested {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for shape in shapes {
+            walk(shape, &mut found);
+        }
+        found
+    }
+
+    /// Where a text run containing `needle` landed. The needle rather than a
+    /// prefix because the pane draws TWO runs beginning `FILTERED` - the band
+    /// and the legend badge - and only one of them is clickable.
+    fn text_position(shapes: &[egui::Shape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|shape| walk(shape, needle))
+    }
+
+    /// One whole application frame, through the shipped `eframe::App::ui`.
+    fn app_frame(
+        app: &mut WorkstationApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Shape> {
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1400.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| <WorkstationApp as eframe::App>::ui(app, ui, &mut frame),
+        );
+        output
+            .shapes
+            .into_iter()
+            .map(|clipped| clipped.shape)
+            .collect()
+    }
+
+    fn pointer(position: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// THE safety pin. A pane that is hiding gates says so, naming what it is
+    /// hiding; a pane that is hiding nothing says nothing.
+    ///
+    /// Asserted on a full application frame rather than on
+    /// `gate_filter_ui::pane_banner_text`, because the failure this guards
+    /// against is not a wrong string - it is a right string that never reaches
+    /// the glass, which is what deleting one line of `canvas` would produce
+    /// while every unit test stayed green.
+    #[test]
+    fn a_pane_says_filtered_exactly_when_it_is_hiding_gates() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let mut quiet = app_with_filter(&context, FilterValues::OFF, "menus");
+        // Two passes: the first builds the font atlas, and a pane is never a
+        // session's first frame.
+        app_frame(&mut quiet, &context, Vec::new());
+        let texts = shape_texts(&app_frame(&mut quiet, &context, Vec::new()));
+        assert!(
+            !texts.iter().any(|text| text.contains(FILTERED_WORD)),
+            "an unfiltered application put {FILTERED_WORD:?} on the glass: {texts:?}"
+        );
+
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let mut filtered = app_with_filter(&context, storm_mode(), "menus");
+        app_frame(&mut filtered, &context, Vec::new());
+        let texts = shape_texts(&app_frame(&mut filtered, &context, Vec::new()));
+        // The band: the loud one, drawn by `canvas` under every pane's header
+        // whatever the legend setting says.
+        let band = texts
+            .iter()
+            .find(|text| text.contains("show everything"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a filtered pane drew no {FILTERED_WORD} band - the only evidence left \
+                     would be the missing echo itself: {texts:?}"
+                )
+            });
+        assert!(
+            band.starts_with(FILTERED_WORD),
+            "the band buries the word that matters: {band:?}"
+        );
+        assert!(
+            band.contains("REF below 20 dBZ"),
+            "the band does not name what it hides: {band:?}"
+        );
+        // And the legend's own copy, beside the colour bar where the analyst
+        // is already reading.
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with(FILTERED_WORD) && !text.contains("show everything")),
+            "the legend badge stack carries no filter badge: {texts:?}"
+        );
+    }
+
+    /// The same claim for the toolbar chip, in BOTH toolbar styles: neither of
+    /// the two supported bars may be the one that stays quiet.
+    #[test]
+    fn the_toolbar_chip_names_the_filter_in_both_toolbar_styles() {
+        for style in ["menus", "full"] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+            let mut quiet = app_with_filter(&context, FilterValues::OFF, style);
+            let texts = toolbar_texts(&mut quiet);
+            assert!(
+                texts.iter().any(|text| text.starts_with("Filter: off")),
+                "{style}: the bar has no gate-filter control at all: {texts:?}"
+            );
+
+            let mut filtered = app_with_filter(&context, storm_mode(), style);
+            let texts = toolbar_texts(&mut filtered);
+            assert!(
+                texts.iter().any(|text| text.contains("Storm mode")),
+                "{style}: the bar does not say which filter is on: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|text| text.starts_with("Filter: off")),
+                "{style}: the bar still reads off while gates are hidden: {texts:?}"
+            );
+        }
+    }
+
+    /// The one obvious action, exercised where it lives: clicking the band
+    /// clears every criterion.
+    #[test]
+    fn clicking_the_filtered_band_shows_everything_again() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let mut app = app_with_filter(&context, storm_mode(), "menus");
+        app_frame(&mut app, &context, Vec::new());
+        let shapes = app_frame(&mut app, &context, Vec::new());
+        let band = text_position(&shapes, "show everything")
+            .expect("a filtered pane draws its band before it can be clicked");
+        assert!(app.settings_cache.gate_filter.is_active());
+
+        app_frame(&mut app, &context, pointer(band, true));
+        app_frame(&mut app, &context, pointer(band, false));
+
+        assert_eq!(
+            app.settings_cache.gate_filter,
+            render2d::GateFilter::OFF,
+            "clicking the band did not clear the filter"
+        );
+        let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
+        assert!(
+            !texts.iter().any(|text| text.contains(FILTERED_WORD)),
+            "the band outlived the filter it was warning about: {texts:?}"
+        );
+    }
+
+    /// Persistence, including the preset's identity: the numbers on disk are
+    /// what name the preset, so a reopen cannot land on Custom.
+    #[test]
+    fn a_reopened_application_comes_back_on_the_same_named_preset() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let storm = PRESETS
+            .iter()
+            .find(|preset| preset.id == "storm")
+            .expect("storm mode is declared");
+        let mut app = app_with_filter(&context, storm.values, "menus");
+        assert_eq!(app.settings_cache.gate_filter, storm.values.to_filter());
+        let texts = toolbar_texts(&mut app);
+        assert!(
+            texts.iter().any(|text| text.contains(storm.label)),
+            "the reopened bar reads {:?} rather than {:?}",
+            texts,
+            storm.label
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains(crate::gate_filter_ui::CUSTOM_LABEL)),
+            "the reopened bar calls a shipped preset Custom: {texts:?}"
+        );
+    }
+
+    /// A fresh install renders what it always rendered.
+    #[test]
+    fn a_fresh_application_carries_no_filter_at_all() {
+        let app = test_app();
+        assert_eq!(app.settings_cache.gate_filter, render2d::GateFilter::OFF);
+        assert!(!app.settings_cache.gate_filter.is_active());
+        assert_eq!(
+            SettingsCache::default().gate_filter,
+            render2d::GateFilter::OFF
+        );
+    }
+
+    /// The filter is a citizen of the settings window, not a stowaway.
+    ///
+    /// The five criteria arrived on their own branch, reachable from their own
+    /// toolbar panel, while the window beside them grew search, per-setting
+    /// and per-page reset, and named profiles. Landing both is only half the
+    /// job: a criterion the window cannot find, cannot reset, or quietly drops
+    /// out of a profile is a criterion that hides weather and then refuses to
+    /// account for it.
+    ///
+    /// Every assertion is made against `settings_cache.gate_filter` - the
+    /// value `ensure_render_requested` puts on the `RenderRequest` and the
+    /// band, the badge and the readout are all built from - rather than
+    /// against the stored number. Reading the store back would pass even if
+    /// the window and the engine had come apart.
+    ///
+    /// The profile half goes through the application's own two calls, with
+    /// the same guard `settings_frame` uses: the recompute only runs if the
+    /// switch reported a change, so a switch that reaches the file and stops
+    /// there fails here instead of passing on a recompute this test did for
+    /// it.
+    #[test]
+    fn a_gate_filter_criterion_is_searchable_resettable_and_carried_by_a_profile() {
+        use crate::settings_ui::catalog::keys::radar as k;
+        const FILTER_IDS: [&str; 5] = [
+            k::FILTER_MIN_DBZ,
+            k::FILTER_VEL_NEEDS_DBZ,
+            k::FILTER_MIN_RHO,
+            k::FILTER_HIDE_RF,
+            k::FILTER_MIN_RANGE_KM,
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "radar-workstation-filter-composition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let context = egui::Context::default();
+        let mut app = app_with_filter(&context, FilterValues::OFF, "menus");
+        let storm = storm_mode();
+
+        // --- findable, by the words an analyst would type ---------------
+        //
+        // Through the window's own predicate, and every term has to match, so
+        // this is the narrow search rather than a lucky one.
+        let category = app
+            .settings_registry
+            .category(k::CATEGORY)
+            .expect("the Radar page is registered");
+        for id in FILTER_IDS {
+            let spec = app
+                .settings_registry
+                .setting(k::CATEGORY, id)
+                .unwrap_or_else(|| panic!("{id} is declared"));
+            assert!(
+                crate::settings_ui::search_finds(category, spec, "gate filter"),
+                "searching \"gate filter\" does not reach {id}, so the one control                  that hides weather cannot be found in the window that resets it"
+            );
+        }
+
+        // --- resettable, one row at a time and a page at a time ---------
+        apply_filter_through_settings(&mut app, storm);
+        assert_eq!(
+            app.settings_cache.gate_filter,
+            storm.to_filter(),
+            "the preset never reached the filter the renderer is handed"
+        );
+
+        assert!(app.settings_store.reset(k::CATEGORY, k::FILTER_MIN_DBZ));
+        app.recompute_settings_cache();
+        assert!(
+            app.settings_cache
+                .gate_filter
+                .min_reflectivity_dbz
+                .is_none(),
+            "a per-setting reset left the reflectivity threshold censoring"
+        );
+        assert!(
+            app.settings_cache.gate_filter.is_active(),
+            "a per-setting reset cleared the whole filter instead of the one row"
+        );
+
+        apply_filter_through_settings(&mut app, storm);
+        assert!(app.settings_store.reset_category(k::CATEGORY));
+        app.recompute_settings_cache();
+        assert_eq!(
+            app.settings_cache.gate_filter,
+            render2d::GateFilter::OFF,
+            "a page reset left the filter on with no row on the page saying so"
+        );
+        assert_eq!(
+            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None),
+            None,
+            "a page reset cleared the pixels and left the band claiming otherwise"
+        );
+
+        // --- saved under a name, switched away from, and switched back --
+        apply_filter_through_settings(&mut app, storm);
+        let mut library = settings::ProfileLibrary::open(
+            &dir,
+            WorkstationApp::shipped_settings_document(),
+            &app.settings_registry,
+        );
+        library
+            .save_as(
+                "Chase",
+                app.settings_store.document(),
+                &app.settings_registry,
+            )
+            .expect("save the profile");
+
+        apply_filter_through_settings(&mut app, FilterValues::OFF);
+        assert!(
+            !app.settings_cache.gate_filter.is_active(),
+            "the move away from the profile did not clear the filter, so the              switch back would prove nothing"
+        );
+
+        let profile = library
+            .find("Chase")
+            .expect("the profile was just saved")
+            .clone();
+        let merged = settings::profiles::merge_for_switch(
+            app.settings_store.document(),
+            &profile.document,
+            "Chase",
+        );
+        app.settings_store.replace_document(merged);
+        let mut outcome = crate::settings_ui::SettingsOutcome::default();
+        app.apply_switched_profile(&mut outcome);
+        for (category, id) in &outcome.changed {
+            app.apply_changed_setting(category, id);
+        }
+        if !outcome.changed.is_empty() {
+            app.recompute_settings_cache();
+        }
+
+        assert_eq!(
+            app.settings_cache.gate_filter,
+            storm.to_filter(),
+            "a profile saved with Storm mode came back showing everything, so              the picture and the profile name disagree"
+        );
+        assert_eq!(
+            settings::profiles::active_profile(app.settings_store.document()),
+            Some("Chase"),
+            "the switch also names the profile it landed on"
+        );
+        // And the words came back with it.
+        assert!(
+            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None)
+                .is_some_and(|band| band.contains(FILTERED_WORD)),
+            "the filter came back and the band did not"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the integration seams ----------------------------------------------
+    //
+    // Two branches built this feature against a written contract: `render2d`
+    // owns the censoring, `workstation_app` owns the analyst's choice and the
+    // admission that it is on. These pin the joints between them - the places
+    // where a merge that compiles can still be wrong.
+
+    /// The words on the pane and the gates the engine removed come from the
+    /// same sentence.
+    ///
+    /// `GateFilter::hidden_summary` is the only implementation of that
+    /// sentence after the merge - the UI branch's copy was a declared
+    /// placeholder and is gone - and both indicators quote it: the pane's band
+    /// through `gate_filter_ui::pane_banner_text_for`, and the engine's own
+    /// line through `GateFilterReport::badge`. Pinning that they quote it,
+    /// rather than pinning two literal strings, is what makes them unable to
+    /// drift apart.
+    ///
+    /// The second half is the case the merge created. A volume-derived product
+    /// is integrated out of the whole volume rather than rastered from one
+    /// sweep, so `render_service::render_derived` answers it with
+    /// `GateFilterReport::not_applicable` - and a canvas-wide band would then
+    /// have that pane reading FILTERED while its own status line read FILTER
+    /// NOT APPLIED. Two indicators on one pane disagreeing about whether
+    /// weather is being hidden is worse than either alone.
+    #[test]
+    fn the_band_and_the_engine_never_describe_the_same_pane_differently() {
+        use crate::render_service::DERIVED_PRODUCT_NOT_FILTERED;
+
+        let filter = storm_mode().to_filter();
+        let summary = filter.hidden_summary();
+        assert!(!summary.is_empty(), "storm mode names nothing");
+
+        for product in DisplayProduct::ALL {
+            // The one fact both sides route on. `render_request` sends a
+            // product with a derived volume down `render_derived`; `canvas`
+            // asks the identical question of the identical method.
+            let applies = product.derived_volume().is_none();
+            let reason = (!applies).then_some(DERIVED_PRODUCT_NOT_FILTERED);
+
+            let band = crate::gate_filter_ui::pane_banner_text_for(&filter, reason)
+                .unwrap_or_else(|| panic!("{}: a filtered pane drew no band", product.id()));
+            let report = if applies {
+                // What a sweep-rastered pane comes back with. The counts are
+                // not the subject here; the words are.
+                render2d::GateFilterReport {
+                    filter,
+                    gates_visible: 1_000,
+                    gates_hidden: 400,
+                    ..render2d::GateFilterReport::INACTIVE
+                }
+            } else {
+                render2d::GateFilterReport::not_applicable(filter, DERIVED_PRODUCT_NOT_FILTERED)
+            };
+            let badge = report
+                .badge()
+                .unwrap_or_else(|| panic!("{}: the engine reported nothing", product.id()));
+
+            assert!(
+                band.contains(&summary),
+                "{}: the band does not name what is hidden: {band:?}",
+                product.id()
+            );
+            assert!(
+                badge.contains(&summary),
+                "{}: the engine's line does not name what is hidden: {badge:?}",
+                product.id()
+            );
+            assert_eq!(
+                band.starts_with(FILTERED_WORD),
+                report.is_applicable(),
+                "{}: the band says {band:?} while the engine says {badge:?}",
+                product.id()
+            );
+            if !applies {
+                assert!(
+                    band.contains(DERIVED_PRODUCT_NOT_FILTERED)
+                        && badge.contains(DERIVED_PRODUCT_NOT_FILTERED),
+                    "{}: the two sides give different reasons: {band:?} / {badge:?}",
+                    product.id()
+                );
+            }
+            // Whatever it says, the way out is on it.
+            assert!(
+                band.contains("click here to show everything"),
+                "{}: the band offers no way out: {band:?}",
+                product.id()
+            );
+        }
+    }
+
+    /// A sweep of uniformly weak echo: every gate 10 dBZ, which Storm mode's
+    /// 20 dBZ criterion hides wherever the cursor lands past the near-range
+    /// cut. Built so a readout test does not have to hit one gate.
+    fn weak_echo_volume() -> Arc<RadarVolume> {
+        let time = chrono::DateTime::from_timestamp(1_755_000_000, 0).expect("a valid second");
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new("KTLX"), time);
+        let gates = || radar_core::GateRange {
+            first_gate_m: 2_125,
+            gate_spacing_m: 250,
+            gate_count: 100,
+        };
+        let cut = volume.push_cut(0.5, Some(1));
+        let mut grid = radar_core::MomentGrid::new_u8(
+            radar_core::MomentType::Reflectivity,
+            gates(),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        for index in 0..360_usize {
+            cut.radials.push(radar_core::Radial {
+                azimuth_deg: index as f32,
+                elevation_deg: 0.5,
+                time_offset_ms: index as i32 * 10,
+                gate_range: gates(),
+                nyquist_velocity_mps: Some(26.0),
+                radial_status: None,
+            });
+            // 10 dBZ everywhere: (10 * 2) + 66 = 86.
+            grid.push_u8_row_slice(index, &[86_u8; 100])
+                .expect("an 8-bit row belongs in an 8-bit grid");
+        }
+        cut.moments
+            .insert(radar_core::MomentType::Reflectivity, grid);
+        Arc::new(volume)
+    }
+
+    /// The cursor readout is censored on exactly the panes the RENDERER
+    /// censors, and on no others.
+    ///
+    /// The failure this pins shipped. `refresh_probe` called `probe_censor`
+    /// for every pane, and `probe_censor` keyed on the source MOMENT - but all
+    /// seven volume-derived products report `MomentType::Reflectivity` as
+    /// their source, and `render_service::render_request` sends every one of
+    /// them to `render_derived`, which censors nothing and answers
+    /// `GateFilterReport::not_applicable`. So with Storm mode on and a
+    /// Composite Reflectivity pane, the cursor over a weak gate read
+    /// `CREF FILTERED` at a pixel the pane had painted, under that pane's own
+    /// band reading `FILTER NOT APPLIED HERE`. One pane, two indicators,
+    /// opposite stories - the same class of contradiction this integration
+    /// closed everywhere else, arriving from the other direction.
+    ///
+    /// Both halves are asserted, because either alone would pass a fix that
+    /// broke the other: censor nothing anywhere and the moment pane lies the
+    /// original way; censor everything and the derived pane lies this way.
+    #[test]
+    fn the_readout_and_the_renderer_censor_the_same_panes() {
+        let context = egui::Context::default();
+        let mut app = app_with_filter(&context, storm_mode(), "menus");
+        install(&mut app, weak_echo_volume());
+        let pane = first_pane();
+        app.refresh_capabilities();
+        assert!(app.settings_cache.gate_filter.is_active());
+
+        // A gate 12 km out on the 45 degree radial: past Storm mode's 5 km
+        // near-range cut, so the only criterion that can hide it is the 20 dBZ
+        // threshold this sweep sits under everywhere.
+        let range_km = 12.0_f64;
+        let (east_km, north_km) = (
+            range_km * 45.0_f64.to_radians().sin(),
+            range_km * 45.0_f64.to_radians().cos(),
+        );
+
+        for product in DisplayProduct::ALL {
+            // Only the products that read reflectivity are comparable here -
+            // this fixture carries no velocity, and a pane with no data to
+            // probe reads the same either way.
+            if product.descriptor().computation.source_moment()
+                != radar_core::MomentType::Reflectivity
+            {
+                continue;
+            }
+            app.workspace.pane_mut(pane).product = product.product_id();
+            app.panes[pane.index()].hovered_world_km = Some((east_km, north_km));
+            let volume = app
+                .history
+                .current()
+                .map(|frame| Arc::clone(&frame.volume))
+                .expect("a frame is installed");
+            let cut_index = app.resolve_cut_index(pane, &volume);
+            app.refresh_probe(pane, Some(&volume), cut_index, product);
+            let readout = app.panes[pane.index()]
+                .probe_text
+                .clone()
+                .unwrap_or_else(|| panic!("{}: the cursor read nothing", product.id()));
+
+            // The one fact the renderer routes on, asked here the same way.
+            let renderer_censors_this_pane = product.derived_volume().is_none();
+            assert_eq!(
+                readout.contains(FILTERED_WORD),
+                renderer_censors_this_pane,
+                "{}: the readout says {readout:?} while render_service {} this pane. \
+                 The readout and the pixels have to come off the same fact",
+                product.id(),
+                if renderer_censors_this_pane {
+                    "censors"
+                } else {
+                    "paints every gate of"
+                }
+            );
+
+            // And the pane's own band agrees with both, for the same reason.
+            let band = crate::gate_filter_ui::pane_banner_text_for(
+                &app.settings_cache.gate_filter,
+                (!renderer_censors_this_pane)
+                    .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED),
+            )
+            .unwrap_or_else(|| panic!("{}: a filtered pane drew no band", product.id()));
+            assert_eq!(
+                band.starts_with(FILTERED_WORD),
+                readout.contains(FILTERED_WORD),
+                "{}: the band says {band:?} and the readout says {readout:?}",
+                product.id()
+            );
+        }
+    }
+
+    /// A pane that is showing everything says nothing, whatever its product.
+    #[test]
+    fn an_unfiltered_pane_draws_no_band_even_where_the_filter_could_not_run() {
+        for product in DisplayProduct::ALL {
+            let reason = product
+                .derived_volume()
+                .is_some()
+                .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED);
+            assert_eq!(
+                crate::gate_filter_ui::pane_banner_text_for(&render2d::GateFilter::OFF, reason),
+                None,
+                "{}: an unfiltered pane put a band on the glass",
+                product.id()
+            );
+        }
+    }
+
+    /// One frame through the whole application path, handed back whole.
+    ///
+    /// The same route `pump_render` takes - measure, resolve, request, wait on
+    /// the real worker - except the finished pane is RETURNED rather than
+    /// installed, so a test can read the pixels the engine produced and the
+    /// report it produced them with. The stamp is matched on the way out
+    /// because a frame an earlier pass queued may still be in the channel, and
+    /// answering with it would compare two pictures of different settings.
+    fn render_one_frame(app: &mut WorkstationApp, pane: PaneId) -> RenderedPane {
+        app.refresh_capabilities();
+        app.update_viewport(pane, VIEWPORT);
+        let volume = app
+            .history
+            .current()
+            .map(|frame| Arc::clone(&frame.volume))
+            .expect("a frame to render");
+        app.ensure_render_requested(pane, volume, VIEWPORT);
+        let wanted = app.panes[pane.index()]
+            .pending_stamp
+            .expect("the pane queued a render");
+        for _ in 0..4_000 {
+            match app.render_service.try_recv() {
+                Some(RenderUpdate::Completed(rendered)) if rendered.stamp == wanted => {
+                    return *rendered;
+                }
+                Some(RenderUpdate::Failed { stamp, message, .. }) if stamp == wanted => {
+                    panic!("the render failed: {message}");
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        panic!("the render worker never answered");
+    }
+
+    /// Apply these criteria the way the analyst does: write the settings
+    /// document, rebuild the cache the paint path reads, invalidate the panes.
+    /// Exactly what the chip and the FILTERED band do.
+    fn apply_filter_through_settings(app: &mut WorkstationApp, values: FilterValues) {
+        crate::gate_filter_ui::write_values(&mut app.settings_store, values);
+        app.recompute_settings_cache();
+        app.invalidate_view_panes(app.workspace.visible_panes());
+    }
+
+    /// Pixels the pane actually inked.
+    fn inked(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|pixel| pixel[3] > 0).count()
+    }
+
+    /// THE end-to-end pin, on real weather.
+    ///
+    /// A threshold set in the settings document has to change which gates ink
+    /// in a rendered frame, the pane has to say so in the engine's own words,
+    /// and clearing it has to give the original picture back BYTE FOR BYTE -
+    /// not merely something that looks the same. The last of those is the one
+    /// that protects every analyst who never touches this feature: OFF is the
+    /// shipped state, and OFF has to be the application that existed before
+    /// gate filtering did.
+    ///
+    /// Ignored because it needs real data. Point `NEXRAD_LEVEL2_SAMPLE` at one
+    /// Archive II volume - ideally one with a clutter or biological bloom
+    /// around the radar, which is what these criteria exist to remove - and
+    /// run:
+    ///
+    /// ```text
+    /// cargo test --release -p workstation_app --bin GenericRadar -- \
+    ///     --ignored --nocapture storm_mode_reaches_the_gates
+    /// ```
+    #[test]
+    #[ignore = "set NEXRAD_LEVEL2_SAMPLE to one real Archive II volume"]
+    fn storm_mode_reaches_the_gates_and_clearing_it_gives_the_frame_back() {
+        let path = std::env::var("NEXRAD_LEVEL2_SAMPLE")
+            .expect("set NEXRAD_LEVEL2_SAMPLE to one real Archive II volume");
+        let volume = Arc::new(
+            nexrad_io::decode_volume_from_path(std::path::Path::new(&path))
+                .unwrap_or_else(|error| panic!("{path} did not decode: {error}")),
+        );
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let mut app = app_with_filter(&context, FilterValues::OFF, "menus");
+        install(&mut app, Arc::clone(&volume));
+        let pane = first_pane();
+
+        // 1. The shipped state.
+        let unfiltered = render_one_frame(&mut app, pane);
+        assert!(
+            unfiltered.gate_filter.is_inactive(),
+            "an unfiltered request came back with a filter report: {:?}",
+            unfiltered.gate_filter.badge()
+        );
+        let unfiltered_ink = inked(&unfiltered.rgba);
+        assert!(
+            unfiltered_ink > 0,
+            "{path} rendered an empty pane - nothing here can be proved on it"
+        );
+
+        // 2. Storm mode, applied through the settings document.
+        apply_filter_through_settings(&mut app, storm_mode());
+        assert_eq!(app.settings_cache.gate_filter, storm_mode().to_filter());
+        let filtered = render_one_frame(&mut app, pane);
+
+        // The request carried the analyst's criteria, not the engine's
+        // placeholder. This is the seam the merge had to close: both branches
+        // wrote this field, and only one of them read the settings.
+        assert_eq!(
+            filtered.gate_filter.filter, app.settings_cache.gate_filter,
+            "the engine filtered by something other than what the settings say"
+        );
+        assert!(
+            filtered.gate_filter.gates_hidden > 0,
+            "storm mode reached the engine and removed nothing: {:?}",
+            filtered.gate_filter
+        );
+        assert!(
+            filtered.gate_filter.gates_hidden < filtered.gate_filter.gates_visible,
+            "storm mode emptied the sweep; that is a blank pane, not a filter"
+        );
+        let filtered_ink = inked(&filtered.rgba);
+        assert!(
+            filtered_ink < unfiltered_ink,
+            "the report says {} gates went but the picture inked {filtered_ink} pixels \
+             against {unfiltered_ink} unfiltered - the censor did not reach the raster",
+            filtered.gate_filter.gates_hidden
+        );
+
+        // 3. The words. Band, legend badge and the engine's own line all quote
+        //    the same summary, so the pane and the picture cannot disagree.
+        let summary = app.settings_cache.gate_filter.hidden_summary();
+        let band =
+            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None)
+                .expect("a filtered pane draws a band");
+        let engine_line = filtered
+            .gate_filter
+            .badge()
+            .expect("the engine says what it removed");
+        assert!(band.contains(&summary) && engine_line.contains(&summary));
+        assert!(
+            crate::gate_filter_ui::pane_badge_text(&app.settings_cache.gate_filter).is_some(),
+            "the legend badge went missing while gates were hidden"
+        );
+
+        // And on the glass, through the shipped `eframe::App::ui`, with this
+        // real volume loaded. Two passes: the first builds the font atlas.
+        app_frame(&mut app, &context, Vec::new());
+        let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with(FILTERED_WORD) && text.contains("show everything")),
+            "a filtered pane drew no {FILTERED_WORD} band over real data: {texts:?}"
+        );
+        println!("unfiltered ink {unfiltered_ink} px");
+        println!("filtered   ink {filtered_ink} px");
+        println!("engine     {engine_line}");
+        for note in filtered.gate_filter.notes() {
+            println!("           {note}");
+        }
+
+        // 4. Clear it. The picture has to come back byte for byte: an OFF
+        //    filter is not "close enough to" the unfiltered application, it IS
+        //    the unfiltered application.
+        apply_filter_through_settings(&mut app, FilterValues::OFF);
+        let cleared = render_one_frame(&mut app, pane);
+        assert!(cleared.gate_filter.is_inactive());
+        assert_eq!(
+            cleared.rgba.len(),
+            unfiltered.rgba.len(),
+            "clearing the filter changed the frame's size"
+        );
+        assert!(
+            cleared.rgba == unfiltered.rgba,
+            "clearing the filter did not give the original picture back: {} of {} bytes differ",
+            cleared
+                .rgba
+                .iter()
+                .zip(&unfiltered.rgba)
+                .filter(|(a, b)| a != b)
+                .count(),
+            unfiltered.rgba.len()
+        );
+        assert_eq!(
+            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None),
+            None,
+            "the band outlived the filter"
+        );
     }
 
     /// The newest `<SITE>*_V06` in the live cache, by filename - the same

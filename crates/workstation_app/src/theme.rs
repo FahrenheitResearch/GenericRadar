@@ -1,11 +1,25 @@
-//! The unified visual language of the workstation: Windows 95, but modern.
+//! The unified visual language of the workstation: Windows 95, but modern —
+//! and, since the appearance framework landed, a language with more than one
+//! set of colours in it.
 //!
-//! One theme for the whole app, applied once at startup with
-//! [`apply`] (or [`install`] to follow the OS light/dark preference), plus
-//! the bevel primitives in [`bevel`] that other modules use to compose the
-//! same language instead of copying colours. The radar pane's own chrome —
+//! # The shape of this module
+//!
+//! * [`catalog`] — the theme registry. One theme is one const in one file;
+//!   registering it is one line. This is where a new look goes.
+//! * [`palette`] — the token set. Every colour the chrome draws, by role.
+//! * [`appearance`] — the four customization axes (scale, density, accent,
+//!   chrome edges) and [`Appearance`], the one value that carries a theme
+//!   plus all four.
+//! * [`bevel`] — the drawing primitives egui's uniform-stroke widgets cannot
+//!   express, so other modules compose the language instead of copying
+//!   colours.
+//! * [`settings`] — the Appearance page, declared as data.
+//!
+//! One call installs everything: [`apply`] at startup and again whenever an
+//! appearance setting changes. The radar pane's own chrome —
 //! `map_scene::MapChrome` — stays authoritative for the map itself; this
-//! module governs the instrument around it.
+//! module governs the instrument around it, and deliberately does not reach
+//! into the panes. Data is not tinted by the chrome.
 //!
 //! # What "Windows 95 but modern" means here
 //!
@@ -20,11 +34,15 @@
 //! any DPI (snapped to the device grid — crisp hairlines at 2×, never grey
 //! mush); the pure-black outline is replaced by deep neutrals; the palette is
 //! re-tuned so the classic `#C0C0C0` face family no longer looks dingy
-//! (light face `#D8D5CE`); and there is a dark variant with the same bevel
+//! (light face `#D8D5CE`); and there is a dark theme with the same bevel
 //! physics, because radar analysts work at night. No skeuomorphic kitsch: no
 //! textures, no gradients, and only small crisp shadows under floating
 //! windows and menus. Toolbars are flat-until-hover in the Office 97 manner
 //! — flatness is visual, never a smaller hit target.
+//!
+//! `ChromeEdges::Flat` is the one deliberate exit from that grammar, offered
+//! because some analysts want the geometry without the 3D language. It
+//! changes what is painted inside a rect, never the rect, so nothing moves.
 //!
 //! # The ground
 //!
@@ -38,9 +56,9 @@
 //! the top of `ui`, and [`clear_color`] from `App::clear_color` so the strip
 //! the compositor exposes mid-resize is the same face.
 //!
-//! # Palette (both variants, pinned by `tests/theme_contract.rs`)
+//! # The founding palettes (pinned by `tests/theme_catalog.rs`)
 //!
-//! | Role            | Light       | Dark        |
+//! | Role            | `light`     | `dark`      |
 //! |-----------------|-------------|-------------|
 //! | face (panels)   | `#D8D5CE`   | `#36393E`   |
 //! | raised face     | `#E4E2DC`   | `#3F4248`   |
@@ -56,35 +74,50 @@
 //! | bevel shade     | `#96938D` / `#5E5C57` | `#232528` / `#0F1012` |
 //!
 //! Contrast floors are tested, not asserted in prose: primary text ≥ 7:1 on
-//! face and well, all other foregrounds ≥ 4.5:1, bevel edges ≥ 1.3:1 against
-//! the face they sculpt (W3C WCAG 2.2, 2023, SC 1.4.3 / 1.4.11).
+//! face and well, all other live foregrounds ≥ 4.5:1, flat borders ≥ 3:1,
+//! bevel edges ≥ 1.3:1 against the face they sculpt (W3C WCAG 2.2, 2023,
+//! SC 1.4.3 / 1.4.11). The audit runs over EVERY registered theme crossed
+//! with EVERY accent, which is what lets themes arrive on parallel branches
+//! without a reviewer measuring anything by hand.
 //!
 //! # Metrics
 //!
 //! Text: the fonts egui already bundles — Ubuntu-Light for UI text, Hack for
 //! monospace readouts; no font dependency is added. Sizes: Small 10, Body
 //! 12.5, Button 12.5, Heading 15.5, Monospace 12 — professional density, one
-//! step tighter than egui's defaults. Every interactive element keeps a hit
-//! target of at least 24 points per side (WCAG 2.2 SC 2.5.8; mobile is a
-//! standing requirement), enforced through `Spacing::interact_size` for
-//! egui's widgets and by construction in [`bevel`]'s helpers. Scroll bars
-//! are solid and allocated — a visible, grabbable, finger-sized channel —
-//! not floating overlays.
+//! step tighter than egui's defaults, and scaled bodily by [`UiScale`]
+//! rather than re-sized per style, so a 125 % analyst gets 125 % of
+//! everything and the bevels stay one physical pixel. Spacing comes from
+//! [`Density`]. Every interactive element keeps a hit target of at least 24
+//! points per side (WCAG 2.2 SC 2.5.8; mobile is a standing requirement) in
+//! every density, enforced through `Spacing::interact_size` for egui's
+//! widgets and by construction in [`bevel`]'s helpers. Scroll bars are solid
+//! and allocated — a visible, grabbable, finger-sized channel — not floating
+//! overlays.
 //!
 //! One stock widget escapes the style: `egui::ProgressBar` defaults to a
 //! pill shape that ignores the widget corner radius. Call sites keep the
 //! language by passing `.corner_radius(CornerRadius::ZERO)`, as
 //! `examples/theme_gallery.rs` demonstrates.
 
-// The explicit `#[path]`s are what let `tests/theme_contract.rs` and
-// `examples/theme_gallery.rs` include this module by `#[path]` before it is
-// wired into `main.rs`: children of a `#[path]`-included file resolve
-// beside the file rather than under `theme/`, and these attributes resolve
-// identically (relative to `src/`) from both compilation paths.
+// The explicit `#[path]`s are what let `tests/theme_contract.rs`,
+// `tests/theme_catalog.rs` and `examples/theme_gallery.rs` include this
+// module by `#[path]`: children of a `#[path]`-included file resolve beside
+// the file rather than under `theme/`, and these attributes resolve
+// identically (relative to `src/`) from every compilation path. The theme
+// files themselves are declared inside `catalog.rs`, whose own children
+// resolve beside IT — that is, in `src/theme/` — which is what makes
+// registering a theme one line in one file.
+#[path = "theme/appearance.rs"]
+pub mod appearance;
 #[path = "theme/bevel.rs"]
 pub mod bevel;
+#[path = "theme/catalog.rs"]
+pub mod catalog;
 #[path = "theme/palette.rs"]
 pub mod palette;
+#[path = "theme/settings.rs"]
+pub mod settings;
 
 use std::collections::BTreeMap;
 
@@ -93,51 +126,129 @@ use eframe::egui::style::{
 };
 use eframe::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Shadow, Stroke, TextStyle, Theme,
-    ThemePreference, Visuals, vec2,
+    ThemePreference, Visuals,
 };
 
+// The vocabulary, re-exported so a caller writes `theme::Density` rather
+// than `theme::appearance::Density`. `unused_imports` is judged per
+// compilation unit and the binary happens not to name all of them; the
+// contract tests, the catalog audit and the contact sheet do.
+#[allow(unused_imports)]
+pub use appearance::{Accent, Appearance, ChromeEdges, Density, UiScale};
+#[allow(unused_imports)]
+pub use catalog::{Ground, ThemeSpec};
 use palette::Palette;
 
-/// Which of the two looks is in force.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Variant {
-    /// Graphite chrome, data wells darker than the panels. The default,
-    /// because the app's audience works storms at night.
-    #[default]
-    Dark,
-    /// Instrument grey, paper-light data wells.
-    Light,
+/// Everything a chrome primitive needs to draw one control: the resolved
+/// colours, how tight the layout is, and which edge language is in force.
+///
+/// Handed back by [`chrome`], which reads it out of the egui context rather
+/// than a global, so an offscreen contact sheet can photograph six themes at
+/// once without any of them seeing another's state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chrome {
+    pub palette: Palette,
+    pub density: Density,
+    pub edges: ChromeEdges,
 }
 
-impl Variant {
-    /// The egui theme slot this variant styles.
-    pub const fn egui_theme(self) -> Theme {
-        match self {
-            Self::Dark => Theme::Dark,
-            Self::Light => Theme::Light,
+/// What [`install`] leaves in the egui context for [`chrome`] to find.
+///
+/// Both grounds' palettes are stored, not just the chosen one, because
+/// [`install`] styles both of egui's theme slots: if something flips the
+/// preference (the OS, a stray `set_theme`), the widgets change ground and
+/// the bevel primitives have to change with them or the chrome tears in half.
+#[derive(Clone, Copy)]
+struct InstalledTheme {
+    appearance: Appearance,
+    light: Palette,
+    dark: Palette,
+}
+
+fn state_id() -> egui::Id {
+    egui::Id::new("radar-workstation::theme::installed")
+}
+
+/// Install `appearance` and pin the app to its theme's ground.
+///
+/// Both egui theme slots are styled — so anything that later flips the
+/// preference still lands on this language, never on stock egui — and the
+/// preference is set to the chosen theme's ground. One call at startup and
+/// one per appearance change is the entire integration.
+pub fn apply(ctx: &egui::Context, appearance: &Appearance) {
+    install(ctx, appearance);
+    ctx.set_theme(match appearance.theme.ground {
+        Ground::Light => ThemePreference::Light,
+        Ground::Dark => ThemePreference::Dark,
+    });
+}
+
+/// Style both slots and publish the appearance, without touching the
+/// light/dark preference. Use [`apply`] to pin the ground explicitly.
+pub fn install(ctx: &egui::Context, appearance: &Appearance) {
+    let (light, dark) = appearance.slots();
+    ctx.set_style_of(Theme::Light, style(&light));
+    ctx.set_style_of(Theme::Dark, style(&dark));
+    // The scale axis, applied where egui already has a home for it: the zoom
+    // factor multiplies whatever `pixels_per_point` the platform reports, so
+    // a 150 % Windows display at 125 % here lands at 187.5 % and every bevel
+    // is still snapped to one physical pixel.
+    ctx.set_zoom_factor(appearance.ui_scale.factor());
+    let installed = InstalledTheme {
+        appearance: *appearance,
+        light: light.palette(),
+        dark: dark.palette(),
+    };
+    ctx.data_mut(|data| data.insert_temp(state_id(), installed));
+}
+
+/// The chrome in force for a `Ui`.
+///
+/// Falls back to [`Appearance::default`] when nothing has been installed —
+/// which is what a bare `egui::Context` in somebody else's test looks like —
+/// so a primitive drawn without the theme still draws the shipped look
+/// rather than panicking or reading stock egui's colours.
+pub fn chrome(ui: &egui::Ui) -> Chrome {
+    chrome_of(ui.ctx(), ui.visuals().dark_mode)
+}
+
+/// The chrome in force for a context on a given ground. `dark_mode` is
+/// egui's own answer (`Visuals::dark_mode`), because a `Ui` can carry
+/// overridden visuals and the primitives must follow the ground they are
+/// actually painting on.
+pub fn chrome_of(ctx: &egui::Context, dark_mode: bool) -> Chrome {
+    let installed = ctx.data(|data| data.get_temp::<InstalledTheme>(state_id()));
+    match installed {
+        Some(installed) => Chrome {
+            palette: if dark_mode {
+                installed.dark
+            } else {
+                installed.light
+            },
+            density: installed.appearance.density,
+            edges: installed.appearance.edges,
+        },
+        None => {
+            let ground = if dark_mode {
+                Ground::Dark
+            } else {
+                Ground::Light
+            };
+            let appearance = Appearance::on_ground(ground);
+            Chrome {
+                palette: appearance.palette(),
+                density: appearance.density,
+                edges: appearance.edges,
+            }
         }
     }
 }
 
-/// Install the theme and pin the app to `variant`.
-///
-/// Both egui theme slots are styled — so anything that later flips the
-/// preference still lands on this language, never on stock egui — and the
-/// preference is set to `variant`. One call at startup is the entire
-/// integration.
-pub fn apply(ctx: &egui::Context, variant: Variant) {
-    install(ctx);
-    ctx.set_theme(match variant {
-        Variant::Dark => ThemePreference::Dark,
-        Variant::Light => ThemePreference::Light,
-    });
-}
-
-/// Install both variants and let the OS light/dark preference choose between
-/// them. Use [`apply`] to pin one explicitly.
-pub fn install(ctx: &egui::Context) {
-    ctx.set_style_of(Theme::Dark, style(Variant::Dark));
-    ctx.set_style_of(Theme::Light, style(Variant::Light));
+/// The appearance installed in a context, or the default if none is.
+pub fn active(ctx: &egui::Context) -> Appearance {
+    ctx.data(|data| data.get_temp::<InstalledTheme>(state_id()))
+        .map(|installed| installed.appearance)
+        .unwrap_or_default()
 }
 
 /// The colour an [`eframe::App`] must clear its window to, so the ground the
@@ -160,7 +271,7 @@ pub fn clear_color(visuals: &Visuals) -> [f32; 4] {
 ///
 /// Without this the app's widgets float on the raw window clear colour, and
 /// every text run that is not inside a well or a button is drawn straight
-/// onto it: in the light variant that is `#1C1B19` ink on near-black, which
+/// onto it: on the light ground that is `#1C1B19` ink on near-black, which
 /// is invisible until a hover happens to paint a face under it. Call this
 /// FIRST in `ui`, before anything else allocates, so the fill lands behind
 /// the frame's own shapes.
@@ -175,21 +286,26 @@ pub fn paint_root_ground(ui: &egui::Ui) {
     ui.painter().rect_filled(rect, CornerRadius::ZERO, ground);
 }
 
-/// The complete [`egui::Style`] for one variant.
-pub fn style(variant: Variant) -> egui::Style {
+/// The complete [`egui::Style`] for one appearance.
+pub fn style(appearance: &Appearance) -> egui::Style {
     let mut style = egui::Style {
         text_styles: text_styles(),
-        visuals: visuals(variant),
+        visuals: visuals(appearance),
         // Near-instant state changes: the language is mechanical, not
         // animated. Kept just above zero so egui's fades still resolve.
         animation_time: 0.06,
         ..egui::Style::default()
     };
-    spacing(&mut style.spacing);
+    spacing(&mut style.spacing, appearance.density);
     style
 }
 
 /// The type ramp, on the fonts egui already bundles.
+///
+/// Not scaled by [`UiScale`]: the scale axis multiplies `pixels_per_point`,
+/// which enlarges the type, the spacing, the bevels and the hit targets
+/// together and keeps every hairline one physical pixel. Growing the font
+/// sizes here instead would leave the chrome around them the same size.
 fn text_styles() -> BTreeMap<TextStyle, FontId> {
     [
         (
@@ -213,24 +329,27 @@ fn text_styles() -> BTreeMap<TextStyle, FontId> {
     .into()
 }
 
-/// Dense professional spacing that never shrinks a hit target below 24 pt.
-fn spacing(spacing: &mut egui::style::Spacing) {
-    spacing.item_spacing = vec2(6.0, 4.0);
-    spacing.window_margin = Margin::same(8);
-    spacing.menu_margin = Margin::same(6);
-    spacing.button_padding = vec2(10.0, 4.0);
+/// Spacing for one density that never shrinks a hit target below 24 pt.
+fn spacing(spacing: &mut egui::style::Spacing, density: Density) {
+    let metrics = density.metrics();
+    spacing.item_spacing = metrics.item_spacing;
+    spacing.window_margin = Margin::same(metrics.window_margin);
+    spacing.menu_margin = Margin::same(metrics.menu_margin);
+    spacing.button_padding = metrics.button_padding;
     // The floor for every interactive widget's height, and the touch rule.
-    spacing.interact_size = vec2(44.0, bevel::MIN_TOUCH_POINTS);
-    spacing.slider_width = 140.0;
+    // The height half is `MIN_TOUCH_POINTS` in every density: `Dense` buys
+    // its density from the gaps, never from the targets.
+    spacing.interact_size = metrics.interact_size();
+    spacing.slider_width = metrics.slider_width;
     spacing.slider_rail_height = 6.0;
-    spacing.text_edit_width = 240.0;
-    spacing.icon_width = 15.0;
-    spacing.icon_width_inner = 9.0;
-    spacing.icon_spacing = 5.0;
+    spacing.text_edit_width = metrics.text_edit_width;
+    spacing.icon_width = metrics.icon_width;
+    spacing.icon_width_inner = metrics.icon_width_inner;
+    spacing.icon_spacing = metrics.icon_spacing;
     spacing.tooltip_width = 420.0;
     spacing.combo_height = 260.0;
     // A solid, allocated scroll channel — visible and grabbable, like the
-    // instrument it belongs to — sized for fingers.
+    // instrument it belongs to — sized for fingers, in every density.
     spacing.scroll = ScrollStyle {
         bar_width: 12.0,
         handle_min_length: 24.0,
@@ -238,22 +357,23 @@ fn spacing(spacing: &mut egui::style::Spacing) {
     };
 }
 
-/// The colours and shapes for one variant.
-fn visuals(variant: Variant) -> Visuals {
-    let palette = Palette::of(variant);
-    let base = match variant {
+/// The colours and shapes for one appearance.
+fn visuals(appearance: &Appearance) -> Visuals {
+    let palette = appearance.palette();
+    let ground = appearance.theme.ground;
+    let base = match ground {
         // Start from egui's own mode defaults so mode-conditional details
         // this function does not name (text-alpha handling, cursor
-        // previews) stay correct for the mode.
-        Variant::Dark => Visuals::dark(),
-        Variant::Light => Visuals::light(),
+        // previews) stay correct for the ground.
+        Ground::Dark => Visuals::dark(),
+        Ground::Light => Visuals::light(),
     };
-    let shadow_alpha = match variant {
-        Variant::Dark => 130,
-        Variant::Light => 60,
+    let shadow_alpha = match ground {
+        Ground::Dark => 130,
+        Ground::Light => 60,
     };
     Visuals {
-        widgets: widgets(palette),
+        widgets: widgets(&palette),
         selection: Selection {
             bg_fill: palette.selection_bg,
             stroke: Stroke::new(1.0, palette.selection_text),
@@ -262,21 +382,21 @@ fn visuals(variant: Variant) -> Visuals {
         // Secondary text is a declared colour, not a faded primary. egui's
         // default is `text_color().gamma_multiply(weak_text_alpha)`, which
         // fades the ink toward transparency without knowing what is behind
-        // it: on the dark variant's well that lands at `#5C5D5D` on
+        // it: on the dark theme's well that lands at `#5C5D5D` on
         // `#181A1D`, a measured 2.64:1, and every text-edit hint on the bar
         // was illegible because of it (caught by the toolbar audit in
         // `examples/theme_gallery.rs`, not by eye). `text_weak` is the
         // palette's own answer, pinned at ≥ 4.5:1 on both face and well.
         weak_text_color: Some(palette.text_weak),
-        faint_bg_color: match variant {
-            Variant::Dark => Color32::from_white_alpha(4),
-            Variant::Light => Color32::from_black_alpha(7),
+        faint_bg_color: match ground {
+            Ground::Dark => Color32::from_white_alpha(4),
+            Ground::Light => Color32::from_black_alpha(7),
         },
         extreme_bg_color: palette.well,
         text_edit_bg_color: Some(palette.well),
-        code_bg_color: match variant {
-            Variant::Dark => Color32::from_rgb(30, 32, 36),
-            Variant::Light => Color32::from_rgb(233, 231, 225),
+        code_bg_color: match ground {
+            Ground::Dark => Color32::from_rgb(30, 32, 36),
+            Ground::Light => Color32::from_rgb(233, 231, 225),
         },
         warn_fg_color: palette.warn,
         error_fg_color: palette.error,

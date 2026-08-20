@@ -1,25 +1,32 @@
-//! The two colour palettes of the workstation theme, stated as numbers.
+//! The token set: every colour the chrome draws, named by role.
 //!
-//! Every colour the theme uses is declared here once, as a named role, so the
-//! widget styling in [`super`] and the bevel primitives in [`super::bevel`]
-//! cannot drift apart: both read the same [`Palette`]. The values themselves
-//! are design decisions, recorded in the table in the [`super`] module doc and
-//! pinned by the contrast tests in `tests/theme_contract.rs` — a later edit
-//! that quietly drops a foreground below its WCAG floor fails a test rather
-//! than shipping.
+//! One [`Palette`] is the whole colour vocabulary of one theme. The widget
+//! styling in [`super`] and the bevel primitives in [`super::bevel`] read the
+//! same struct, which is what keeps them from drifting apart, and a
+//! registered theme in [`super::catalog`] is exactly one of these plus its
+//! identity. There are no per-widget colours anywhere in the chrome: if a
+//! control needs a colour that is not a role here, the role is missing.
+//!
+//! The values themselves live in the theme files (`src/theme/light.rs`,
+//! `src/theme/dark.rs`, and one file per theme after them). This module owns
+//! only the vocabulary and the one operation performed on it - swapping in a
+//! chosen accent, [`Palette::with_accent`].
 //!
 //! Contrast floors follow W3C, "Web Content Accessibility Guidelines (WCAG)
 //! 2.2", W3C Recommendation, 2023: SC 1.4.3 (contrast minimum, 4.5:1 for
-//! text) and SC 1.4.11 (non-text contrast, 3:1 for UI graphics). The bevel
-//! grammar the four `hi_*`/`sh_*` roles serve is from "The Windows Interface
-//! Guidelines for Software Design", Microsoft Press, 1995, ch. 13 — the
-//! light-from-top-left convention this whole theme is built on.
+//! text) and SC 1.4.11 (non-text contrast, 3:1 for UI graphics). They are
+//! tested, not asserted in prose - `tests/theme_catalog.rs` measures every
+//! registered theme against every accent and names the pairing it failed on.
+//! The bevel grammar the four `hi_*`/`sh_*` roles serve is from "The Windows
+//! Interface Guidelines for Software Design", Microsoft Press, 1995, ch. 13 -
+//! the light-from-top-left convention this whole theme is built on.
 
 use eframe::egui::Color32;
 
-use super::Variant;
+use super::appearance::AccentTokens;
+use super::catalog::{self, Ground};
 
-/// Every colour role the theme paints with, for one variant.
+/// Every colour role the chrome paints with, for one theme.
 ///
 /// Roles, not widgets: a button and a combo box share `face_raised` rather
 /// than each declaring a colour, which is what keeps the app looking like one
@@ -36,33 +43,44 @@ pub struct Palette {
     pub face_pressed: Color32,
     /// The face of a control under the pointer. The lightest face step.
     pub hover: Color32,
-    /// The fill of inset content — text edits, lists, data readouts. In the
-    /// light variant this is near-paper; in the dark variant it is *darker*
-    /// than the chrome, so data areas sit visually behind the instrument.
+    /// The fill of inset content — text edits, lists, data readouts. On a
+    /// light ground this is near-paper; on a dark one it is *darker* than the
+    /// chrome, so data areas sit visually behind the instrument.
     pub well: Color32,
-    /// Primary text. Pinned at ≥ 7:1 against both `face` and `well`.
+    /// Primary text. Pinned at ≥ 7:1 against `face`, `face_raised` and
+    /// `well`.
     pub text: Color32,
-    /// Secondary text: hints, captions, status lines. Pinned at ≥ 4.5:1.
+    /// Secondary text: hints, captions, status lines. Pinned at ≥ 4.5:1 on
+    /// `face` and `well`.
     pub text_weak: Color32,
-    /// Text of a disabled control. Deliberately *below* the WCAG floor —
-    /// illegibility-by-degree is the disabled affordance — but still present.
+    /// Text of a disabled control. Deliberately *below* the WCAG text floor —
+    /// illegibility-by-degree is the disabled affordance, and SC 1.4.3
+    /// exempts inactive components — but pinned above a presence floor so it
+    /// never disappears, and pinned weaker than `text_weak` so a disabled
+    /// control can never read as a live one.
     pub text_disabled: Color32,
     /// The 1-px outline of controls at rest. Visible affordance: a button has
     /// an edge you can see before you hover it.
     pub border: Color32,
-    /// The outline of a control that is hovered, pressed, or a window edge.
+    /// The outline of a control that is hovered or pressed, a window edge,
+    /// and — in `ChromeEdges::Flat` — every edge the bevels would have drawn.
+    /// Pinned at ≥ 3:1 on `face` and `well` for that reason (SC 1.4.11).
     pub border_strong: Color32,
-    /// Hyperlinks and the open-combo accent edge. Pinned ≥ 4.5:1 on `face`.
+    /// Hyperlinks and the open-combo accent edge. Pinned ≥ 4.5:1 on `face`
+    /// and `well`. Owned by the accent axis.
     pub link: Color32,
-    /// Fill behind selected text and selected list rows.
+    /// Fill behind selected text and selected list rows. Owned by the accent
+    /// axis.
     pub selection_bg: Color32,
     /// Text on `selection_bg`; also egui's focus-ring colour, so it must be
-    /// visible against `face` as well as against `selection_bg`.
+    /// visible against `face` as well as against `selection_bg`. Owned by the
+    /// accent axis.
     pub selection_text: Color32,
     /// The fill of a latched (toggled-on) toolbar button: `face` pulled
-    /// toward the accent, sitting under a sunken bevel.
+    /// toward the accent, sitting under a sunken bevel. Owned by the accent
+    /// axis.
     pub selection_tint: Color32,
-    /// Warning text on `face`. Amber, tuned per variant to hold ≥ 4.5:1.
+    /// Warning text on `face`. Amber, tuned per theme to hold ≥ 4.5:1.
     pub warn: Color32,
     /// Error text on `face`.
     pub error: Color32,
@@ -79,80 +97,40 @@ pub struct Palette {
     pub sh_outer: Color32,
 }
 
-/// The light ("daylight bench") palette.
-///
-/// The classic `#C0C0C0` face family lifted well out of dinge — `face` is
-/// `#D8D5CE`, about nine percent brighter and a hair warm, so on a modern
-/// panel it reads as brushed instrument grey rather than as an old dialog.
-pub const LIGHT: Palette = Palette {
-    face: Color32::from_rgb(216, 213, 206),
-    face_raised: Color32::from_rgb(228, 226, 220),
-    face_pressed: Color32::from_rgb(198, 195, 188),
-    hover: Color32::from_rgb(236, 234, 228),
-    well: Color32::from_rgb(250, 249, 245),
-    text: Color32::from_rgb(28, 27, 25),
-    text_weak: Color32::from_rgb(88, 86, 81),
-    text_disabled: Color32::from_rgb(139, 137, 132),
-    border: Color32::from_rgb(146, 143, 137),
-    border_strong: Color32::from_rgb(94, 92, 87),
-    link: Color32::from_rgb(43, 84, 148),
-    selection_bg: Color32::from_rgb(167, 190, 219),
-    selection_text: Color32::from_rgb(16, 45, 85),
-    selection_tint: Color32::from_rgb(181, 187, 194),
-    warn: Color32::from_rgb(128, 74, 0),
-    error: Color32::from_rgb(170, 36, 28),
-    hi_outer: Color32::from_rgb(255, 255, 255),
-    hi_inner: Color32::from_rgb(238, 236, 230),
-    sh_inner: Color32::from_rgb(150, 147, 141),
-    sh_outer: Color32::from_rgb(94, 92, 87),
-};
+/// The daylight bench's palette. A convenience alias for the founding light
+/// theme's tokens, kept because the contract tests and the toolbar audit name
+/// it directly.
+pub const LIGHT: Palette = catalog::light::THEME.palette;
 
-/// The dark ("night bench") palette, because radar analysts work at night.
-///
-/// Graphite, not black: `face` is `#36393E`, bright enough that the bevel
-/// grammar still has room on both sides — a lit edge above it and two shade
-/// steps below it — where a near-black chrome would leave the language
-/// nowhere to go. Data wells are darker than the chrome so imagery pops.
-pub const DARK: Palette = Palette {
-    face: Color32::from_rgb(54, 57, 62),
-    face_raised: Color32::from_rgb(63, 66, 72),
-    face_pressed: Color32::from_rgb(42, 44, 48),
-    hover: Color32::from_rgb(70, 74, 80),
-    well: Color32::from_rgb(24, 26, 29),
-    text: Color32::from_rgb(230, 228, 225),
-    text_weak: Color32::from_rgb(162, 165, 169),
-    text_disabled: Color32::from_rgb(106, 109, 114),
-    border: Color32::from_rgb(94, 99, 106),
-    border_strong: Color32::from_rgb(130, 136, 144),
-    link: Color32::from_rgb(125, 168, 222),
-    selection_bg: Color32::from_rgb(46, 90, 150),
-    selection_text: Color32::from_rgb(235, 240, 247),
-    selection_tint: Color32::from_rgb(51, 69, 93),
-    warn: Color32::from_rgb(232, 163, 61),
-    error: Color32::from_rgb(244, 130, 120),
-    hi_outer: Color32::from_rgb(98, 103, 110),
-    hi_inner: Color32::from_rgb(72, 76, 82),
-    sh_inner: Color32::from_rgb(35, 37, 40),
-    sh_outer: Color32::from_rgb(15, 16, 18),
-};
+/// The night bench's palette. See [`LIGHT`].
+pub const DARK: Palette = catalog::dark::THEME.palette;
 
 impl Palette {
-    /// The palette of a variant.
-    pub const fn of(variant: Variant) -> &'static Self {
-        match variant {
-            Variant::Light => &LIGHT,
-            Variant::Dark => &DARK,
-        }
+    /// The default theme of a ground, as a palette.
+    pub const fn of(ground: Ground) -> Self {
+        catalog::default_for(ground).palette
     }
 
-    /// The palette in force for a `Ui`, read from the style the theme
-    /// installed (`Visuals::dark_mode`). This is how the bevel helpers find
-    /// their colours without every caller threading a [`Variant`] around.
-    pub fn detect(ui: &eframe::egui::Ui) -> &'static Self {
-        if ui.visuals().dark_mode {
-            &DARK
-        } else {
-            &LIGHT
-        }
+    /// This palette with a chosen accent's four roles swapped in.
+    ///
+    /// Only the four accent roles move. A theme's face steps, inks, borders
+    /// and bevel ladder are what make it that theme, and an accent that
+    /// touched them would be a second theme wearing the first one's name.
+    pub const fn with_accent(mut self, accent: AccentTokens) -> Self {
+        self.link = accent.link;
+        self.selection_bg = accent.selection_bg;
+        self.selection_text = accent.selection_text;
+        self.selection_tint = accent.selection_tint;
+        self
+    }
+
+    /// The palette in force for a `Ui`.
+    ///
+    /// Reads the appearance the theme installed into the egui context (see
+    /// `super::chrome`), so the bevel helpers find their colours - including
+    /// the analyst's chosen accent - without every caller threading an
+    /// [`super::Appearance`] around.
+    pub fn detect(ui: &eframe::egui::Ui) -> Self {
+        super::chrome(ui).palette
     }
 }

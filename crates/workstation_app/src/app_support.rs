@@ -331,3 +331,175 @@ pub(crate) fn previous_sweep_for(
     let index = crate::sweep::matching_cut_index(&previous.volume, target, moment)?;
     Some((std::sync::Arc::clone(&previous.volume), index))
 }
+
+/// File extensions the open and drop paths accept, lowercase and without the
+/// dot.
+///
+/// The list spans every container the io crate's routing seam can identify,
+/// so a drop that mixes a volume with the screenshot next to it opens the
+/// volume rather than the screenshot.
+///
+/// * NEXRAD Archive II: `ar2v`, `v06`, `v08`, `raw`, and the `gz`/`bz2`
+///   wrappers those arrive in.
+/// * GR2Analyst-convention exports: `msg31`.
+/// * HDF5, carrying ODIM_H5: `h5`, `hdf`, `hd5`.
+/// * Classic netCDF, carrying CfRadial 1.x: `nc`.
+/// * Mobile deployment bundles: `zip`.
+///
+/// DORADE sweepfiles are not on the list because they have no extension in
+/// any useful sense - `swp.1090509143923.NOXPRVP.0.0.5_PPI_v1` parses as an
+/// extension of `5_PPI_v1` - so they are matched by their `swp.` naming
+/// convention instead; see [`looks_like_radar_file`].
+const RADAR_FILE_EXTENSIONS: &[&str] = &[
+    "ar2v", "bz2", "gz", "h5", "hd5", "hdf", "msg31", "nc", "raw", "v06", "v08", "zip",
+];
+
+/// Whether a path is worth handing to the decoder.
+///
+/// A file with no extension passes. That is not laxity: NEXRAD volumes are
+/// routinely stored with the site and timestamp as the entire name
+/// (`KTLX19990503_233631`), and the S3 archive objects carry no extension at
+/// all, so refusing them would reject the most common real input. Content is
+/// what actually decides - the io crate sniffs magic bytes - and this
+/// predicate exists only to pick the plausible file out of a multi-file drop
+/// and to keep an obviously wrong one from clearing the session.
+pub(crate) fn looks_like_radar_file(path: &std::path::Path) -> bool {
+    // A DORADE sweepfile's name is a dotted field list, so its "extension"
+    // is whatever happens to follow the last dot. The io crate owns the
+    // naming convention; asking it keeps one definition of the shape.
+    if nexrad_io::dorade::looks_like_dorade_path(path) {
+        return true;
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        None => true,
+        Some(extension) => RADAR_FILE_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known)),
+    }
+}
+
+/// Pick which of a drop's paths to open.
+///
+/// Dropping a selection rather than a single file is normal - an analyst
+/// grabs a volume and the screenshot sitting next to it - so this takes the
+/// first plausible radar file rather than simply the first file, and one
+/// stray `.png` cannot clear the session.
+///
+/// If nothing in the drop looks like radar data, the first path is returned
+/// anyway. A decoder error naming the file the analyst dropped is more use
+/// than a drop target that silently does nothing, which reads as a bug.
+pub(crate) fn choose_dropped_radar_file(
+    paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let mut first = None;
+    for path in paths {
+        if looks_like_radar_file(&path) {
+            return Some(path);
+        }
+        if first.is_none() {
+            first = Some(path);
+        }
+    }
+    first
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_drop_prefers_the_radar_file_over_whatever_came_with_it() {
+        let dropped = ["notes.txt", "screenshot.png", "KTLX19990503_233631"]
+            .into_iter()
+            .map(PathBuf::from);
+        assert_eq!(
+            choose_dropped_radar_file(dropped),
+            Some(PathBuf::from("KTLX19990503_233631"))
+        );
+    }
+
+    #[test]
+    fn a_drop_of_only_wrong_files_still_reports_one_so_the_error_names_it() {
+        let dropped = ["notes.txt", "screenshot.png"]
+            .into_iter()
+            .map(PathBuf::from);
+        assert_eq!(
+            choose_dropped_radar_file(dropped),
+            Some(PathBuf::from("notes.txt"))
+        );
+    }
+
+    #[test]
+    fn an_empty_drop_loads_nothing() {
+        assert_eq!(choose_dropped_radar_file(Vec::new()), None);
+    }
+
+    #[test]
+    fn accepts_every_container_the_routing_seam_can_identify() {
+        for name in [
+            "KDVN20260819_192802_V06",
+            "volume.ar2v",
+            "volume.ar2v.gz",
+            "volume.V08",
+            "scan.RAW",
+            "export.msg31",
+            "bejab.pvol.h5",
+            "T_PAGZ35.hdf",
+            "polrad.hd5",
+            "cfrad.20211011_223602_DOW8_RHI.nc",
+            "deployment.zip",
+            "volume.bz2",
+            // Real DORADE sweepfiles, whose names are dotted field lists.
+            // `Path::extension` reads the first as "5_PPI_v1", which is on
+            // no allowlist and never will be.
+            "swp.1090509143923.NOXPRVP.0.0.5_PPI_v1",
+            "swp.1260521225514.COW2.229.1.0_SUR_v215",
+        ] {
+            assert!(
+                looks_like_radar_file(Path::new(name)),
+                "{name} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_files_that_are_plainly_not_radar_volumes() {
+        for name in ["screenshot.png", "notes.txt", "colors.json", "report.pdf"] {
+            assert!(
+                !looks_like_radar_file(Path::new(name)),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    /// A DORADE sweep dropped alongside its notes opens the sweep.
+    ///
+    /// This is the case the extension allowlist cannot serve: without the
+    /// naming rule the sweepfile reads as extension "5_PPI_v1", loses to the
+    /// `.txt` sitting next to it, and the analyst gets a decode failure on a
+    /// text file instead of the scan they dropped.
+    #[test]
+    fn a_dorade_sweepfile_wins_a_drop_over_the_notes_beside_it() {
+        let dropped = [
+            "deployment/notes.txt",
+            "deployment/swp.1090509143923.NOXPRVP.0.0.5_PPI_v1",
+        ]
+        .into_iter()
+        .map(PathBuf::from);
+        assert_eq!(
+            choose_dropped_radar_file(dropped),
+            Some(PathBuf::from(
+                "deployment/swp.1090509143923.NOXPRVP.0.0.5_PPI_v1"
+            ))
+        );
+    }
+
+    #[test]
+    fn extensionless_archive_names_are_accepted_because_that_is_how_they_ship() {
+        // The public Level II archive stores objects under exactly this name.
+        assert!(looks_like_radar_file(Path::new(
+            "C:/data/KTLX19990503_233631"
+        )));
+    }
+}

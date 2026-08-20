@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, TimeZone, Utc};
-use nexrad_io::decode_volume_from_path;
+use nexrad_io::decode_supported_volume_from_path;
 use radar_core::{MomentStorage, RadarVolume};
 
 fn main() {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: cargo run -p nexrad_io --example inspect -- <level2-file>");
+        eprintln!("usage: cargo run -p nexrad_io --example inspect -- <radar-volume-file>");
         std::process::exit(2);
     };
 
-    match decode_volume_from_path(&path) {
+    match decode_supported_volume_from_path(&path) {
         Ok(volume) => {
             println!("site: {}", volume.site.id);
             println!("volume_time: {}", volume.volume_time);

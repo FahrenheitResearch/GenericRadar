@@ -1,32 +1,84 @@
-//! The theme, photographed: a sample panel of every widget class the
-//! workstation uses, rendered through the real egui → egui_wgpu pipeline in
-//! both variants and written out as PNG for a human to look at.
+//! The chrome, photographed: a widget-by-widget sample panel and a contact
+//! sheet of every registered theme, rendered through the real egui →
+//! egui_wgpu pipeline and written out as PNG for a human to look at.
 //!
 //! ```text
-//! cargo run --release -p workstation_app --example theme_gallery
+//! cargo run --release -p workstation_app --example theme_gallery -- //!     --volume <level2-file>
 //! cargo run --release -p workstation_app --example theme_gallery -- --window
 //! ```
 //!
-//! Headless (default): renders the gallery offscreen at 1× and 2× device
-//! scale in both variants and writes four PNGs to `THEME_GALLERY_OUT`
-//! (default `target/theme_gallery`). The 2× frames are what prove the
-//! one-physical-pixel bevel promise: the lines must stay single crisp
-//! hairlines, not grey smears. `--window` opens the same gallery live, with
-//! variant toggles, for a human on a real display.
+//! Everything is written to `THEME_GALLERY_OUT` (default
+//! `target/theme_gallery`).
+//!
+//! # The sample panel, per theme
+//!
+//! `gallery_<theme-id>_1x.png` / `_2x.png`: one of everything the chrome
+//! draws, for every theme in `theme::catalog::THEMES`, at 1× and 2× device
+//! scale. The 2× frames are what prove the one-physical-pixel bevel promise:
+//! the lines must stay single crisp hairlines, not grey smears. This part
+//! needs no arguments and no volume.
+//!
+//! # The contact sheet
+//!
+//! `sheet_<theme-id>[_axis…][_2x].png`: the same sample panel plus a REAL
+//! radar pane, one image per registered theme, each labelled with its id,
+//! its description and the exact axes it was shot at — and, for the shipped
+//! default theme, one image per density, one per chrome-edge mode and one at
+//! a raised interface scale. This is the tool a theme author uses: register
+//! a theme in `src/theme/catalog.rs`, run this, and there is a picture of it
+//! on the bench beside every other theme with the same echo underneath.
+//!
+//! Every registered theme is shot at 1× and again at 2× device scale. The
+//! second is not decoration: the one-physical-pixel bevel promise is a claim
+//! about pixels, and a hairline that has smeared into two grey rows is
+//! invisible at 1× and obvious at 2×. The axis sweep stays at 1×, because
+//! those shots are about spacing and layout, which 2× re-photographs without
+//! adding anything. Note that the interface-scale AXIS and the device scale
+//! are different questions and multiply: `sheet_light_scale125.png` is the
+//! chrome grown by the analyst's own setting, `sheet_light_2x.png` is the
+//! same chrome on a denser panel.
+//!
+//! # The settings window
+//!
+//! `settings_<theme-id>[_themelist[_hover|_scale160|_narrow|_dense]][_2x].png`:
+//! the real Settings window, drawn through the shipped
+//! `settings_ui::draw_settings_window`, wearing each registered theme —
+//! once as it sits, and then with the theme list dropped open.
+//!
+//! It is here because it is the densest chrome the application draws (a
+//! category list, a search strip, rows of combos and sliders, help
+//! paragraphs in weak ink, a status footer) and because it is where a
+//! palette's SECONDARY ink is put under the most pressure. The open-list
+//! shot is the one that shows what an analyst actually reads while choosing
+//! a theme: every theme's label with its own description under it, rendered
+//! in the theme being chosen from.
+//!
+//! Four of the open-list shots are there because they are where that list
+//! broke. `_hover` rests the pointer on a row that is NOT the current theme
+//! — a third ground, neither the menu's face nor the selection fill, and
+//! the one an analyst is looking at for the whole time they are choosing.
+//! `_scale160`, `_narrow` and `_dense` are the three ways the room runs out:
+//! the interface-scale axis at its top step, the narrowest display the page
+//! supports (304 points, which is what produces the window's 280-point
+//! floor), and the tightest density. A description has to wrap inside the
+//! display in all of them rather than run off it.
+//!
+//! This part needs no volume and always runs: the settings window draws no
+//! radar. It is the contact sheet below that refuses to run without one.
 //!
 //! # The bar, photographed
 //!
 //! The headless run also photographs the application's OWN menu bar —
 //! `app::WorkstationApp::toolbar`, the shipped function, not a sample of it —
-//! in both variants, at 1× and 2×, in four states (nothing hovered, a button
-//! under the pointer, a button held down, a menu dropped). It is built
-//! exactly as `main.rs` builds it and opened on a REAL Level II volume, so
-//! the tilt readout carries a measured elevation and the product, palette and
-//! live controls carry the state a real volume puts there. Point it at one:
+//! for every registered theme, at 1× and 2×, in four states (nothing
+//! hovered, a button under the pointer, a button held down, a menu dropped).
+//! It is built exactly as `main.rs` builds it and opened on a REAL Level II
+//! volume, so the tilt readout carries a measured elevation and the product,
+//! palette and live controls carry the state a real volume puts there. Point
+//! it at one:
 //!
 //! ```text
-//! cargo run --release -p workstation_app --example theme_gallery -- \
-//!     --toolbar <level2-file>
+//! cargo run --release -p workstation_app --example theme_gallery -- //!     --toolbar <level2-file>
 //! ```
 //!
 //! Each frame is then audited against W3C, "Web Content Accessibility
@@ -36,6 +88,19 @@
 //! read back out of the rendered image. Anything below 4.5:1 fails the run.
 //! A picture a human has not looked at is not a sign-off; this is the
 //! pre-flight that makes looking worth a reviewer's time.
+//!
+//! **Do not compare the bar PNGs by checksum.** Every theme's bar is
+//! photographed through one shared `egui::Context`, and that capture is
+//! reproducible only to within a handful of pixels of ±1/255 on glyph
+//! edges — measured, not assumed; see
+//! `assert_the_capture_does_not_depend_on_the_running_order`, which reports
+//! the drift on every run and fails if it ever grows past rounding. Two
+//! builds with identical palettes will still produce different md5s here.
+//! The artifact that IS byte-comparable is the sample panel above, which
+//! builds a fresh context per image.
+//!
+//! `--window` opens the sample panel live on a real display, with a toggle
+//! per registered theme.
 
 // The whole application, compiled into this example exactly as `src/main.rs`
 // compiles it. The directory `#[path]` is what makes each module's own child
@@ -46,13 +111,16 @@
 #[allow(dead_code)]
 #[path = "../src"]
 mod source {
+    pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod gate_filter_ui;
     pub mod hazards;
     pub mod legend;
     pub mod live_service;
     pub mod load_service;
     pub mod nearest_site;
+    pub mod net_tuning;
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
@@ -66,6 +134,7 @@ mod source {
     pub mod sites_service;
     pub mod sweep;
     pub mod theme;
+    pub mod units;
     pub mod user_tables;
     pub mod vol3d;
     pub mod vrot;
@@ -74,10 +143,10 @@ mod source {
 }
 
 pub(crate) use source::{
-    app, app_support, hazards, legend, live_service, load_service, nearest_site, palette_editor,
-    palettes, pane_canvas, popup, probe, product, product_availability, product_picker,
-    render_service, settings_ui, sites_service, sweep, theme, user_tables, vol3d, vrot,
-    warnings_service, xsection,
+    annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
+    nearest_site, net_tuning, palette_editor, palettes, pane_canvas, popup, probe, product,
+    product_availability, product_picker, render_service, settings_ui, sites_service, sweep, theme,
+    units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};
@@ -85,7 +154,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use eframe::{egui, wgpu};
 use theme::palette::Palette;
-use theme::{Variant, bevel};
+use theme::{Appearance, bevel, catalog};
 
 /// 896 × 640 points: wide enough for a real toolbar row, and 896·4·ppp bytes
 /// per row is a multiple of wgpu's 256-byte readback alignment at 1× and 2×.
@@ -98,17 +167,22 @@ fn main() {
         run_window();
         return;
     }
-    let toolbar_volume = arguments
-        .iter()
-        .position(|argument| argument == "--toolbar")
-        .and_then(|index| arguments.get(index + 1))
-        .map(PathBuf::from);
-    run_headless(toolbar_volume.as_deref());
+    let value_of = |name: &str| {
+        arguments
+            .iter()
+            .position(|argument| argument == name)
+            .and_then(|index| arguments.get(index + 1))
+            .map(PathBuf::from)
+    };
+    run_headless(
+        value_of("--toolbar").as_deref(),
+        value_of("--volume").as_deref(),
+    );
 }
 
 /// The mutable bits of the sample panel, so controls respond in `--window`.
 struct GalleryState {
-    variant: Variant,
+    appearance: Appearance,
     path_text: String,
     site_text: String,
     frame_index: f32,
@@ -121,7 +195,7 @@ struct GalleryState {
 impl Default for GalleryState {
     fn default() -> Self {
         Self {
-            variant: Variant::Dark,
+            appearance: Appearance::by_id("dark"),
             path_text: String::new(),
             site_text: "KTLX".to_owned(),
             frame_index: 7.0,
@@ -289,7 +363,7 @@ fn draw_gallery(ui: &mut egui::Ui, state: &mut GalleryState) {
 // Headless: render through egui_wgpu and write PNGs.
 // ---------------------------------------------------------------------------
 
-fn run_headless(toolbar_volume: Option<&Path>) {
+fn run_headless(toolbar_volume: Option<&Path>, sheet_volume: Option<&Path>) {
     let out_dir = std::env::var_os("THEME_GALLERY_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/theme_gallery"));
@@ -305,9 +379,11 @@ fn run_headless(toolbar_volume: Option<&Path>) {
     }))
     .expect("wgpu device");
 
-    for (variant, name) in [(Variant::Light, "light"), (Variant::Dark, "dark")] {
+    for theme in catalog::THEMES {
+        let name = theme.id;
+        let appearance = Appearance::by_id(theme.id);
         for scale in [1.0_f32, 2.0] {
-            let pixels = render_frame(&device, &queue, variant, scale);
+            let pixels = render_frame(&device, &queue, &appearance, scale);
             let width = (WIDTH_POINTS as f32 * scale) as u32;
             let height = (HEIGHT_POINTS as f32 * scale) as u32;
             let file = out_dir.join(format!("gallery_{name}_{scale}x.png"));
@@ -317,6 +393,19 @@ fn run_headless(toolbar_volume: Option<&Path>) {
             println!("wrote {}", file.display());
         }
     }
+
+    match sheet_volume {
+        Some(volume) => sheet::photograph(&device, &queue, &out_dir, volume),
+        None => println!(
+            "
+SKIPPED the contact sheet: pass `--volume <level2-file>` to run it.
+             It is deliberately not runnable without one - the sheet exists so a theme
+             author can see their chrome around REAL echo, and a pane full of synthetic
+             colour would answer a question nobody asked."
+        ),
+    }
+
+    settings_shot::photograph(&device, &queue, &out_dir);
 
     match toolbar_volume {
         Some(volume) => toolbar::photograph(&device, &queue, &out_dir, volume),
@@ -333,17 +422,20 @@ fn run_headless(toolbar_volume: Option<&Path>) {
 fn render_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    variant: Variant,
+    appearance: &Appearance,
     scale: f32,
 ) -> Vec<u8> {
     let width_px = (WIDTH_POINTS as f32 * scale) as u32;
     let height_px = (HEIGHT_POINTS as f32 * scale) as u32;
 
     let ctx = egui::Context::default();
-    theme::apply(&ctx, variant);
+    theme::apply(&ctx, appearance);
+    // AFTER `apply`, which sets the zoom factor from the appearance's own
+    // scale axis: here the DEVICE scale is what is being photographed, so it
+    // is the one that wins.
     ctx.set_pixels_per_point(scale);
     let mut state = GalleryState {
-        variant,
+        appearance: *appearance,
         ..GalleryState::default()
     };
     // Three passes: the first applies the scale, the rest settle sizes. The
@@ -521,7 +613,391 @@ fn pollster_block<F: std::future::Future>(future: F) -> F::Output {
 }
 
 // ---------------------------------------------------------------------------
-// Windowed: the same gallery on a real display, with variant toggles.
+// The contact sheet: every registered theme, over real echo.
+// ---------------------------------------------------------------------------
+
+/// One labelled photograph per registered theme — plus, for the shipped
+/// default theme, every density, both chrome-edge modes and a raised
+/// interface scale — with a radar pane showing a REAL volume in each.
+///
+/// This is the tool a theme author uses. Register a theme in
+/// `src/theme/catalog.rs`, run this, and there is a picture of it on the
+/// bench next to every other theme, with the same widgets and the same echo
+/// underneath. No edit to this file is needed for a new theme to appear: the
+/// sheet iterates `theme::catalog::THEMES`.
+///
+/// The pane is the shipped raster path (`render2d::render_moment_image`) and
+/// the shipped colour bar (`legend::draw_legend`) over the volume named on
+/// the command line — not a fixture, not a gradient. What it deliberately
+/// does NOT draw is the basemap underlay, which is a live wgpu scene with
+/// network tiles behind it; the pane's ground here is the map's own dark
+/// ground, which is what an analyst sees under echo with no imagery
+/// selected. That distinction matters for reading these images: the chrome
+/// is the theme's, the pane is not, and a theme that only looks right
+/// because it tinted the data would be visible here as a data area that
+/// changed colour between sheets.
+mod sheet {
+    use std::path::Path;
+
+    use eframe::egui;
+    use eframe::egui_wgpu::{Renderer, RendererOptions};
+    use eframe::wgpu;
+    use radar_core::MomentType;
+    use render2d::RasterOptions;
+
+    use super::theme::{
+        self, Appearance, ChromeEdges, Density, ThemeSpec, UiScale, bevel, catalog,
+    };
+    use super::{GalleryState, TARGET_FORMAT, gallery_body, gallery_windows, render_clipped};
+
+    /// 1280 points wide. Every interface scale this application offers times
+    /// 1280 is a whole multiple of 64 pixels, so `bytes_per_row` is a
+    /// multiple of wgpu's 256-byte readback alignment at every one of them
+    /// and the read-back never needs row padding.
+    const WIDTH_POINTS: f32 = 1280.0;
+    const HEIGHT_POINTS: f32 = 1000.0;
+    /// The radar pane, in points. Square-ish and left of where the floating
+    /// window lands, so the sheet shows both without either covering the
+    /// other.
+    const PANE_POINTS: egui::Vec2 = egui::vec2(540.0, 500.0);
+    /// The sweep raster, in pixels. Rendered once and reused for every
+    /// sheet, so that the ECHO is identical across the sheet and a data
+    /// area that changed between two images means the chrome reached into
+    /// the data.
+    ///
+    /// The echo, and not the whole pane. Measured on this volume: the pane
+    /// crop left of the colour bar is byte-identical under all eight
+    /// themes, while the colour bar itself is identical only within a
+    /// GROUND — the four light-ground themes agree with each other, the
+    /// four dark-ground ones agree with each other, and the two groups
+    /// differ by a few hundred pixels on the glyph edges of the bar's
+    /// title, badge and tick labels. Nothing in `legend.rs` reads the
+    /// theme: those labels are drawn in constants. What differs is how
+    /// egui rasterises them — `Visuals::light()` converts glyph coverage to
+    /// alpha linearly and `Visuals::dark()` uses `2c - c²` (egui 0.34.3,
+    /// `AlphaFromCoverage`), because white-on-black and black-on-white text
+    /// want different curves. So compare colour bars by eye, not by md5.
+    const RASTER: RasterOptions = RasterOptions {
+        width: 900,
+        height: 900,
+        range_fraction: 94,
+    };
+
+    /// The real volume, prepared once: the raster, the shipped colour table
+    /// for the product, the colour bar's layout, and the identity line the
+    /// chrome puts under the pane.
+    struct Radar {
+        image: egui::ColorImage,
+        table: color_tables::ColorTable,
+        layout: crate::legend::LegendLayout,
+        identity: String,
+        badges: Vec<String>,
+    }
+
+    /// Photograph the whole sheet.
+    pub fn photograph(device: &wgpu::Device, queue: &wgpu::Queue, out_dir: &Path, volume: &Path) {
+        assert!(
+            volume.is_file(),
+            "--volume wants a real Level II file; {} is not one",
+            volume.display()
+        );
+        println!("\n=== the contact sheet, on {} ===", volume.display());
+        let radar = load(volume);
+        println!("  pane: {}", radar.identity);
+
+        // Every registered theme at the shipped axes, then the shipped
+        // theme across the axes. A theme author reads the first group; the
+        // second is what stops an axis from quietly breaking a theme.
+        let mut shots: Vec<(String, Appearance)> = catalog::THEMES
+            .iter()
+            .map(|theme| {
+                (
+                    name_of(&Appearance::by_id(theme.id)),
+                    Appearance::by_id(theme.id),
+                )
+            })
+            .collect();
+        let default = Appearance::default();
+        for density in Density::ALL {
+            for edges in ChromeEdges::ALL {
+                let appearance = Appearance {
+                    density,
+                    edges,
+                    ..default
+                };
+                let name = name_of(&appearance);
+                if !shots.iter().any(|(existing, _)| *existing == name) {
+                    shots.push((name, appearance));
+                }
+            }
+        }
+        let scaled = Appearance {
+            ui_scale: UiScale::Large,
+            ..default
+        };
+        shots.push((name_of(&scaled), scaled));
+
+        // Every registered theme is shot at BOTH device scales, because the
+        // one-physical-pixel promise is a claim about pixels and 1x cannot
+        // show whether a bevel survived as a hairline or smeared into grey.
+        // The axis sweep below it stays at 1x: those shots are about layout
+        // and spacing, which 2x re-photographs without adding anything.
+        let mut written = 0;
+        for (name, appearance) in &shots {
+            let registered = catalog::THEMES
+                .iter()
+                .any(|theme| name_of(&Appearance::by_id(theme.id)) == *name);
+            let scales: &[f32] = if registered { &[1.0, 2.0] } else { &[1.0] };
+            for &device_scale in scales {
+                let (width, height, pixels) =
+                    render(device, queue, &radar, appearance, device_scale);
+                let suffix = if device_scale == 1.0 { "" } else { "_2x" };
+                let file = out_dir.join(format!("sheet_{name}{suffix}.png"));
+                image::RgbaImage::from_raw(width, height, pixels)
+                    .expect("readback size matches the target")
+                    .save(&file)
+                    .expect("write PNG");
+                println!("  wrote {}", file.display());
+                written += 1;
+            }
+        }
+        println!(
+            "\n{written} sheets. They are the pre-flight, not the sign-off: a picture nobody \n\
+             has looked at proves nothing."
+        );
+    }
+
+    /// The file name of one shot: theme id first, then only the axes that
+    /// are not at their shipped value, so `sheet_light.png` is the shipped
+    /// look and anything longer says what was changed.
+    fn name_of(appearance: &Appearance) -> String {
+        let default = Appearance::default();
+        let mut name = appearance.theme.id.to_owned();
+        if appearance.accent != default.accent {
+            name.push('_');
+            name.push_str(appearance.accent.id());
+        }
+        if appearance.edges != default.edges {
+            name.push('_');
+            name.push_str(appearance.edges.id());
+        }
+        if appearance.density != default.density {
+            name.push('_');
+            name.push_str(appearance.density.id());
+        }
+        if appearance.ui_scale != default.ui_scale {
+            name.push_str("_scale");
+            name.push_str(&appearance.ui_scale.id().replace('.', ""));
+        }
+        name
+    }
+
+    /// Decode the volume and build everything the pane draws from it.
+    fn load(path: &Path) -> Radar {
+        let volume = nexrad_io::decode_volume_from_path(path)
+            .unwrap_or_else(|error| panic!("decode {}: {error}", path.display()));
+        let moment = MomentType::Reflectivity;
+        let cut = volume
+            .cuts
+            .iter()
+            .position(|cut| cut.moments.contains_key(&moment))
+            .unwrap_or_else(|| panic!("{} carries no reflectivity sweep", path.display()));
+        let raster = render2d::render_moment_image(&volume, cut, moment, RASTER)
+            .unwrap_or_else(|error| panic!("render {}: {error}", path.display()));
+        let (width, height) = raster.dimensions();
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            raster.as_raw(),
+        );
+
+        let product = crate::product::DisplayProduct::Reflectivity;
+        let tables = color_tables::ColorTableSet::default();
+        let table = crate::palettes::table_for(product.descriptor(), &tables);
+        let layout = crate::legend::legend_layout(&product.domain(), &table)
+            .expect("reflectivity has a colour ladder");
+        let identity = format!(
+            "{} · REF (dBZ) · {:.2}° · {}",
+            volume.site.id,
+            volume.cuts[cut].elevation_deg,
+            volume.volume_time.format("%Y-%m-%d %H:%M:%SZ")
+        );
+        let badges = vec![format!("cut {}/{}", cut + 1, volume.cuts.len())];
+        Radar {
+            image,
+            table,
+            layout,
+            identity,
+            badges,
+        }
+    }
+
+    /// One sheet, rendered offscreen. Returns `(width_px, height_px, rgba)`.
+    fn render(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        radar: &Radar,
+        appearance: &Appearance,
+        device_scale: f32,
+    ) -> (u32, u32, Vec<u8>) {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, appearance);
+        // The interface-scale axis IS a scale factor on the chrome, which is
+        // the only way to see what it actually does; `device_scale` is the
+        // separate question of how many physical pixels one point is worth.
+        // They multiply, and the product is what egui calls
+        // `pixels_per_point`, so it is set explicitly here - `apply` set the
+        // zoom from the axis alone and knows nothing about the panel.
+        let ppp = appearance.ui_scale.factor() * device_scale;
+        ctx.set_pixels_per_point(ppp);
+        let width_px = (WIDTH_POINTS * ppp) as u32;
+        let height_px = (HEIGHT_POINTS * ppp) as u32;
+
+        let texture = ctx.load_texture(
+            "sheet-radar",
+            radar.image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut state = GalleryState {
+            appearance: *appearance,
+            ..GalleryState::default()
+        };
+
+        // Four passes: the first carries the scale, the next settle the
+        // widths the layout reads from the previous pass, and the texture
+        // upload arrives in whichever delta first carried it. The deltas are
+        // accumulated across all of them — dropping the early ones leaves
+        // every mesh sampling a texture nobody uploaded, and the frame comes
+        // back black.
+        let mut textures = eframe::epaint::textures::TexturesDelta::default();
+        let mut last = None;
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(WIDTH_POINTS, HEIGHT_POINTS),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                theme::paint_root_ground(ui);
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        caption(ui, appearance);
+                        ui.add_space(6.0);
+                        gallery_body(ui, &mut state);
+                        ui.add_space(6.0);
+                        pane(ui, radar, &texture);
+                    });
+                gallery_windows(&ui.ctx().clone(), &mut state);
+            });
+            textures.append(std::mem::take(&mut output.textures_delta));
+            last = Some(output);
+        }
+        let output = last.expect("at least one pass ran");
+        assert_eq!(
+            output.pixels_per_point, ppp,
+            "the interface-scale axis times the device scale must be the scale in force"
+        );
+        let clipped = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(
+            !clipped.is_empty(),
+            "the sheet tessellated nothing; the photograph would be a lie"
+        );
+
+        let mut renderer = Renderer::new(device, TARGET_FORMAT, RendererOptions::PREDICTABLE);
+        for (id, delta) in &textures.set {
+            renderer.update_texture(device, queue, *id, delta);
+        }
+        let pixels = render_clipped(
+            device,
+            queue,
+            &mut renderer,
+            &clipped,
+            width_px,
+            height_px,
+            ppp,
+        );
+        for id in &textures.free {
+            renderer.free_texture(id);
+        }
+        (width_px, height_px, pixels)
+    }
+
+    /// The label strip: which theme this is, in the theme's own ink, and
+    /// exactly which axes it was photographed at. A sheet a reviewer cannot
+    /// identify from the image alone is a sheet that gets attributed to the
+    /// wrong branch.
+    fn caption(ui: &mut egui::Ui, appearance: &Appearance) {
+        let spec: &ThemeSpec = appearance.theme;
+        bevel::raised_frame(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(spec.id);
+                    bevel::etched_separator(ui);
+                    ui.label(spec.label);
+                });
+                ui.label(egui::RichText::new(spec.description).weak());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "accent {} · edges {} · density {} · scale {}",
+                        appearance.accent.id(),
+                        appearance.edges.id(),
+                        appearance.density.id(),
+                        appearance.ui_scale.id(),
+                    ))
+                    .weak(),
+                );
+            });
+        });
+    }
+
+    /// The radar pane: a real sweep on the map's ground, the shipped colour
+    /// bar over it, and the theme's own sunken edge around it — then the
+    /// volume's identity in a chrome readout underneath, so the picture says
+    /// what it is a picture of.
+    fn pane(ui: &mut egui::Ui, radar: &Radar, texture: &egui::TextureHandle) {
+        let chrome = theme::chrome(ui);
+        ui.vertical(|ui| {
+            let (rect, _) = ui.allocate_exact_size(PANE_POINTS, egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter().with_clip_rect(rect);
+                // The pane's ground is the MAP's, not the theme's: this is
+                // what an analyst sees under echo with no imagery selected,
+                // and it must not change when the chrome does.
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(11, 15, 20));
+                let side = rect.width().min(rect.height());
+                let image_rect =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                crate::legend::draw_legend(
+                    &painter,
+                    rect,
+                    &radar.layout,
+                    &radar.table,
+                    "REF (dBZ)",
+                    &radar.badges,
+                );
+                bevel::paint_bevel(
+                    &painter,
+                    rect,
+                    bevel::Bevel::Sunken,
+                    &chrome.palette,
+                    chrome.edges,
+                );
+            }
+            bevel::sunken_readout(ui, PANE_POINTS.x, PANE_POINTS.x, radar.identity.as_str());
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windowed: the same gallery on a real display, one toggle per theme.
 // ---------------------------------------------------------------------------
 
 struct GalleryApp {
@@ -536,14 +1012,11 @@ impl eframe::App for GalleryApp {
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (variant, label) in [
-                        (Variant::Dark, "Night bench"),
-                        (Variant::Light, "Daylight bench"),
-                    ] {
-                        if bevel::toolbar_toggle(ui, self.state.variant == variant, label).clicked()
-                        {
-                            self.state.variant = variant;
-                            theme::apply(ui.ctx(), variant);
+                    for theme in catalog::THEMES {
+                        let selected = self.state.appearance.theme.id == theme.id;
+                        if bevel::toolbar_toggle(ui, selected, theme.label).clicked() {
+                            self.state.appearance.theme = theme;
+                            theme::apply(ui.ctx(), &self.state.appearance);
                         }
                     }
                 });
@@ -565,7 +1038,7 @@ fn run_window() {
         options,
         Box::new(|creation_context| {
             let state = GalleryState::default();
-            theme::apply(&creation_context.egui_ctx, state.variant);
+            theme::apply(&creation_context.egui_ctx, &state.appearance);
             Ok(Box::new(GalleryApp { state }))
         }),
     )
@@ -596,7 +1069,7 @@ mod toolbar {
     use eframe::wgpu;
 
     use super::theme::palette::Palette;
-    use super::theme::{self, Variant};
+    use super::theme::{self, Appearance, ThemeSpec, catalog};
     use super::{TARGET_FORMAT, app, render_clipped};
 
     /// 1408 points wide: the shipped window opens at 1500 and the bar spans
@@ -671,7 +1144,7 @@ mod toolbar {
         println!("\n=== the real toolbar, on {} ===", volume.display());
 
         let ctx = egui::Context::default();
-        theme::apply(&ctx, Variant::Light);
+        theme::apply(&ctx, &Appearance::default());
         let mut renderer = Renderer::new(device, TARGET_FORMAT, RendererOptions::PREDICTABLE);
         let mut app = build(&ctx, out_dir, volume);
 
@@ -682,18 +1155,37 @@ mod toolbar {
              photographing placeholder text, which is not evidence about anything"
         );
 
+        // Every state the measured loop will ask for, run once and thrown
+        // away, so that no theme is photographed while the context is still
+        // reaching steady state. One context serves every theme here (see
+        // `assert_the_capture_does_not_depend_on_the_running_order`), and a
+        // context has first-time work in it: the font atlas grows as glyphs
+        // are rasterized, and each device scale rasterizes its own set.
+        // Without this, whichever theme happened to be listed first paid for
+        // that growth and came out a hair different from the rest - which
+        // made every PNG here depend on how many themes were registered
+        // ahead of it.
+        warm_up(&ctx, device, queue, &mut renderer, &mut app);
+
         let mut failures = Vec::new();
-        for (variant, name) in [(Variant::Light, "light"), (Variant::Dark, "dark")] {
-            theme::apply(&ctx, variant);
-            let palette = Palette::of(variant);
+        // The resting frame of the reference theme, kept from whenever the
+        // loop reaches it, and re-shot once the loop is done. See
+        // `assert_the_capture_does_not_depend_on_the_running_order` below for
+        // what this is guarding against and why it is worth the extra frames.
+        let mut reference: HashMap<u32, Vec<u8>> = HashMap::new();
+        for theme in catalog::THEMES {
+            let name = theme.id;
+            let appearance = Appearance::by_id(theme.id);
+            theme::apply(&ctx, &appearance);
+            let palette = appearance.palette();
             check_the_app_grounds_itself(
                 &ctx,
                 device,
                 queue,
                 &mut renderer,
                 &mut app,
-                variant,
-                palette,
+                theme,
+                &palette,
             );
             for scale in [1.0_f32, 2.0] {
                 ctx.set_pixels_per_point(scale);
@@ -733,12 +1225,24 @@ mod toolbar {
                     // frame, which is bare only while nothing is dropped into
                     // it; the three closed states prove the ground already.
                     if pointer != Pointer::Menu {
-                        check_the_ground_is_painted(&pixels, width_px, height_px, palette);
+                        check_the_ground_is_painted(&pixels, width_px, height_px, &palette);
                     }
-                    failures.extend(audit(&runs, &pixels, width_px, height_px, scale, palette));
+                    if theme.id == catalog::DEFAULT.id && pointer == Pointer::Rest {
+                        reference.insert(scale.to_bits(), pixels.clone());
+                    }
+                    failures.extend(audit(&runs, &pixels, width_px, height_px, scale, &palette));
                 }
             }
         }
+
+        assert_the_capture_does_not_depend_on_the_running_order(
+            &ctx,
+            device,
+            queue,
+            &mut renderer,
+            &mut app,
+            &reference,
+        );
 
         assert!(
             failures.is_empty(),
@@ -750,6 +1254,165 @@ mod toolbar {
              the ground its pixels actually landed on, in both variants, at 1x and 2x, at rest, \
              hovered and pressed.\nThe PNGs above are the pre-flight. A human has still not \
              looked at them; until one has, nothing here is signed off."
+        );
+    }
+
+    /// One theme's full capture sequence - every scale, every pointer state,
+    /// in the order the measured loop walks them - returning the resting
+    /// frame at each scale.
+    ///
+    /// The measured loop does exactly this. Sharing the sequence is the
+    /// point: a frame is only comparable with another frame that had the
+    /// same run-up, because the pointer state, the open menu and the scale
+    /// change immediately before it all leave marks in the context.
+    fn capture_sequence(
+        ctx: &egui::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        app: &mut app::WorkstationApp,
+        appearance: &Appearance,
+    ) -> HashMap<u32, Vec<u8>> {
+        theme::apply(ctx, appearance);
+        let mut resting = HashMap::new();
+        for scale in [1.0_f32, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            let mut targets = Targets::default();
+            for pointer in Pointer::ALL {
+                let (runs, pixels) =
+                    frame(ctx, device, queue, renderer, app, scale, pointer, targets);
+                if pointer == Pointer::Rest {
+                    targets = Targets {
+                        hover: centre_of(&runs, "+ Tilt"),
+                        press: centre_of(&runs, "− Tilt"),
+                        menu: centre_of(&runs, "File"),
+                    };
+                    resting.insert(scale.to_bits(), pixels);
+                }
+            }
+        }
+        resting
+    }
+
+    /// Drive the whole sequence once, discarding the frames, to take the
+    /// context's first-time work out of the measured captures.
+    ///
+    /// Cheap (a dozen frames of an already-loaded bar) and it removes the
+    /// one asymmetry the running order would otherwise impose: whichever
+    /// theme is listed first would pay for the font atlas growing to hold
+    /// each device scale's glyphs, and come out a hair different from the
+    /// seven behind it.
+    fn warm_up(
+        ctx: &egui::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        app: &mut app::WorkstationApp,
+    ) {
+        let appearance = Appearance::by_id(catalog::DEFAULT.id);
+        let _ = capture_sequence(ctx, device, queue, renderer, app, &appearance);
+    }
+
+    /// Replay the reference theme's whole capture sequence at the end of the
+    /// run and measure how far the resting frame moved.
+    ///
+    /// # What this is for, and what it is NOT
+    ///
+    /// Every theme in this proof is photographed through ONE
+    /// `egui::Context` and one `Renderer`, deliberately: the point is the
+    /// application's real bar, and rebuilding the app per theme would cost a
+    /// volume load each time. Shared mutable state comes with that - a font
+    /// atlas that grows as glyphs are rasterized, per-widget layout memory,
+    /// animation clocks.
+    ///
+    /// The measured result, on this bar: **these frames are reproducible to
+    /// within a few pixels of one part in 255, and no closer.** Replaying the
+    /// identical sequence - same theme, same scales, same pointer states, same
+    /// order - inside a single run still moves a handful of pixels on glyph
+    /// edges. A warm-up pass does not remove it. So the drift is not
+    /// first-time atlas growth, and it is not something a caller can tune
+    /// away; it is the rasteriser landing a subpixel differently.
+    ///
+    /// The consequence is worth stating plainly, because it is easy to get
+    /// backwards: **the PNGs this module writes must not be compared by
+    /// checksum.** Two builds whose bars are identical in every colour will
+    /// still produce different md5s here. When the eight-theme catalog was
+    /// merged, the shipped dark bar's md5 changed and the shipped light
+    /// bar's did not; that difference was three pixels of ±1/255 on glyph
+    /// edges and meant nothing about either palette. The artifact that IS
+    /// byte-comparable is the sample panel from `render_frame`, which builds
+    /// a fresh context per image - that one is identical across builds, and
+    /// it is what a "did this theme change?" question should be settled
+    /// with.
+    ///
+    /// What this check still buys: a ceiling. A step bigger than 1/255, or
+    /// more than a rounding-sized scatter of moved pixels, is a colour or a
+    /// layout that actually moved, and that fails here rather than being
+    /// waved through as more of the same noise.
+    fn assert_the_capture_does_not_depend_on_the_running_order(
+        ctx: &egui::Context,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        app: &mut app::WorkstationApp,
+        reference: &HashMap<u32, Vec<u8>>,
+    ) {
+        let appearance = Appearance::by_id(catalog::DEFAULT.id);
+        let again = capture_sequence(ctx, device, queue, renderer, app, &appearance);
+        for scale in [1.0_f32, 2.0] {
+            let Some(first) = reference.get(&scale.to_bits()) else {
+                panic!(
+                    "the reference theme {} was never photographed at {scale}x",
+                    catalog::DEFAULT.id
+                );
+            };
+            let second = again
+                .get(&scale.to_bits())
+                .expect("the replay shoots the same scales");
+            let moved = first
+                .chunks_exact(4)
+                .zip(second.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            let worst = first
+                .iter()
+                .zip(second.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            let total = first.len() / 4;
+            println!(
+                "  {} at {scale}x: {moved} of {total} pixels moved on replay, worst \
+                 channel step {worst}/255",
+                catalog::DEFAULT.id
+            );
+            // One part in 255 on a glyph edge is the rasteriser rounding, and
+            // it is what this capture is reproducible to - see the doc above.
+            // Anything BIGGER than that is a colour or a layout that actually
+            // moved, and no amount of it is acceptable.
+            assert!(
+                worst <= 1,
+                "the resting {} bar at {scale}x changed by {worst}/255 on replay. That is \
+                 past antialiasing: a colour or a position moved inside a single run, so \
+                 these frames are not evidence about any theme",
+                catalog::DEFAULT.id
+            );
+            // And it must stay rounding-sized. A frame where a percent of the
+            // pixels moved is a frame where something re-laid out, even if
+            // every step was small.
+            let fraction = moved as f64 / total as f64;
+            assert!(
+                fraction <= 0.0005,
+                "the resting {} bar at {scale}x moved on {moved} of {total} pixels \
+                 ({:.4}%) on replay. Too many to be glyph edges - something in the bar \
+                 is not settling",
+                catalog::DEFAULT.id,
+                fraction * 100.0
+            );
+        }
+        println!(
+            "  (so: compare these bars by eye and by the audit above, never by md5 - \
+             the byte-comparable artifact is the sample panel, not this one.)"
         );
     }
 
@@ -1320,25 +1983,45 @@ mod toolbar {
         queue: &wgpu::Queue,
         renderer: &mut Renderer,
         app: &mut app::WorkstationApp,
-        variant: Variant,
+        theme_spec: &ThemeSpec,
         palette: &Palette,
     ) {
+        let theme_id = theme_spec.id;
         let screen = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(PUMP_POINTS.0, PUMP_POINTS.1),
         );
         let mut eframe_frame = eframe::Frame::_new_kittest();
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ui| <app::WorkstationApp as eframe::App>::ui(app, ui, &mut eframe_frame),
+        // This check owns its own viewport rather than inheriting the last
+        // capture's. `paint_root_ground` unions the root `Ui`'s extent with
+        // `Context::content_rect`, and that content rect is whatever the
+        // PREVIOUS pass left behind — after the 2× frames above it is a
+        // doubled, differently-shaped rect that no longer covers this
+        // window. Reading a shape list against a viewport the context is
+        // still half-way out of measures the harness, not the application.
+        // So: the scale is stated, and the first pass is a settling pass
+        // whose only job is to make the second one honest.
+        ctx.set_pixels_per_point(1.0);
+        let mut output = None;
+        for _ in 0..2 {
+            let mut pass = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| <app::WorkstationApp as eframe::App>::ui(app, ui, &mut eframe_frame),
+            );
+            // Whatever these passes grew the atlas by belongs to the renderer
+            // the photographs use; dropping it would leave them sampling a
+            // texture nobody uploaded.
+            upload(device, queue, renderer, &mut pass.textures_delta);
+            output = Some(pass);
+        }
+        let output = output.expect("at least one pass ran");
+        assert_eq!(
+            output.pixels_per_point, 1.0,
+            "{theme_id}: the stated scale is not the scale in force"
         );
-        // Whatever this pass grew the atlas by belongs to the renderer the
-        // photographs use; dropping it would leave them sampling a texture
-        // nobody uploaded.
-        upload(device, queue, renderer, &mut output.textures_delta);
 
         // Index rather than identity: the property that makes the chrome
         // legible is "a face rect covers the viewport AND is painted before
@@ -1352,11 +2035,24 @@ mod toolbar {
                     if rect.fill == palette.face && rect.rect.contains_rect(screen))
             })
             .unwrap_or_else(|| {
+                let biggest = output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped| match &clipped.shape {
+                        egui::Shape::Rect(rect) => Some(rect),
+                        _ => None,
+                    })
+                    .max_by(|a, b| {
+                        (a.rect.width() * a.rect.height())
+                            .total_cmp(&(b.rect.width() * b.rect.height()))
+                    })
+                    .map(|rect| format!("{} over {:?}", hex(rect.fill), rect.rect))
+                    .unwrap_or_else(|| "no rect at all".to_owned());
                 panic!(
-                    "{variant:?}: the real `App::ui` painted no {} rect over the whole viewport \
-                     - the application is back on eframe's near-black ground and every bare \
-                     label on the bar is invisible again",
-                    hex(palette.face)
+                    "{theme_id}: the real `App::ui` painted no {} rect over the whole viewport \
+                     {screen:?} at {} ppp - the biggest rect it did paint is {biggest}",
+                    hex(palette.face),
+                    output.pixels_per_point,
                 )
             });
         if let Some(first_text) = output
@@ -1366,7 +2062,7 @@ mod toolbar {
         {
             assert!(
                 ground < first_text,
-                "{variant:?}: the ground is painted at shape {ground}, after the first text run \
+                "{theme_id}: the ground is painted at shape {ground}, after the first text run \
                  at {first_text} - it would cover the chrome instead of backing it"
             );
         }
@@ -1376,16 +2072,404 @@ mod toolbar {
         assert_eq!(
             clear,
             palette.face.to_opaque().to_normalized_gamma_f32(),
-            "{variant:?}: App::clear_color would tear a seam against the painted ground"
+            "{theme_id}: App::clear_color would tear a seam against the painted ground"
         );
         assert!(
             (clear[3] - 1.0).abs() < 1e-6,
-            "{variant:?}: a translucent clear colour lets the desktop through"
+            "{theme_id}: a translucent clear colour lets the desktop through"
         );
         println!(
             "\nthe real App::ui paints {} over the whole viewport (shape {ground}) and \
-             App::clear_color returns it - {variant:?}",
+             App::clear_color returns it - {theme_id}",
             hex(palette.face)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The settings window, photographed.
+// ---------------------------------------------------------------------------
+
+/// The real Settings window, wearing each registered theme.
+///
+/// This is the densest chrome the application draws — a category list, a
+/// search strip, rows of combos, sliders, checkboxes and text fields, help
+/// paragraphs in weak ink, a status footer — and until now nothing
+/// photographed it. Every theme author who wanted to see their palette on it
+/// wrote a throwaway harness and deleted it again rather than edit a shared
+/// example while other branches were open. That is a gap in the proof kit,
+/// not a preference: weak help text on a busy page is exactly where a
+/// palette's secondary ink fails first, and the contact sheet's sample panel
+/// has no equivalent of it.
+///
+/// It is drawn through `settings_ui::draw_settings_window`, the shipped
+/// function, on a settings store of this run's own so no saved values can
+/// change what the picture shows.
+mod settings_shot {
+    use std::path::Path;
+
+    use eframe::egui;
+    use eframe::egui_wgpu::{Renderer, RendererOptions};
+    use eframe::wgpu;
+
+    use super::theme::{self, Appearance, Density, ThemeSpec, UiScale, catalog};
+    use super::{TARGET_FORMAT, render_clipped, settings_ui};
+
+    /// The bench display, in points: room for the window at its default size
+    /// plus its shadow.
+    const BENCH: egui::Vec2 = egui::vec2(1024.0, 768.0);
+
+    /// The narrowest display the settings page supports, in points.
+    ///
+    /// `draw_settings_window` sizes the window to
+    /// `(screen.width() - 24).clamp(280, 940)`, so 304 points is the last
+    /// display that still produces the 280-point floor — the phone-width
+    /// case the module promises to survive (mobile is a standing
+    /// requirement), and the hardest test there is of a list that has to
+    /// wrap rather than run off the edge.
+    const NARROWEST: egui::Vec2 = egui::vec2(304.0, 720.0);
+
+    /// What the pointer is doing when the shutter opens.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Pointer {
+        /// Away from the window: the page as it sits.
+        Away,
+        /// On the theme combo, which has dropped its list open.
+        OnTheThemeCombo,
+        /// Resting on a list row that is NOT the theme in force.
+        ///
+        /// That row is painted on a third ground — neither the menu's own
+        /// face nor the selection fill — and it is the state an analyst is
+        /// in for the whole time they are reading the list.
+        OnAnUnselectedRow,
+    }
+
+    /// One photograph of the window.
+    struct Shot {
+        /// What follows the theme id in the file name.
+        suffix: &'static str,
+        appearance: Appearance,
+        /// The display, in points. The window sizes itself from this.
+        screen: egui::Vec2,
+        /// Physical pixels per point: the interface-scale axis times the
+        /// device scale, which is what egui calls `pixels_per_point`.
+        pixels_per_point: f32,
+        pointer: Pointer,
+    }
+
+    /// Every shot taken of one theme.
+    ///
+    /// The first four are the window as it ships, at both device scales,
+    /// shut and open. The rest are the states that broke it: a hovered row,
+    /// a raised interface scale, the narrowest display and the tightest
+    /// density. A described row has to stay inside the display in all of
+    /// them, which is a claim about layout and therefore a claim only a
+    /// photograph can settle.
+    fn shots(theme: &'static ThemeSpec) -> Vec<Shot> {
+        let bench = Appearance::by_id(theme.id);
+        vec![
+            Shot {
+                suffix: "",
+                appearance: bench,
+                screen: BENCH,
+                pixels_per_point: 1.0,
+                pointer: Pointer::Away,
+            },
+            Shot {
+                suffix: "_2x",
+                appearance: bench,
+                screen: BENCH,
+                pixels_per_point: 2.0,
+                pointer: Pointer::Away,
+            },
+            Shot {
+                suffix: "_themelist",
+                appearance: bench,
+                screen: BENCH,
+                pixels_per_point: 1.0,
+                pointer: Pointer::OnTheThemeCombo,
+            },
+            Shot {
+                suffix: "_themelist_2x",
+                appearance: bench,
+                screen: BENCH,
+                pixels_per_point: 2.0,
+                pointer: Pointer::OnTheThemeCombo,
+            },
+            Shot {
+                suffix: "_themelist_hover",
+                appearance: bench,
+                screen: BENCH,
+                pixels_per_point: 1.0,
+                pointer: Pointer::OnAnUnselectedRow,
+            },
+            Shot {
+                suffix: "_themelist_scale160",
+                appearance: Appearance {
+                    ui_scale: UiScale::Huge,
+                    ..bench
+                },
+                // The same 1024×768 panel of pixels, which at 160 % is a
+                // display of 640×480 POINTS: the axis buys bigger type by
+                // leaving less room, and less room is the whole question
+                // here.
+                screen: BENCH / UiScale::Huge.factor(),
+                pixels_per_point: UiScale::Huge.factor(),
+                pointer: Pointer::OnTheThemeCombo,
+            },
+            Shot {
+                suffix: "_themelist_narrow",
+                appearance: bench,
+                screen: NARROWEST,
+                pixels_per_point: 1.0,
+                pointer: Pointer::OnTheThemeCombo,
+            },
+            Shot {
+                suffix: "_themelist_dense",
+                appearance: Appearance {
+                    density: Density::Dense,
+                    ..bench
+                },
+                screen: BENCH,
+                pixels_per_point: 1.0,
+                pointer: Pointer::OnTheThemeCombo,
+            },
+        ]
+    }
+
+    pub fn photograph(device: &wgpu::Device, queue: &wgpu::Queue, out_dir: &Path) {
+        println!("\n=== the settings window, per theme ===");
+        for theme in catalog::THEMES {
+            for shot in shots(theme) {
+                let (width, height, pixels) = render(device, queue, &shot, out_dir);
+                let file = out_dir.join(format!("settings_{}{}.png", theme.id, shot.suffix));
+                image::RgbaImage::from_raw(width, height, pixels)
+                    .expect("readback size matches the target")
+                    .save(&file)
+                    .expect("write PNG");
+                println!("  wrote {}", file.display());
+            }
+        }
+    }
+
+    /// The capture width in pixels: the display rounded UP to a whole 64.
+    ///
+    /// `render_clipped` reads the frame back with `bytes_per_row = width *
+    /// 4`, and wgpu requires that to be a multiple of 256 — so the width in
+    /// PIXELS has to be a multiple of 64 at every scale. Rounding up, rather
+    /// than demanding a display size that happens to divide, is what lets a
+    /// shot ask for the geometry it needs (304 points, the narrowest window
+    /// the page supports) instead of the nearest tidy number.
+    fn capture_width(points: f32, pixels_per_point: f32) -> u32 {
+        let pixels = (points * pixels_per_point).ceil() as u32;
+        pixels.div_ceil(64) * 64
+    }
+
+    /// The row a hover shot rests the pointer on: a registered theme that is
+    /// NOT the one in force, and among those the one with the longest
+    /// description — so the same photograph answers the wrap question as
+    /// well as the contrast one.
+    fn unselected_row(current: &ThemeSpec) -> &'static ThemeSpec {
+        catalog::THEMES
+            .iter()
+            .copied()
+            .filter(|theme| theme.id != current.id)
+            .max_by_key(|theme| theme.description.len())
+            .expect("the catalog registers more than one theme")
+    }
+
+    /// The centre of the first text run whose text satisfies `matches`, in
+    /// points.
+    ///
+    /// Read off the frame the window actually emitted rather than guessed
+    /// from the layout, so the pointer lands on the control wherever the
+    /// theme's own metrics put it. A described list row is ONE galley
+    /// holding the label, a newline and the description, which is why this
+    /// takes a predicate rather than a string to compare.
+    fn centre_of(
+        shapes: &[eframe::epaint::ClippedShape],
+        matches: &dyn Fn(&str) -> bool,
+    ) -> Option<egui::Pos2> {
+        fn walk(
+            shape: &egui::Shape,
+            matches: &dyn Fn(&str) -> bool,
+            found: &mut Option<egui::Pos2>,
+        ) {
+            if found.is_some() {
+                return;
+            }
+            match shape {
+                egui::Shape::Text(run) if matches(run.galley.text()) => {
+                    *found = Some(run.galley.rect.translate(run.pos.to_vec2()).center());
+                }
+                egui::Shape::Vec(inner) => {
+                    for shape in inner {
+                        walk(shape, matches, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = None;
+        for clipped in shapes {
+            walk(&clipped.shape, matches, &mut found);
+        }
+        found
+    }
+
+    fn render(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        shot: &Shot,
+        out_dir: &Path,
+    ) -> (u32, u32, Vec<u8>) {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &shot.appearance);
+        // `apply` set the zoom from the interface-scale axis alone, and
+        // `Context::set_pixels_per_point` REPLACES that zoom rather than
+        // multiplying it, so the product of the axis and the device scale is
+        // what has to go in here.
+        ctx.set_pixels_per_point(shot.pixels_per_point);
+        let width_px = capture_width(shot.screen.x, shot.pixels_per_point);
+        let height_px = (shot.screen.y * shot.pixels_per_point).round() as u32;
+
+        // A store of this run's own. The window shows stored values, so a
+        // leftover file would put an earlier run's choices in the picture.
+        let settings_file = out_dir.join("settings-shot-settings.json");
+        let _ = std::fs::remove_file(&settings_file);
+        let mut store = settings::SettingsStore::open(&settings_file);
+        // The page shows STORED values, so the theme it reports has to be
+        // the theme it is drawn in - otherwise every shot claims the
+        // analyst is running the default while wearing something else.
+        store.set(
+            theme::settings::keys::CATEGORY,
+            theme::settings::keys::THEME,
+            settings::SettingValue::Text(shot.appearance.theme.id.to_owned()),
+        );
+        let registry = settings_ui::full_registry(theme::settings::settings_category());
+        let mut state = settings_ui::SettingsUi::default();
+        state.open_category(theme::settings::keys::CATEGORY);
+
+        let mut textures = eframe::epaint::textures::TexturesDelta::default();
+        let mut last: Option<egui::FullOutput> = None;
+        let screen = shot.screen;
+        let pass = |ctx: &egui::Context,
+                    state: &mut settings_ui::SettingsUi,
+                    store: &mut settings::SettingsStore,
+                    events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                // A quarter-second per pass: egui drives the popup's fade off
+                // `predicted_dt`, and at the default sixtieth of a second a
+                // menu photographed two passes after it opened is still
+                // part-way through appearing.
+                predicted_dt: 0.25,
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                theme::paint_root_ground(ui);
+                let _ = settings_ui::draw_settings_window(
+                    ui.ctx(),
+                    state,
+                    settings_ui::SettingsWindowInput {
+                        registry: &registry,
+                        store,
+                        color_tables: None,
+                        user_tables: None,
+                    },
+                );
+            })
+        };
+        // Four passes: the first carries the scale, the rest settle the
+        // widths the layout reads back from the previous pass. Deltas are
+        // accumulated across all of them - the font atlas arrives with the
+        // first, and dropping it leaves every mesh sampling a texture nobody
+        // uploaded.
+        for _ in 0..4 {
+            let mut output = pass(&ctx, &mut state, &mut store, Vec::new());
+            textures.append(std::mem::take(&mut output.textures_delta));
+            last = Some(output);
+        }
+        if shot.pointer != Pointer::Away {
+            let settled = last.as_ref().expect("at least one pass ran");
+            let label = shot.appearance.theme.label;
+            let at =
+                centre_of(&settled.shapes, &|text| text.trim() == label).unwrap_or_else(|| {
+                    panic!("the settings page never drew the theme combo's selected text {label:?}")
+                });
+            let click = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            for index in 0..4 {
+                let events = if index == 0 {
+                    click.clone()
+                } else {
+                    Vec::new()
+                };
+                let mut output = pass(&ctx, &mut state, &mut store, events);
+                textures.append(std::mem::take(&mut output.textures_delta));
+                last = Some(output);
+            }
+        }
+        if shot.pointer == Pointer::OnAnUnselectedRow {
+            let target = unselected_row(shot.appearance.theme);
+            let settled = last.as_ref().expect("at least one pass ran");
+            let at = centre_of(&settled.shapes, &|text| {
+                text.starts_with(target.label) && text.contains('\n')
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the dropped list never drew a described row for {:?}",
+                    target.label
+                )
+            });
+            for index in 0..3 {
+                let events = if index == 0 {
+                    vec![egui::Event::PointerMoved(at)]
+                } else {
+                    Vec::new()
+                };
+                let mut output = pass(&ctx, &mut state, &mut store, events);
+                textures.append(std::mem::take(&mut output.textures_delta));
+                last = Some(output);
+            }
+        }
+        let output = last.expect("at least one pass ran");
+        let clipped = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(
+            !clipped.is_empty(),
+            "the settings window tessellated nothing; the photograph would be a lie"
+        );
+
+        let mut renderer = Renderer::new(device, TARGET_FORMAT, RendererOptions::PREDICTABLE);
+        for (id, delta) in &textures.set {
+            renderer.update_texture(device, queue, *id, delta);
+        }
+        let pixels = render_clipped(
+            device,
+            queue,
+            &mut renderer,
+            &clipped,
+            width_px,
+            height_px,
+            shot.pixels_per_point,
+        );
+        for id in &textures.free {
+            renderer.free_texture(id);
+        }
+        (width_px, height_px, pixels)
     }
 }

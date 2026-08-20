@@ -1,8 +1,27 @@
-//! NEXRAD Archive II / Level II decoder entry points.
+//! NEXRAD Archive II / Level II decoder entry points, plus the magic-byte
+//! seam that routes a buffer of unknown provenance to the decoder that owns
+//! its container format.
 //!
-//! This first slice focuses on the modern Message Type 31 radial format and
-//! keeps unsupported records non-fatal so an app can inspect partially decoded
+//! Two radial message types are decoded: the modern generic Message Type 31
+//! (1 or 0.5 degree azimuth, up to ten moments) and the legacy Message Type 1
+//! that pre-2008 volumes are written in (REF/VEL/SW only, fixed resolutions).
+//! Unsupported records stay non-fatal so an app can inspect partially decoded
 //! volumes while the edge-case corpus grows.
+//!
+//! Message layouts follow the NEXRAD RDA/RPG Interface Control Document
+//! ICD 2620002 (Message Type 1: "Digital Radar Data"; Message Type 31:
+//! "Digital Radar Data Generic Format"). Container magic numbers for the
+//! non-NEXRAD formats are cited on [`SupportedVolumeFormat`].
+
+// One module per container format this crate can read. The Archive II /
+// Level II decoder itself lives in this file; everything else is sniffed by
+// [`sniff_supported_volume_format`] and routed to one of these.
+pub mod cfradial;
+pub mod dorade;
+pub mod hdf5lite;
+pub mod mobile_archive;
+pub mod netcdf3;
+pub mod odim;
 
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -24,6 +43,7 @@ const VOLUME_HEADER_LEN: usize = 24;
 const CONTROL_WORD_LEN: usize = 12;
 const MESSAGE_HEADER_LEN: usize = 16;
 const RECORD_BYTES: usize = 2432;
+const MSG_1_HEADER_LEN: usize = 100;
 const MSG_31_HEADER_LEN: usize = 72;
 const GENERIC_DATA_BLOCK_LEN: usize = 28;
 const VOLUME_CONSTANT_BLOCK_LEN: usize = 44;
@@ -62,6 +82,21 @@ pub enum NexradError {
     InvalidMessage { offset: usize, reason: String },
     #[error("moment grid error: {0}")]
     MomentGrid(#[from] radar_core::MomentGridError),
+    /// A recognised non-NEXRAD container whose own decoder rejected the
+    /// bytes.
+    ///
+    /// The container name is kept in front of the decoder's complaint
+    /// because the first useful question about a failed load is what the
+    /// file was taken to be: an unreadable ODIM_H5 volume should not read
+    /// like a broken Archive II one. The Archive II arm is deliberately NOT
+    /// wrapped - it is the fallthrough for bytes nothing recognised, and its
+    /// messages are the existing, familiar error surface.
+    #[error("{format}: {source}")]
+    Format {
+        format: &'static str,
+        #[source]
+        source: Box<NexradError>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +115,308 @@ impl ArchiveCompression {
             Self::Bzip2Blocks => "bzip2-blocks",
             Self::Uncompressed => "uncompressed",
         }
+    }
+}
+
+/// A single-buffer radar container this workspace knows how to identify.
+///
+/// Identification and decoding are deliberately separate: the sniff is the
+/// shared routing contract used by local file open, drag-and-drop and URL
+/// polling, and a caller can ask what a file is without paying to decode it.
+/// Every variant is decodable - [`decode_supported_volumes_bytes`] hands
+/// each one to the module that owns it - and a decoder's failure is wrapped
+/// in a [`NexradError::Format`] that still names the container.
+///
+/// Magic numbers, in the order the sniff tests them:
+///
+/// * [`Self::MobileDeploymentZip`] — `PK\x03\x04`, the ZIP local file header
+///   (PKWARE .ZIP File Format Specification, section 4.3.7). Mobile
+///   deployments ship a scan as a zipped bundle of sweepfiles.
+/// * [`Self::OdimH5`] — `\x89HDF\r\n\x1a\n`, the HDF5 superblock signature
+///   (HDF5 File Format Specification, "Level 0A - Format Signature").
+///   Decoded as ODIM_H5 PVOL/SCAN per the EUMETNET OPERA Data Information
+///   Model for HDF5.
+/// * [`Self::CfRadial1`] — `CDF\x01` / `CDF\x02`, classic netCDF (NetCDF
+///   Classic Format Specification), decoded per the NCAR CfRadial 1.x
+///   convention.
+/// * [`Self::Dorade`] — a leading `COMM`/`SSWB`/`VOLD`/`RADD` descriptor
+///   name followed by a block length that is valid in at least one byte
+///   order (NCAR/EOL DORADE sweepfile format). DORADE has no file-level
+///   magic, so the length check is what keeps the four ASCII names from
+///   matching arbitrary text.
+/// * [`Self::NexradLevel2`] — `AR2V` or `ARCHIVE2` tape identifiers
+///   (ICD 2620002 Archive II volume header), or a whole-file `\x1f\x8b`
+///   gzip / `BZh` bzip2 wrapper around one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupportedVolumeFormat {
+    NexradLevel2,
+    OdimH5,
+    Dorade,
+    CfRadial1,
+    MobileDeploymentZip,
+}
+
+impl SupportedVolumeFormat {
+    /// Human-readable format name, used in error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NexradLevel2 => "NEXRAD Archive II",
+            Self::OdimH5 => "ODIM_H5",
+            Self::Dorade => "DORADE",
+            Self::CfRadial1 => "CfRadial 1.x",
+            Self::MobileDeploymentZip => "mobile deployment zip",
+        }
+    }
+}
+
+/// The four ASCII descriptor names a DORADE sweepfile may open with.
+const DORADE_LEAD_DESCRIPTORS: [&[u8; 4]; 4] = [b"COMM", b"SSWB", b"VOLD", b"RADD"];
+/// Name plus 4-byte length: the fixed part of a DORADE descriptor block.
+const DORADE_BLOCK_HEADER_LEN: usize = 8;
+
+/// Identify a radar container by its leading bytes.
+///
+/// `None` means "no signature matched". Callers that hold real file bytes
+/// should treat `None` the way [`decode_supported_volume_bytes`] does — as
+/// an Archive II candidate — because an Archive II volume whose tape
+/// identifier is neither `AR2V` nor `ARCHIVE2` is still worth handing to the
+/// Level II parser, which produces a specific error of its own. `None` is
+/// kept distinct from `Some(NexradLevel2)` so a caller that wants to *know*
+/// whether anything was recognised (a file picker, a diagnostic) can ask.
+///
+/// This reads only the head of the buffer and never decompresses. A gzipped
+/// ODIM_H5 file therefore sniffs as `NexradLevel2` from its outer bytes;
+/// pass inflated bytes when you want the inner format. The router does that
+/// peek for you.
+pub fn sniff_supported_volume_format(head: &[u8]) -> Option<SupportedVolumeFormat> {
+    if head.starts_with(b"PK\x03\x04") {
+        return Some(SupportedVolumeFormat::MobileDeploymentZip);
+    }
+    if head.starts_with(b"\x89HDF\r\n\x1a\n") {
+        return Some(SupportedVolumeFormat::OdimH5);
+    }
+    if head.len() >= 4 && &head[..3] == b"CDF" && matches!(head[3], 1 | 2) {
+        return Some(SupportedVolumeFormat::CfRadial1);
+    }
+    if looks_like_dorade_head(head) {
+        return Some(SupportedVolumeFormat::Dorade);
+    }
+    if head.starts_with(b"AR2V")
+        || head.starts_with(b"ARCHIVE2")
+        || head.starts_with(&[0x1f, 0x8b])
+        || head.starts_with(b"BZh")
+    {
+        return Some(SupportedVolumeFormat::NexradLevel2);
+    }
+    None
+}
+
+/// A DORADE sweepfile opens with a descriptor name and that block's length.
+///
+/// DORADE files carry no file-level magic number, and solo/Radx write them in
+/// whichever byte order the producing machine used, so the name alone is too
+/// weak a test — `COMM` is four perfectly ordinary ASCII letters. Requiring
+/// the following length to be a sane block size in at least one byte order is
+/// what makes the signature specific.
+fn looks_like_dorade_head(head: &[u8]) -> bool {
+    if head.len() < DORADE_BLOCK_HEADER_LEN {
+        return false;
+    }
+    if !DORADE_LEAD_DESCRIPTORS
+        .iter()
+        .any(|name| &head[..4] == name.as_slice())
+    {
+        return false;
+    }
+    let little = i32::from_le_bytes([head[4], head[5], head[6], head[7]]) as i64;
+    let big = i32::from_be_bytes([head[4], head[5], head[6], head[7]]) as i64;
+    let available = head.len() as i64;
+    let plausible = |len: i64| len >= DORADE_BLOCK_HEADER_LEN as i64 && len <= available;
+    plausible(little) || plausible(big)
+}
+
+/// How much of a gzip member to inflate before deciding what is inside it.
+///
+/// Only the first descriptor block or superblock signature is needed, and
+/// every signature the sniff knows lives in the first eight bytes. A small
+/// peek keeps the cost of routing a gzipped Level II volume to a few
+/// microseconds rather than a second inflate of the whole file.
+const GZIP_SNIFF_PEEK_BYTES: usize = 512;
+
+/// Identify a whole file, seeing through a gzip wrapper if there is one.
+///
+/// [`sniff_supported_volume_format`] judges only the bytes it is given, which
+/// makes a gzipped ODIM_H5 file indistinguishable from a gzipped Archive II
+/// volume. This variant inflates a few hundred bytes to settle that, and is
+/// what both [`decode_supported_volume_bytes`] and any caller deciding how to
+/// treat a file should use.
+pub fn sniff_supported_volume_bytes(raw: &[u8]) -> Option<SupportedVolumeFormat> {
+    let outer = sniff_supported_volume_format(raw);
+    if !raw.starts_with(&[0x1f, 0x8b]) {
+        return outer;
+    }
+    // A gzip member that will not inflate is left to the Archive II decoder,
+    // which reports the decompression failure in its own words.
+    match peek_gzip_head(raw) {
+        Some(inner) => sniff_supported_volume_format(&inner).or(outer),
+        None => outer,
+    }
+}
+
+/// Decode every radar volume in a supported container, chosen by magic bytes.
+///
+/// This is the one shared router for bytes of unknown provenance: local file
+/// open, drag-and-drop, and custom URL polling all go through it so they
+/// cannot drift apart. Unrecognised bytes are handed to the Archive II
+/// decoder, which is where the useful diagnostic for a not-actually-radar
+/// file comes from - so a file that is not radar data at all still fails
+/// exactly the way it did before the seam existed.
+///
+/// The returned vector always holds at least one volume. Only a mobile
+/// deployment archive can hold more than one: it is a bundle of sweeps,
+/// often from several instruments at several scan times, and reducing it to
+/// one volume inside the router would throw away what the analyst opened.
+/// Every other container is one scan and yields exactly one volume.
+///
+/// A gzip wrapper is seen through: a `.h5.gz` is inflated and decoded as
+/// ODIM_H5 rather than handed to the Level II decoder because its outer
+/// bytes look like a compressed Archive II volume.
+pub fn decode_supported_volumes_bytes(raw: &[u8]) -> Result<Vec<RadarVolume>> {
+    let Some(format) = sniff_supported_volume_bytes(raw) else {
+        // Nothing matched. The Archive II decoder owns this case and its
+        // error is the one worth reading.
+        return decode_volume_from_bytes(raw).map(|volume| vec![volume]);
+    };
+    if format == SupportedVolumeFormat::NexradLevel2 {
+        // Includes the gzip and bzip2 wrappers, which the Level II decoder
+        // unwraps for itself.
+        return decode_volume_from_bytes(raw).map(|volume| vec![volume]);
+    }
+
+    // Everything below is a self-contained container that cannot unwrap its
+    // own gzip, so the wrapper comes off here. The sniff has already looked
+    // inside, so this only runs for a genuinely wrapped non-NEXRAD file.
+    let inflated;
+    let body = if raw.starts_with(&[0x1f, 0x8b]) {
+        inflated = decompress_gzip_bytes(raw).map_err(|source| named(format, source))?;
+        inflated.as_slice()
+    } else {
+        raw
+    };
+
+    let decoded = match format {
+        SupportedVolumeFormat::NexradLevel2 => unreachable!("handled above"),
+        SupportedVolumeFormat::OdimH5 => odim::decode_odim_h5_volume(body),
+        SupportedVolumeFormat::CfRadial1 => cfradial::decode_cfradial1_volume(body),
+        SupportedVolumeFormat::Dorade => dorade::decode_dorade_sweep(body),
+        SupportedVolumeFormat::MobileDeploymentZip => return deployment_volumes(format, body),
+    };
+    decoded
+        .map(|volume| vec![volume])
+        .map_err(|source| named(format, source))
+}
+
+/// Unpack a deployment archive into plain volumes, keeping the member label.
+///
+/// The archive reader knows which member each volume came from and writes it
+/// into `source_path`; [`decode_supported_volume_from_path`] joins the file
+/// name onto it, so a load reads `deployment.zip::swp....` rather than losing
+/// the sweep's identity the moment it leaves the archive.
+fn deployment_volumes(format: SupportedVolumeFormat, body: &[u8]) -> Result<Vec<RadarVolume>> {
+    let members =
+        mobile_archive::decode_deployment_zip(body).map_err(|source| named(format, source))?;
+    if members.is_empty() {
+        // The archive reader raises its own error for an archive with no
+        // radar in it, so this is belt and braces rather than a live path -
+        // but a router that could return an empty vector would make every
+        // caller check for one, and none of them should have to.
+        return Err(named(
+            format,
+            NexradError::InvalidMessage {
+                offset: 0,
+                reason: "archive holds no decodable radar volumes".to_owned(),
+            },
+        ));
+    }
+    Ok(members.into_iter().map(|member| member.volume).collect())
+}
+
+/// Put the container's name in front of its decoder's complaint.
+fn named(format: SupportedVolumeFormat, source: NexradError) -> NexradError {
+    NexradError::Format {
+        format: format.label(),
+        source: Box::new(source),
+    }
+}
+
+/// Decode one radar volume from any supported container, chosen by magic
+/// bytes.
+///
+/// A pane draws one volume, so this is what the open and drop paths call.
+/// For a mobile deployment archive that means the EARLIEST scan in the
+/// bundle - [`decode_supported_volumes_bytes`] returns them in scan-time
+/// order - which is where an analyst opening a deployment expects to start.
+/// A caller that wants the whole deployment uses that function instead.
+pub fn decode_supported_volume_bytes(raw: &[u8]) -> Result<RadarVolume> {
+    // `decode_supported_volumes_bytes` promises at least one volume, so the
+    // `None` arm is unreachable - but it is written as an error rather than
+    // an index, because a router that panics when a future format returns an
+    // empty list is a worse way to find that out than a message.
+    decode_supported_volumes_bytes(raw)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| NexradError::InvalidMessage {
+            offset: 0,
+            reason: "the container decoded to no volumes at all".to_owned(),
+        })
+}
+
+/// Inflate at most [`GZIP_SNIFF_PEEK_BYTES`] of a gzip member.
+///
+/// A short read is a success: a tiny member simply ends early. A corrupt
+/// stream returns `None` so the caller falls through to the Archive II
+/// decoder and reports the failure in its own words.
+fn peek_gzip_head(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = GzDecoder::new(raw);
+    let mut head = vec![0u8; GZIP_SNIFF_PEEK_BYTES];
+    let mut filled = 0;
+    while filled < head.len() {
+        match decoder.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(_) => return (filled > 0).then(|| head[..filled].to_vec()),
+        }
+    }
+    head.truncate(filled);
+    Some(head)
+}
+
+/// Decode a local radar file, routing on magic bytes.
+///
+/// The extension is not consulted: NEXRAD volumes are routinely stored with
+/// no extension at all, and a `.raw` from one network is a different format
+/// from a `.raw` from another.
+pub fn decode_supported_volume_from_path(path: &Path) -> Result<RadarVolume> {
+    let bytes = fs::read(path).map_err(|source| NexradError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut volume = decode_supported_volume_bytes(&bytes)?;
+    volume.metadata.source_path = Some(source_path_for(path, volume.metadata.source_path.take()));
+    Ok(volume)
+}
+
+/// Where a decoded volume says it came from.
+///
+/// Normally the file. A container that holds several scans has already
+/// written the member it chose - `swp.1090509143923.NOXPRVP...` - and that is
+/// the more informative half, so the two are joined rather than the file name
+/// overwriting the member. The separator matches the one the archive reader
+/// uses for a deployment opened by path.
+fn source_path_for(path: &Path, decoded: Option<String>) -> String {
+    match decoded {
+        Some(member) => format!("{}::{member}", path.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -455,6 +792,13 @@ pub fn decode_normalized_volume_bytes(
 
     let mut cursor = VOLUME_HEADER_LEN;
     let mut record_index = 0usize;
+    // GR2Analyst-style ".msg31" exports keep the Archive II volume header but
+    // carry only a few metadata records before their message 31s - well
+    // before the 134th record where variable framing normally begins - and
+    // pack those messages back to back with no fixed-record padding.
+    // Detected once, at the first early message 31, and latched for the rest
+    // of the file so the detector runs once rather than per radial.
+    let mut early_variable_msg31 = false;
     while cursor + CONTROL_WORD_LEN + MESSAGE_HEADER_LEN <= bytes.len() {
         let header_offset = cursor + CONTROL_WORD_LEN;
         let header =
@@ -479,6 +823,23 @@ pub fn decode_normalized_volume_bytes(
 
         volume.metadata.message_count += 1;
         match header.message_type {
+            1 => {
+                let message_end = header_offset + message_total_len;
+                if message_end > bytes.len() {
+                    if volume.metadata.decoded_radial_count > 0 {
+                        volume.metadata.skipped_message_count += 1;
+                        break;
+                    }
+                    return Err(NexradError::Truncated {
+                        what: "message 1 body",
+                        offset: header_offset,
+                        needed: message_total_len,
+                        available: bytes.len().saturating_sub(header_offset),
+                    });
+                }
+                let body = &bytes[header_offset + MESSAGE_HEADER_LEN..message_end];
+                parse_message_1(body, &header, &mut volume)?;
+            }
             31 => {
                 let message_end = header_offset + message_total_len;
                 if message_end > bytes.len() {
@@ -508,16 +869,49 @@ pub fn decode_normalized_volume_bytes(
             _ => volume.metadata.skipped_message_count += 1,
         }
 
-        let record_len = if record_index < 134 || header.message_type != 31 {
+        let record_len = if header.message_type != 31 {
             RECORD_BYTES
-        } else {
+        } else if record_index >= 134 || early_variable_msg31 {
             message_total_len + CONTROL_WORD_LEN
+        } else if message31_uses_variable_framing(bytes, cursor, message_total_len) {
+            early_variable_msg31 = true;
+            message_total_len + CONTROL_WORD_LEN
+        } else {
+            RECORD_BYTES
         };
         cursor = cursor.saturating_add(record_len);
         record_index += 1;
     }
 
     Ok(volume)
+}
+
+/// Decide the framing of a message 31 that appears before the 134th record.
+///
+/// Real Archive II volumes never place a message 31 that early - the metadata
+/// records come first - but GR2Analyst-convention ".msg31" exports do, and
+/// the DOW/COW/RaXPol Level II twins written that way pack their messages
+/// back to back. Returns `true` when the bytes immediately after this message
+/// hold another message 31, or when the file ends exactly there: neither is
+/// something fixed 2432-byte framing can produce, because fixed framing would
+/// leave padding in between.
+///
+/// The look-ahead is why this lives only on the whole-buffer path.
+/// [`decode_volume_from_stream`] reads from a `Read` and cannot see past the
+/// current record, and the block-bzip path decodes LDM-compressed volumes,
+/// which is not a container GR2Analyst writes.
+fn message31_uses_variable_framing(bytes: &[u8], cursor: usize, message_total_len: usize) -> bool {
+    let variable_next = cursor + CONTROL_WORD_LEN + message_total_len;
+    if variable_next == bytes.len() {
+        return true;
+    }
+    let header_offset = variable_next + CONTROL_WORD_LEN;
+    let Some(header_bytes) = bytes.get(header_offset..header_offset + MESSAGE_HEADER_LEN) else {
+        return false;
+    };
+    let header = parse_message_header_bytes(header_bytes);
+    header.message_type == 31
+        && usize::from(header.size_halfwords) * 2 >= MESSAGE_HEADER_LEN + MSG_31_HEADER_LEN
 }
 
 struct StreamDecodeResult {
@@ -594,6 +988,23 @@ where
         volume.metadata.message_count += 1;
 
         match header.message_type {
+            1 => {
+                if let Err(err) = read_exact_into_buffer(
+                    reader,
+                    &mut body_buffer,
+                    body_len,
+                    "message 1 body",
+                    header_offset,
+                ) {
+                    if volume.metadata.decoded_radial_count > 0 {
+                        volume.metadata.skipped_message_count += 1;
+                        break;
+                    }
+                    return Err(err);
+                }
+                parse_message_1(&body_buffer, &header, &mut volume)?;
+                skip_record_padding(reader, record_len, prefix.len() + body_len, cursor)?;
+            }
             31 => {
                 if let Err(err) = read_exact_into_buffer(
                     reader,
@@ -920,6 +1331,29 @@ fn decode_bzip_block_sequence(volume_header: &[u8], blocks: &[Vec<u8>]) -> Resul
         volume.metadata.message_count += 1;
 
         match header.message_type {
+            1 => {
+                let body = match cursor_reader.read_slice_or_copy(
+                    &mut body_buffer,
+                    body_len,
+                    "message 1 body",
+                    header_offset,
+                ) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        if volume.metadata.decoded_radial_count > 0 {
+                            volume.metadata.skipped_message_count += 1;
+                            break;
+                        }
+                        return Err(err);
+                    }
+                };
+                parse_message_1(body, &header, &mut volume)?;
+                cursor_reader.skip_exact(
+                    record_len.saturating_sub(prefix.len() + body_len),
+                    "record padding",
+                    cursor + prefix.len() + body_len,
+                )?;
+            }
             31 => {
                 let body = match cursor_reader.read_slice_or_copy(
                     &mut body_buffer,
@@ -1124,6 +1558,283 @@ fn parse_message_5(body: &[u8], volume: &mut RadarVolume) {
     }
 }
 
+/// Byte offsets into a Message Type 1 body, from ICD 2620002 Table
+/// "Digital Radar Data (Message Type 1)". The ICD numbers halfwords from 1;
+/// each constant below is `(halfword - 1) * 2`, and the halfword is named so
+/// the mapping can be checked against the document without arithmetic.
+mod msg1 {
+    /// Halfword 1-2: radial collection time, ms past midnight.
+    pub const COLLECT_MS: usize = 0;
+    /// Halfword 3: modified Julian date, days since 1 January 1970.
+    pub const COLLECT_DATE: usize = 4;
+    /// Halfword 5: azimuth angle, coded (see `legacy_binary_angle_deg`).
+    pub const AZIMUTH_ANGLE: usize = 8;
+    /// Halfword 7: radial status.
+    pub const RADIAL_STATUS: usize = 12;
+    /// Halfword 8: elevation angle, coded.
+    pub const ELEVATION_ANGLE: usize = 14;
+    /// Halfword 9: elevation number within the volume scan.
+    pub const ELEVATION_NUMBER: usize = 16;
+    /// Halfword 10: surveillance range - range to the first reflectivity gate, m.
+    pub const SURVEILLANCE_RANGE: usize = 18;
+    /// Halfword 11: Doppler range - range to the first velocity gate, m.
+    pub const DOPPLER_RANGE: usize = 20;
+    /// Halfword 12: surveillance range sample interval (reflectivity gate spacing), m.
+    pub const SURVEILLANCE_RANGE_STEP: usize = 22;
+    /// Halfword 13: Doppler range sample interval (velocity gate spacing), m.
+    pub const DOPPLER_RANGE_STEP: usize = 24;
+    /// Halfword 14: number of surveillance (reflectivity) bins.
+    pub const SURVEILLANCE_BIN_COUNT: usize = 26;
+    /// Halfword 15: number of Doppler (velocity/spectrum width) bins.
+    pub const DOPPLER_BIN_COUNT: usize = 28;
+    /// Halfword 19: reflectivity data pointer, bytes from the start of this body.
+    pub const REFLECTIVITY_POINTER: usize = 36;
+    /// Halfword 20: velocity data pointer.
+    pub const VELOCITY_POINTER: usize = 38;
+    /// Halfword 21: spectrum width data pointer.
+    pub const SPECTRUM_WIDTH_POINTER: usize = 40;
+    /// Halfword 22: Doppler velocity resolution code (2 = 0.5 m/s, 4 = 1.0 m/s).
+    pub const VELOCITY_RESOLUTION: usize = 42;
+    /// Halfword 23: volume coverage pattern number.
+    pub const VOLUME_COVERAGE_PATTERN: usize = 44;
+    /// Halfword 31: Nyquist velocity, cm/s.
+    ///
+    /// Halfwords 24-27 are reserved for RDA internal use and halfwords 28-30
+    /// repeat the three data pointers for playback, so the Nyquist sits nine
+    /// halfwords past the VCP rather than one. Verified on KTLX 1999-05-03
+    /// 23:36:31Z: at this offset the field is exactly zero on the two
+    /// surveillance-only cuts of the VCP 11 split scan and 2610/2819/3041
+    /// cm/s on every cut that carries Doppler bins, and halfwords 28-30 hold
+    /// byte-for-byte copies of halfwords 19-21.
+    pub const NYQUIST_VELOCITY: usize = 60;
+}
+
+/// Legacy reflectivity coding, ICD 2620002: `dBZ = (code - 66) / 2`, giving
+/// 0.5 dBZ resolution from -32 dBZ at code 2. Codes 0 and 1 are
+/// below-threshold and range-folded.
+const LEGACY_REFLECTIVITY_SCALE: f32 = 2.0;
+const LEGACY_REFLECTIVITY_OFFSET: f32 = 66.0;
+/// Legacy Doppler coding: `m/s = (code - 129) / scale`, where the scale is
+/// 2 for 0.5 m/s velocity resolution and 1 for 1.0 m/s. Spectrum width is
+/// always carried at 0.5 m/s resolution regardless of the velocity code.
+const LEGACY_DOPPLER_OFFSET: f32 = 129.0;
+const LEGACY_SPECTRUM_WIDTH_SCALE: f32 = 2.0;
+
+/// Decode one legacy Message Type 1 radial (ICD 2620002, "Digital Radar
+/// Data"), the format every NEXRAD volume before the 2008 Build 10 generic
+/// -format cutover is written in.
+///
+/// Message 1 carries only the three legacy moments at fixed resolutions -
+/// reflectivity on 1 km gates, velocity and spectrum width on 250 m gates -
+/// with the moment layout described by pointers into the message body rather
+/// than by the self-describing blocks of Message 31. Split cuts appear as
+/// separate elevation numbers, one surveillance-only and one Doppler-only,
+/// and are kept as separate cuts here for the same reason Message 31 split
+/// cuts are: they are separate sweeps of the antenna.
+fn parse_message_1(
+    body: &[u8],
+    _message_header: &MessageHeader,
+    volume: &mut RadarVolume,
+) -> Result<()> {
+    require_len(body, 0, MSG_1_HEADER_LEN, "message 1 header")?;
+
+    let collect_ms = be_u32(body, msg1::COLLECT_MS);
+    let collect_date = be_u16(body, msg1::COLLECT_DATE);
+    // Message 1 volumes have no Message 31 volume-constant block and, on
+    // pre-2008 tapes, an all-zero ICAO field in the volume header, so the
+    // first radial's own timestamp is the best volume time available.
+    if volume.metadata.decoded_radial_count == 0 && collect_date > 0 {
+        volume.volume_time = nexrad_date_ms_to_datetime(u32::from(collect_date), collect_ms);
+    }
+
+    let azimuth_angle = legacy_binary_angle_deg(be_u16(body, msg1::AZIMUTH_ANGLE));
+    let radial_status = RadialStatus::from(be_u16(body, msg1::RADIAL_STATUS) as u8);
+    let elevation_angle = legacy_binary_angle_deg(be_u16(body, msg1::ELEVATION_ANGLE));
+    // Elevation numbers are 1-based; a zero here would collide with "no cut
+    // number recorded" downstream.
+    let elevation_number = (be_u16(body, msg1::ELEVATION_NUMBER) as u8).max(1);
+
+    let reflectivity_range = GateRange {
+        first_gate_m: i32::from(be_i16(body, msg1::SURVEILLANCE_RANGE)),
+        gate_spacing_m: i32::from(be_u16(body, msg1::SURVEILLANCE_RANGE_STEP).max(1)),
+        gate_count: usize::from(be_u16(body, msg1::SURVEILLANCE_BIN_COUNT)),
+    };
+    let doppler_range = GateRange {
+        first_gate_m: i32::from(be_i16(body, msg1::DOPPLER_RANGE)),
+        gate_spacing_m: i32::from(be_u16(body, msg1::DOPPLER_RANGE_STEP).max(1)),
+        gate_count: usize::from(be_u16(body, msg1::DOPPLER_BIN_COUNT)),
+    };
+    let reflectivity_pointer = usize::from(be_u16(body, msg1::REFLECTIVITY_POINTER));
+    let velocity_pointer = usize::from(be_u16(body, msg1::VELOCITY_POINTER));
+    let spectrum_width_pointer = usize::from(be_u16(body, msg1::SPECTRUM_WIDTH_POINTER));
+    let velocity_resolution = be_u16(body, msg1::VELOCITY_RESOLUTION);
+
+    let vcp = be_u16(body, msg1::VOLUME_COVERAGE_PATTERN);
+    if vcp != 0 {
+        volume.vcp = Some(VcpInfo { pattern: vcp });
+    }
+    let nyquist_velocity_mps = match be_i16(body, msg1::NYQUIST_VELOCITY) {
+        raw if raw > 0 => Some(f32::from(raw) / 100.0),
+        _ => None,
+    };
+
+    let reflectivity_row =
+        legacy_message_1_row(body, reflectivity_pointer, reflectivity_range.gate_count);
+    let velocity_row = legacy_message_1_row(body, velocity_pointer, doppler_range.gate_count);
+    let spectrum_width_row =
+        legacy_message_1_row(body, spectrum_width_pointer, doppler_range.gate_count);
+    if reflectivity_row.is_none() && velocity_row.is_none() && spectrum_width_row.is_none() {
+        volume.metadata.skipped_message_count += 1;
+        return Ok(());
+    }
+
+    let gate_range = if reflectivity_row.is_some() {
+        reflectivity_range.clone()
+    } else {
+        doppler_range.clone()
+    };
+    let radial = Radial {
+        azimuth_deg: azimuth_angle,
+        elevation_deg: elevation_angle,
+        time_offset_ms: collect_ms as i32,
+        gate_range,
+        nyquist_velocity_mps,
+        radial_status: Some(radial_status),
+    };
+
+    let cut = select_cut_for_radial(volume, radial_status, elevation_angle, elevation_number);
+    if cut.radials.is_empty() {
+        cut.radials.reserve(ONE_DEGREE_RADIALS_PER_CUT);
+    }
+    let radial_index = cut.radials.len();
+    cut.radials.push(radial);
+
+    if let Some(row) = reflectivity_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::Reflectivity,
+            reflectivity_range,
+            LEGACY_REFLECTIVITY_SCALE,
+            LEGACY_REFLECTIVITY_OFFSET,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+    if let Some(row) = velocity_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::Velocity,
+            doppler_range.clone(),
+            legacy_message_1_velocity_scale(velocity_resolution),
+            LEGACY_DOPPLER_OFFSET,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+    if let Some(row) = spectrum_width_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::SpectrumWidth,
+            doppler_range,
+            LEGACY_SPECTRUM_WIDTH_SCALE,
+            LEGACY_DOPPLER_OFFSET,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+
+    volume.metadata.decoded_radial_count += 1;
+    Ok(())
+}
+
+/// Pick the cut a radial belongs to, shared by Message 1 and Message 31.
+///
+/// A start-of-elevation marker opens a new cut, which is what keeps the two
+/// halves of a split cut apart even though they sit at the same angle.
+/// Otherwise the radial extends the cut in progress when it matches, and only
+/// a radial that matches neither goes looking through earlier cuts.
+fn select_cut_for_radial(
+    volume: &mut RadarVolume,
+    radial_status: RadialStatus,
+    elevation_angle: f32,
+    elevation_number: u8,
+) -> &mut radar_core::ElevationCut {
+    let starts_elevation = matches!(
+        radial_status,
+        RadialStatus::StartElevation
+            | RadialStatus::StartVolume
+            | RadialStatus::StartElevationLastCut
+    );
+    let last_cut_has_radials = volume
+        .cuts
+        .last()
+        .is_some_and(|cut| !cut.radials.is_empty());
+    let last_cut_matches = volume.cuts.last().is_some_and(|cut| {
+        cut.elevation_number == Some(elevation_number)
+            || (cut.elevation_deg - elevation_angle).abs() <= 0.05
+    });
+    if starts_elevation && last_cut_has_radials {
+        volume.push_cut(elevation_angle, Some(elevation_number))
+    } else if last_cut_matches {
+        volume
+            .cuts
+            .last_mut()
+            .expect("last cut existence was checked before borrowing")
+    } else {
+        volume.find_or_insert_cut(elevation_angle, Some(elevation_number))
+    }
+}
+
+/// Fetch or create the 8-bit grid a legacy moment accumulates into.
+fn legacy_u8_grid(
+    cut: &mut radar_core::ElevationCut,
+    moment: MomentType,
+    gate_range: GateRange,
+    scale: f32,
+    offset: f32,
+) -> &mut MomentGrid {
+    match cut.moments.entry(moment) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let mut grid = MomentGrid::new_u8(
+                entry.key().clone(),
+                gate_range,
+                scale,
+                offset,
+                Some(0),
+                Some(1),
+            );
+            grid.reserve_rows(ONE_DEGREE_RADIALS_PER_CUT);
+            entry.insert(grid)
+        }
+    }
+}
+
+/// Borrow one moment's gates out of a Message 1 body.
+///
+/// A zero pointer means the moment is absent from this radial, which is the
+/// normal state of a split cut's surveillance half. A pointer that runs off
+/// the end of the message is treated the same way rather than as a fatal
+/// error, so one damaged radial costs one radial.
+fn legacy_message_1_row(body: &[u8], pointer: usize, gate_count: usize) -> Option<&[u8]> {
+    if pointer == 0 || gate_count == 0 {
+        return None;
+    }
+    body.get(pointer..pointer.checked_add(gate_count)?)
+}
+
+/// Velocity scale from the Doppler velocity resolution code (ICD 2620002
+/// halfword 22): code 2 is 0.5 m/s per count, code 4 is 1.0 m/s per count.
+/// An out-of-range code falls back to the far more common 0.5 m/s.
+fn legacy_message_1_velocity_scale(velocity_resolution: u16) -> f32 {
+    match velocity_resolution {
+        4 => 1.0,
+        _ => 2.0,
+    }
+}
+
+/// Decode a legacy binary angle: a full turn spread over the 16-bit range.
+fn legacy_binary_angle_deg(raw: u16) -> f32 {
+    f32::from(raw) * 360.0 / 65_536.0
+}
+
 fn parse_message_31(
     body: &[u8],
     _message_header: &MessageHeader,
@@ -1183,30 +1894,12 @@ fn parse_message_31(
         radial_status: Some(header.radial_status),
     };
 
-    let starts_elevation = matches!(
+    let cut = select_cut_for_radial(
+        volume,
         header.radial_status,
-        RadialStatus::StartElevation
-            | RadialStatus::StartVolume
-            | RadialStatus::StartElevationLastCut
+        header.elevation_angle,
+        header.elevation_number,
     );
-    let last_cut_has_radials = volume
-        .cuts
-        .last()
-        .is_some_and(|cut| !cut.radials.is_empty());
-    let last_cut_matches = volume.cuts.last().is_some_and(|cut| {
-        cut.elevation_number == Some(header.elevation_number)
-            || (cut.elevation_deg - header.elevation_angle).abs() <= 0.05
-    });
-    let cut = if starts_elevation && last_cut_has_radials {
-        volume.push_cut(header.elevation_angle, Some(header.elevation_number))
-    } else if last_cut_matches {
-        volume
-            .cuts
-            .last_mut()
-            .expect("last cut existence was checked before borrowing")
-    } else {
-        volume.find_or_insert_cut(header.elevation_angle, Some(header.elevation_number))
-    };
     if cut.radials.is_empty() {
         cut.radials.reserve(expected_radials);
     }
@@ -1718,6 +2411,388 @@ mod tests {
             !volume.cuts.is_empty(),
             "expected at least one decoded elevation cut"
         );
+    }
+
+    #[test]
+    fn sniffs_every_container_by_its_magic_number() {
+        let cases: [(&[u8], SupportedVolumeFormat); 8] = [
+            (b"AR2V0006.473", SupportedVolumeFormat::NexradLevel2),
+            (b"ARCHIVE2.027", SupportedVolumeFormat::NexradLevel2),
+            (
+                &[0x1f, 0x8b, 0x08, 0x00],
+                SupportedVolumeFormat::NexradLevel2,
+            ),
+            (b"BZh91AY&SY", SupportedVolumeFormat::NexradLevel2),
+            (b"\x89HDF\r\n\x1a\n\x00\x00", SupportedVolumeFormat::OdimH5),
+            (b"CDF\x01\x00\x00\x00\x00", SupportedVolumeFormat::CfRadial1),
+            (b"CDF\x02\x00\x00\x00\x00", SupportedVolumeFormat::CfRadial1),
+            (
+                b"PK\x03\x04\x14\x00\x00\x00",
+                SupportedVolumeFormat::MobileDeploymentZip,
+            ),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(
+                sniff_supported_volume_format(bytes),
+                Some(expected),
+                "wrong format for {:?}",
+                &bytes[..4.min(bytes.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn sniffs_dorade_only_when_the_block_length_is_credible() {
+        // `COMM` followed by a block length that fits the buffer.
+        let mut sweep = b"COMM".to_vec();
+        sweep.extend_from_slice(&32u32.to_be_bytes());
+        sweep.resize(64, 0);
+        assert_eq!(
+            sniff_supported_volume_format(&sweep),
+            Some(SupportedVolumeFormat::Dorade)
+        );
+
+        // The same four letters as ordinary prose, which is why the length
+        // check has to be part of the signature.
+        assert_eq!(
+            sniff_supported_volume_format(b"COMMENTARY ON THE WEATHER, AT LENGTH"),
+            None
+        );
+    }
+
+    #[test]
+    fn sniff_returns_none_for_bytes_that_are_not_radar_data() {
+        assert_eq!(sniff_supported_volume_format(b"\x89PNG\r\n\x1a\n"), None);
+        assert_eq!(sniff_supported_volume_format(b"{\"json\": true}"), None);
+        assert_eq!(sniff_supported_volume_format(b""), None);
+    }
+
+    #[test]
+    fn router_decodes_the_level2_arm() {
+        let volume = decode_supported_volume_bytes(&synthetic_archive(false)).unwrap();
+        assert_eq!(volume.site.id, "KTLX");
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+    }
+
+    #[test]
+    fn a_failed_decode_still_names_the_container_it_was_taken_for() {
+        // Each of these is a valid signature followed by rubbish, so the
+        // format's own decoder is reached and rejects the bytes. The point
+        // of the seam is that the analyst is told WHICH decoder rejected
+        // them: "ODIM_H5: ..." sends you to look at an HDF5 file, whereas
+        // the Archive II parser's complaint about a short volume header
+        // sends you looking for a truncated NEXRAD download that does not
+        // exist.
+        for (bytes, expected) in [
+            (b"\x89HDF\r\n\x1a\n\x00\x00".as_slice(), "ODIM_H5"),
+            (b"CDF\x01\x00\x00\x00\x00".as_slice(), "CfRadial 1.x"),
+            (
+                b"PK\x03\x04\x14\x00\x00\x00".as_slice(),
+                "mobile deployment zip",
+            ),
+            // A COMM descriptor whose declared block length is honest, so
+            // the sniff accepts it and the DORADE reader is the one that
+            // finds nothing behind it.
+            (b"COMM\x00\x00\x00\x10rubbish!".as_slice(), "DORADE"),
+        ] {
+            let error = decode_supported_volume_bytes(bytes).unwrap_err();
+            assert!(
+                matches!(&error, NexradError::Format { format, .. } if *format == expected),
+                "expected {expected} to be named, got {error}"
+            );
+            assert!(
+                error.to_string().starts_with(expected),
+                "the message should lead with the container, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn router_looks_inside_a_gzip_wrapper_before_deciding() {
+        // A gzipped ODIM_H5 file is byte-indistinguishable from a gzipped
+        // Archive II volume from the outside, so the router has to inflate a
+        // little before it can name the format.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(b"\x89HDF\r\n\x1a\n").unwrap();
+        encoder.write_all(&[0u8; 256]).unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        assert_eq!(
+            sniff_supported_volume_format(&gzipped),
+            Some(SupportedVolumeFormat::NexradLevel2),
+            "the outer bytes say gzip, which is a Level II wrapper"
+        );
+        assert_eq!(
+            sniff_supported_volume_bytes(&gzipped),
+            Some(SupportedVolumeFormat::OdimH5),
+            "the inner bytes say HDF5"
+        );
+        // And the wrapper comes off before the ODIM decoder sees the bytes,
+        // so the failure is HDF5's ("not enough bytes for a superblock"),
+        // not gzip's.
+        assert!(matches!(
+            decode_supported_volume_bytes(&gzipped).unwrap_err(),
+            NexradError::Format {
+                format: "ODIM_H5",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn router_hands_unrecognised_bytes_to_the_archive_ii_decoder() {
+        // Not "unsupported format" - the Archive II decoder's own complaint,
+        // which is the one that helps when a file is not radar data at all.
+        let error = decode_supported_volume_bytes(b"not a radar volume").unwrap_err();
+        assert!(
+            matches!(error, NexradError::ShortVolumeHeader { .. }),
+            "expected the Level II decoder's error, got {error}"
+        );
+    }
+
+    #[test]
+    fn decodes_legacy_message_1_reflectivity_velocity_and_spectrum_width() {
+        let volume = decode_volume_from_bytes(&synthetic_legacy_archive()).unwrap();
+
+        assert_eq!(volume.vcp.map(|vcp| vcp.pattern), Some(11));
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+        assert_eq!(volume.cuts.len(), 1);
+        let cut = &volume.cuts[0];
+        assert_eq!(cut.elevation_number, Some(1));
+        assert!((cut.elevation_deg - 0.4998).abs() < 0.001);
+
+        let radial = &cut.radials[0];
+        assert!((radial.azimuth_deg - 90.0).abs() < 0.01);
+        assert_eq!(radial.radial_status, Some(RadialStatus::StartVolume));
+
+        let reflectivity = &cut.moments[&MomentType::Reflectivity];
+        assert_eq!(reflectivity.gate_range.gate_spacing_m, 1_000);
+        assert_eq!(reflectivity.gate_range.first_gate_m, 0);
+        // Codes 0 and 1 are below-threshold and range-folded; the rest decode
+        // as dBZ = (code - 66) / 2 per ICD 2620002.
+        assert_eq!(reflectivity.scaled_value(0, 0), None);
+        assert_eq!(reflectivity.scaled_value(0, 1), None);
+        assert_eq!(reflectivity.scaled_value(0, 2), Some(0.0));
+        assert_eq!(reflectivity.scaled_value(0, 3), Some(7.0));
+
+        let velocity = &cut.moments[&MomentType::Velocity];
+        assert_eq!(velocity.gate_range.gate_spacing_m, 250);
+        assert_eq!(velocity.gate_range.first_gate_m, -375);
+        // m/s = (code - 129) / 2 at the 0.5 m/s resolution code.
+        assert_eq!(velocity.scaled_value(0, 0), Some(0.0));
+        assert_eq!(velocity.scaled_value(0, 1), Some(10.0));
+        assert_eq!(velocity.scaled_value(0, 2), Some(-10.0));
+
+        let spectrum_width = &cut.moments[&MomentType::SpectrumWidth];
+        assert_eq!(spectrum_width.scaled_value(0, 0), Some(0.0));
+        assert_eq!(spectrum_width.scaled_value(0, 1), Some(2.0));
+        assert_eq!(spectrum_width.scaled_value(0, 2), Some(4.0));
+    }
+
+    #[test]
+    fn legacy_nyquist_comes_from_halfword_31_not_the_reserved_field() {
+        // Halfword 24 is reserved for RDA internal use. The fixture puts a
+        // decoy there that would decode as 99.99 m/s if it were read as the
+        // Nyquist velocity, which is what pins the correct offset in place.
+        let volume = decode_volume_from_bytes(&synthetic_legacy_archive()).unwrap();
+        let nyquist = volume.cuts[0].radials[0].nyquist_velocity_mps;
+        assert_eq!(nyquist, Some(26.1));
+    }
+
+    #[test]
+    fn legacy_velocity_resolution_code_selects_the_scale() {
+        assert_eq!(legacy_message_1_velocity_scale(2), 2.0);
+        assert_eq!(legacy_message_1_velocity_scale(4), 1.0);
+        // An out-of-range code falls back to the common 0.5 m/s coding
+        // rather than producing a zero scale and infinite velocities.
+        assert_eq!(legacy_message_1_velocity_scale(0), 2.0);
+    }
+
+    #[test]
+    fn legacy_radial_without_any_moment_is_skipped_not_fatal() {
+        let mut bytes = synthetic_legacy_archive();
+        let pointers = VOLUME_HEADER_LEN + CONTROL_WORD_LEN + MESSAGE_HEADER_LEN;
+        for offset in [
+            msg1::REFLECTIVITY_POINTER,
+            msg1::VELOCITY_POINTER,
+            msg1::SPECTRUM_WIDTH_POINTER,
+        ] {
+            bytes[pointers + offset..pointers + offset + 2].copy_from_slice(&0u16.to_be_bytes());
+        }
+
+        let volume = decode_volume_from_bytes(&bytes).unwrap();
+        assert_eq!(volume.metadata.decoded_radial_count, 0);
+        assert_eq!(volume.metadata.skipped_message_count, 1);
+    }
+
+    #[test]
+    fn decodes_back_to_back_message_31s_framed_the_gr2analyst_way() {
+        let bytes = synthetic_variable_framed_archive(3);
+        let volume = decode_volume_from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            volume.metadata.decoded_radial_count, 3,
+            "all three variable-framed radials should decode"
+        );
+    }
+
+    #[test]
+    fn variable_framing_is_detected_only_when_the_next_record_is_a_message_31() {
+        let variable = synthetic_variable_framed_archive(2);
+        let message_total_len =
+            usize::from(be_u16(&variable, VOLUME_HEADER_LEN + CONTROL_WORD_LEN)) * 2;
+        assert!(message31_uses_variable_framing(
+            &variable,
+            VOLUME_HEADER_LEN,
+            message_total_len
+        ));
+
+        // The standard fixture pads its single message out to a full 2432
+        // byte record, which is exactly what the detector must not mistake
+        // for back-to-back framing.
+        let fixed = synthetic_archive(false);
+        let fixed_len = usize::from(be_u16(&fixed, VOLUME_HEADER_LEN + CONTROL_WORD_LEN)) * 2;
+        assert!(!message31_uses_variable_framing(
+            &fixed,
+            VOLUME_HEADER_LEN,
+            fixed_len
+        ));
+    }
+
+    #[test]
+    fn fixed_framed_early_message_31_still_decodes_as_a_fixed_record() {
+        // The latch must not change how an ordinary Archive II volume is
+        // walked; this is the regression guard for that.
+        let volume = decode_volume_from_bytes(&synthetic_archive(false)).unwrap();
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+    }
+
+    #[ignore = "set NEXRAD_LEGACY_SAMPLE to a pre-2008 Archive II file path to run manually"]
+    #[test]
+    fn decodes_real_legacy_message_1_file_from_env() {
+        let path = std::env::var("NEXRAD_LEGACY_SAMPLE").expect("NEXRAD_LEGACY_SAMPLE is not set");
+        let volume = decode_volume_from_path(Path::new(&path)).unwrap();
+
+        assert!(!volume.cuts.is_empty());
+        assert!(volume.metadata.decoded_radial_count > 1_000);
+        assert!(
+            volume
+                .cuts
+                .iter()
+                .any(|cut| cut.moments.contains_key(&MomentType::Velocity)),
+            "a legacy volume should carry Doppler cuts"
+        );
+        assert!(
+            volume
+                .cuts
+                .iter()
+                .flat_map(|cut| &cut.radials)
+                .any(|radial| {
+                    radial
+                        .nyquist_velocity_mps
+                        .is_some_and(|nyquist| (10.0..40.0).contains(&nyquist))
+                }),
+            "Doppler radials should carry a physically plausible Nyquist velocity"
+        );
+    }
+
+    /// A one-record Archive II volume whose single message is a legacy
+    /// Message Type 1 radial carrying all three legacy moments.
+    fn synthetic_legacy_archive() -> Vec<u8> {
+        let mut body = vec![0u8; MSG_1_HEADER_LEN];
+        let put_u16 = |body: &mut Vec<u8>, offset: usize, value: u16| {
+            body[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        };
+        body[msg1::COLLECT_MS..msg1::COLLECT_MS + 4].copy_from_slice(&1_000u32.to_be_bytes());
+        put_u16(&mut body, msg1::COLLECT_DATE, 19_724);
+        // 90 degrees, as a full turn spread over the 16-bit range.
+        put_u16(&mut body, msg1::AZIMUTH_ANGLE, 16_384);
+        put_u16(&mut body, msg1::RADIAL_STATUS, 3);
+        put_u16(&mut body, msg1::ELEVATION_ANGLE, 91);
+        put_u16(&mut body, msg1::ELEVATION_NUMBER, 1);
+        put_u16(&mut body, msg1::SURVEILLANCE_RANGE, 0);
+        put_u16(&mut body, msg1::DOPPLER_RANGE, (-375i16) as u16);
+        put_u16(&mut body, msg1::SURVEILLANCE_RANGE_STEP, 1_000);
+        put_u16(&mut body, msg1::DOPPLER_RANGE_STEP, 250);
+        put_u16(&mut body, msg1::SURVEILLANCE_BIN_COUNT, 4);
+        put_u16(&mut body, msg1::DOPPLER_BIN_COUNT, 3);
+        put_u16(&mut body, msg1::REFLECTIVITY_POINTER, 100);
+        put_u16(&mut body, msg1::VELOCITY_POINTER, 104);
+        put_u16(&mut body, msg1::SPECTRUM_WIDTH_POINTER, 107);
+        put_u16(&mut body, msg1::VELOCITY_RESOLUTION, 2);
+        put_u16(&mut body, msg1::VOLUME_COVERAGE_PATTERN, 11);
+        // Decoy in the reserved halfword 24 that an off-by-seven-halfword
+        // read of the Nyquist velocity would pick up as 99.99 m/s.
+        put_u16(&mut body, 46, 9_999);
+        put_u16(&mut body, msg1::NYQUIST_VELOCITY, 2_610);
+
+        body.extend_from_slice(&[0, 1, 66, 80]);
+        body.extend_from_slice(&[129, 149, 109]);
+        body.extend_from_slice(&[129, 133, 137]);
+
+        let mut bytes = legacy_volume_header();
+        bytes.extend_from_slice(&[0u8; CONTROL_WORD_LEN]);
+        bytes.extend_from_slice(&message_header(1, &body));
+        bytes.extend_from_slice(&body);
+        bytes.resize(VOLUME_HEADER_LEN + RECORD_BYTES, 0);
+        bytes
+    }
+
+    /// The 24-byte volume header a pre-2008 tape carries: an `ARCHIVE2` tape
+    /// identifier and, unlike modern files, no ICAO.
+    fn legacy_volume_header() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ARCHIVE2.");
+        bytes.extend_from_slice(b"027");
+        bytes.extend_from_slice(&19_724u32.to_be_bytes());
+        bytes.extend_from_slice(&1_000u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes
+    }
+
+    fn message_header(message_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut header = Vec::with_capacity(MESSAGE_HEADER_LEN);
+        let size = u16::try_from((MESSAGE_HEADER_LEN + body.len()) / 2).unwrap();
+        header.extend_from_slice(&size.to_be_bytes());
+        header.push(0);
+        header.push(message_type);
+        header.extend_from_slice(&7u16.to_be_bytes());
+        header.extend_from_slice(&19_724u16.to_be_bytes());
+        header.extend_from_slice(&1_000u32.to_be_bytes());
+        header.extend_from_slice(&1u16.to_be_bytes());
+        header.extend_from_slice(&1u16.to_be_bytes());
+        header
+    }
+
+    /// A GR2Analyst-convention export: an Archive II volume header followed
+    /// immediately by message 31 records packed back to back, each preceded
+    /// by its control word and followed by no padding at all.
+    ///
+    /// `pub(crate)` so `mobile_archive`'s tests can put one inside a zip and
+    /// prove the framing latch is reached through the archive path too.
+    pub(crate) fn synthetic_variable_framed_archive(radials: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"AR2V00000");
+        bytes.extend_from_slice(b"1  ");
+        bytes.extend_from_slice(&19_724u32.to_be_bytes());
+        bytes.extend_from_slice(&1_000u32.to_be_bytes());
+        bytes.extend_from_slice(b"KTLX");
+
+        for radial in 0..radials {
+            let mut body = synthetic_message_31_body(false);
+            // Azimuth number and angle advance so the radials are distinct;
+            // every radial after the first is an intermediate one.
+            body[10..12].copy_from_slice(&(radial as u16 + 1).to_be_bytes());
+            let azimuth = 180.5f32 + radial as f32;
+            body[12..16].copy_from_slice(&azimuth.to_bits().to_be_bytes());
+            if radial > 0 {
+                body[21] = 1;
+            }
+            bytes.extend_from_slice(&[0u8; CONTROL_WORD_LEN]);
+            bytes.extend_from_slice(&message_header(31, &body));
+            bytes.extend_from_slice(&body);
+        }
+        bytes
     }
 
     fn synthetic_archive(include_phi_16: bool) -> Vec<u8> {

@@ -5,6 +5,7 @@
 
 pub mod beam;
 pub mod derived;
+pub mod gate_filter;
 pub mod interpolate;
 pub mod quality;
 pub mod smooth;
@@ -18,6 +19,11 @@ use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
+pub use gate_filter::{
+    CompanionSampler, CompanionSweep, GateFilter, GateFilterMask, GateFilterOutcome,
+    GateFilterReport, apply_gate_filter, evaluate_gate_filter, masked_grid,
+    resolve_companion_sweep,
+};
 use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{InterpolatedGrid, UpsampleFactors, upsample_moment_grid};
 use radar_core::{
@@ -229,6 +235,8 @@ pub enum RenderError {
     },
     #[error("viewport render cache belongs to a different radar volume")]
     CacheVolumeMismatch,
+    #[error("viewport sample cache was resolved under a different gate filter")]
+    CacheGateFilterMismatch,
     #[error("viewport render cache is for cut {actual}, expected cut {expected}")]
     CacheCutMismatch { expected: usize, actual: usize },
     #[error("viewport render cache is for {actual}, expected {expected}")]
@@ -284,6 +292,34 @@ pub fn render_moment_image_with_table(
     options: RasterOptions,
     table: Option<&ColorTable>,
 ) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+    render_moment_image_filtered(volume, cut_index, moment, options, table, &GateFilter::OFF)
+        .map(|raster| raster.image)
+}
+
+/// A raster and the account of what a [`GateFilter`] removed from it.
+///
+/// The two travel together on purpose. A censored picture handed over without
+/// its report is a picture nobody can label, and an unlabelled censored picture
+/// is the exact failure mode the whole module is written to avoid.
+pub struct FilteredRaster {
+    pub image: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    pub report: GateFilterReport,
+}
+
+/// The same raster with a [`GateFilter`] applied, plus the report of what the
+/// filter hid.
+///
+/// [`GateFilter::OFF`] takes the identical code path this function had before
+/// filtering existed - `apply_gate_filter` returns before it reads a gate, no
+/// grid is copied, and the raster is byte-for-byte what it always was.
+pub fn render_moment_image_filtered(
+    volume: &RadarVolume,
+    cut_index: usize,
+    moment: MomentType,
+    options: RasterOptions,
+    table: Option<&ColorTable>,
+    filter: &GateFilter,
+) -> Result<FilteredRaster> {
     let cut = volume
         .cuts
         .get(cut_index)
@@ -291,7 +327,7 @@ pub fn render_moment_image_with_table(
             index: cut_index,
             cut_count: volume.cuts.len(),
         })?;
-    let grid = cut
+    let source = cut
         .moments
         .get(&moment)
         .ok_or_else(|| RenderError::MissingMoment {
@@ -299,11 +335,19 @@ pub fn render_moment_image_with_table(
             moment: moment.clone(),
         })?;
 
-    if grid.radial_indices.is_empty() {
+    if source.radial_indices.is_empty() {
         return Err(RenderError::EmptyMoment { cut_index, moment });
     }
 
-    let row_lookup = AzimuthLookup::new(cut, grid);
+    // The sweep is rastered as it arrived and the censor rides in the lookup.
+    // Nothing is copied, the candidate ranking is the ranking the unfiltered
+    // raster would have used, and a censored gate stops the candidate walk
+    // instead of being stepped past. See `AzimuthLookup::censors`.
+    let outcome = evaluate_gate_filter(volume, cut_index, source, filter);
+    let report = outcome.report;
+    let grid = source;
+
+    let row_lookup = AzimuthLookup::new(cut, grid).with_censor(outcome.mask);
     let width = options.width.max(64);
     let height = options.height.max(64);
     let center_x = (width as f32 - 1.0) / 2.0;
@@ -373,10 +417,11 @@ pub fn render_moment_image_with_table(
         ),
     }
 
-    Ok(
-        ImageBuffer::from_raw(width, height, pixels)
+    Ok(FilteredRaster {
+        image: ImageBuffer::from_raw(width, height, pixels)
             .expect("RGBA buffer matches raster dimensions"),
-    )
+        report,
+    })
 }
 
 pub fn render_moment_viewport_image(
@@ -429,13 +474,38 @@ pub struct ViewportMomentCache {
     /// and/or upsample the polar lattice. Both produce a grid that is not in
     /// the volume, and both must be built once per data change rather than per
     /// frame, which is what this cache is for.
+    ///
+    /// A [`GateFilter`] is a third: it removes gates from the grid, and it too
+    /// belongs here rather than in the per-frame loop.
     display_grid: Option<MomentGrid>,
+    /// What the gate filter hid on the way in.
+    ///
+    /// [`GateFilterReport::INACTIVE`] whenever no filter was asked for, which
+    /// is the default for every constructor that does not take one. A pane
+    /// reads this to decide whether it owes the analyst a badge.
+    gate_filter: GateFilterReport,
+    /// Which gates of the SOURCE grid the filter removed, when it removed any.
+    ///
+    /// Indexed against the grid as it sits in the cut, not against the display
+    /// grid, so a readout that probes the volume can tell "this gate is hidden
+    /// by your filter" from "the radar found nothing here". Absent when no
+    /// filter ran.
+    gate_filter_mask: Option<GateFilterMask>,
 }
 
 pub struct ViewportSampleCache {
     volume_ptr: usize,
     cut_index: usize,
     moment: MomentType,
+    /// The gate filter the moment cache was carrying when these samples were
+    /// resolved.
+    ///
+    /// A sample cache is a pixel-to-gate answer frozen for reuse, and a censor
+    /// changes that answer. Replaying samples resolved under one filter through
+    /// a cache carrying another would show the analyst the previous filter's
+    /// picture under the current filter's badge, which is the one failure the
+    /// whole module is written against - so `ensure_sample_cache` refuses it.
+    gate_filter: GateFilter,
     width: u32,
     height: u32,
     sample_count: usize,
@@ -693,6 +763,22 @@ impl ViewportMomentCache {
         moment: MomentType,
         color_tables: &ColorTableSet,
     ) -> Result<Self> {
+        Self::new_filtered(volume, cut_index, moment, color_tables, &GateFilter::OFF)
+    }
+
+    /// The plain moment cache with a [`GateFilter`] applied to the sweep before
+    /// anything else touches it.
+    ///
+    /// With [`GateFilter::OFF`] this is the identical construction the
+    /// unfiltered constructor performs - the filter returns before reading a
+    /// gate, no grid is copied, and `display_grid` stays `None`.
+    pub fn new_filtered(
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: MomentType,
+        color_tables: &ColorTableSet,
+        filter: &GateFilter,
+    ) -> Result<Self> {
         let cut = volume
             .cuts
             .get(cut_index)
@@ -700,7 +786,7 @@ impl ViewportMomentCache {
                 index: cut_index,
                 cut_count: volume.cuts.len(),
             })?;
-        let grid = cut
+        let source = cut
             .moments
             .get(&moment)
             .ok_or_else(|| RenderError::MissingMoment {
@@ -708,9 +794,17 @@ impl ViewportMomentCache {
                 moment: moment.clone(),
             })?;
 
-        if grid.radial_indices.is_empty() {
+        if source.radial_indices.is_empty() {
             return Err(RenderError::EmptyMoment { cut_index, moment });
         }
+
+        // No copy of the grid: the censor travels in the lookup, so the raster
+        // walks the sweep as it arrived and simply refuses to paint - or to
+        // step past - the gates the filter removed.
+        let outcome = evaluate_gate_filter(volume, cut_index, source, filter);
+        let display_grid = None;
+        let grid = source;
+        let row_lookup = AzimuthLookup::new(cut, grid).with_censor(outcome.mask.clone());
 
         Ok(Self {
             volume_ptr: volume as *const RadarVolume as usize,
@@ -718,9 +812,11 @@ impl ViewportMomentCache {
             storm_motion_basis: (moment == MomentType::Velocity)
                 .then(|| StormMotionBasis::new(cut, grid)),
             moment,
-            row_lookup: AzimuthLookup::new(cut, grid),
+            row_lookup,
             color_lookup: CachedColorLookup::new(grid, color_tables),
-            display_grid: None,
+            display_grid,
+            gate_filter: outcome.report,
+            gate_filter_mask: outcome.mask,
         })
     }
 
@@ -732,6 +828,24 @@ impl ViewportMomentCache {
         volume: &RadarVolume,
         cut_index: usize,
         color_tables: &ColorTableSet,
+    ) -> Result<Self> {
+        Self::new_dealiased_velocity_filtered(volume, cut_index, color_tables, &GateFilter::OFF)
+    }
+
+    /// Unfold first, then censor.
+    ///
+    /// The order is deliberate and it is the only defensible one. Dealiasing
+    /// walks the sweep looking for continuity, so censoring gates ahead of it
+    /// would change the unfolded values of gates that were never filtered:
+    /// moving a threshold slider would silently rewrite the velocity elsewhere
+    /// in the picture. Unfolding first keeps the dealiaser's answer a property
+    /// of the data alone, and the filter then removes gates from a field that
+    /// has already been decided.
+    pub fn new_dealiased_velocity_filtered(
+        volume: &RadarVolume,
+        cut_index: usize,
+        color_tables: &ColorTableSet,
+        filter: &GateFilter,
     ) -> Result<Self> {
         let cut = volume
             .cuts
@@ -756,14 +870,22 @@ impl ViewportMomentCache {
         }
 
         let dealiased_grid = dealias_velocity_grid(cut, source_grid);
+        // The mask is built against the unfolded grid and stays there: the
+        // raster reads the unfolded values and refuses the censored gates, so
+        // no second copy of the sweep is made and the candidate ranking is the
+        // unfiltered one.
+        let outcome = evaluate_gate_filter(volume, cut_index, &dealiased_grid, filter);
+        let row_lookup = AzimuthLookup::new(cut, &dealiased_grid).with_censor(outcome.mask.clone());
         Ok(Self {
             volume_ptr: volume as *const RadarVolume as usize,
             cut_index,
             moment: MomentType::Velocity,
-            row_lookup: AzimuthLookup::new(cut, &dealiased_grid),
+            row_lookup,
             color_lookup: CachedColorLookup::new(&dealiased_grid, color_tables),
             storm_motion_basis: Some(StormMotionBasis::new(cut, &dealiased_grid)),
             display_grid: Some(dealiased_grid),
+            gate_filter: outcome.report,
+            gate_filter_mask: outcome.mask,
         })
     }
 
@@ -788,6 +910,33 @@ impl ViewportMomentCache {
         color_tables: &ColorTableSet,
         quality: DisplayQuality,
     ) -> Result<Self> {
+        Self::new_display_quality_filtered(
+            volume,
+            cut_index,
+            moment,
+            color_tables,
+            quality,
+            &GateFilter::OFF,
+        )
+    }
+
+    /// The display-quality cache with a [`GateFilter`] applied FIRST.
+    ///
+    /// Censoring before the quality passes rather than after is the correct
+    /// order for the same reason the interpolator is guarded at all: a
+    /// censored gate is missing data, and both the soften pass and the polar
+    /// upsampler already know what to do with missing data. Filtering
+    /// afterwards would let a bloom gate contribute its value to the
+    /// interpolated neighbours that survive it, so the bloom would leave a
+    /// halo behind after being "removed".
+    pub fn new_display_quality_filtered(
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: MomentType,
+        color_tables: &ColorTableSet,
+        quality: DisplayQuality,
+        filter: &GateFilter,
+    ) -> Result<Self> {
         let cut = volume
             .cuts
             .get(cut_index)
@@ -806,7 +955,9 @@ impl ViewportMomentCache {
             return Err(RenderError::EmptyMoment { cut_index, moment });
         }
 
-        let (display_grid, row_lookup) = apply_display_quality(cut, &moment, source, quality);
+        let outcome = evaluate_gate_filter(volume, cut_index, source, filter);
+        let (display_grid, row_lookup) =
+            display_quality_with_censor(cut, Some(&moment), source, quality, outcome.mask.as_ref());
         let grid = display_grid.as_ref().unwrap_or(source);
         let color_lookup = CachedColorLookup::new(grid, color_tables);
         let storm_motion_basis =
@@ -820,6 +971,8 @@ impl ViewportMomentCache {
             color_lookup,
             storm_motion_basis,
             display_grid,
+            gate_filter: outcome.report,
+            gate_filter_mask: outcome.mask,
         })
     }
 
@@ -836,6 +989,24 @@ impl ViewportMomentCache {
         cut_index: usize,
         color_tables: &ColorTableSet,
         quality: DisplayQuality,
+    ) -> Result<Self> {
+        Self::new_dealiased_velocity_display_quality_filtered(
+            volume,
+            cut_index,
+            color_tables,
+            quality,
+            &GateFilter::OFF,
+        )
+    }
+
+    /// Unfold, then censor, then upgrade. Each step is where it is for a
+    /// reason given on the constructor that owns it.
+    pub fn new_dealiased_velocity_display_quality_filtered(
+        volume: &RadarVolume,
+        cut_index: usize,
+        color_tables: &ColorTableSet,
+        quality: DisplayQuality,
+        filter: &GateFilter,
     ) -> Result<Self> {
         let cut = volume
             .cuts
@@ -859,13 +1030,15 @@ impl ViewportMomentCache {
         }
 
         let dealiased = dealias_velocity_grid(cut, source_grid);
+        let outcome = evaluate_gate_filter(volume, cut_index, &dealiased, filter);
         // Softening is allowed here where it is refused for raw velocity: the
         // reason for that refusal is the fold, and there is no longer one.
         let quality = DisplayQuality {
             soften: quality.soften,
             ..quality
         };
-        let (upgraded, row_lookup) = apply_display_quality_unguarded(cut, &dealiased, quality);
+        let (upgraded, row_lookup) =
+            display_quality_with_censor(cut, None, &dealiased, quality, outcome.mask.as_ref());
         let grid = upgraded.as_ref().unwrap_or(&dealiased);
         let color_lookup = CachedColorLookup::new(grid, color_tables);
         let storm_motion_basis = Some(StormMotionBasis::new(cut, grid));
@@ -878,6 +1051,8 @@ impl ViewportMomentCache {
             color_lookup,
             storm_motion_basis,
             display_grid: Some(upgraded.unwrap_or(dealiased)),
+            gate_filter: outcome.report,
+            gate_filter_mask: outcome.mask,
         })
     }
 
@@ -887,6 +1062,30 @@ impl ViewportMomentCache {
 
     pub fn moment(&self) -> &MomentType {
         &self.moment
+    }
+
+    /// What the gate filter hid on the way into this cache.
+    ///
+    /// [`GateFilterReport::INACTIVE`] when no filter was asked for. A pane must
+    /// draw a badge whenever this is not inactive: absence of echo is never
+    /// allowed to be the only evidence that gates were removed.
+    pub fn gate_filter_report(&self) -> &GateFilterReport {
+        &self.gate_filter
+    }
+
+    /// Which gates of the sweep as it sits in the volume the filter removed.
+    ///
+    /// Indexed against the SOURCE grid, so a probe that reads
+    /// `volume.cuts[cut].moments[moment]` can ask this directly. `None` when
+    /// no filter ran, or when it ran and hid nothing.
+    pub fn gate_filter_mask(&self) -> Option<&GateFilterMask> {
+        self.gate_filter_mask.as_ref()
+    }
+
+    /// The grid this cache draws instead of the one in the cut, when it has
+    /// one: dealiased, censored, softened, upsampled, or any combination.
+    pub fn display_grid(&self) -> Option<&MomentGrid> {
+        self.display_grid.as_ref()
     }
 
     pub fn render_moment_rgba_into(
@@ -919,28 +1118,18 @@ impl ViewportMomentCache {
         let geometry = viewport_geometry(grid, options);
         let lookup_table = ViewportLookupTable::new(grid, geometry);
 
-        let row_builds = match &grid.storage {
-            MomentStorage::U8(values) => {
-                build_sample_cache_rows(height, &lookup_table, &self.row_lookup, |sample| {
-                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
-            MomentStorage::U16(values) => {
-                build_sample_cache_rows(height, &lookup_table, &self.row_lookup, |sample| {
-                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
-            MomentStorage::F32(values) => {
-                build_sample_cache_rows(height, &lookup_table, &self.row_lookup, |sample| {
-                    resolve_f32_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
+        // Once for the whole viewport, not once per pixel, and as a TYPE rather
+        // than a value - see `SampleCensor`.
+        let row_builds = match self.row_lookup.censor() {
+            None => sample_rows(grid, &self.row_lookup, height, &lookup_table, NoCensor),
+            Some(censor) => sample_rows(grid, &self.row_lookup, height, &lookup_table, censor),
         };
 
         Ok(viewport_sample_cache_from_rows(
             self.volume_ptr,
             self.cut_index,
             self.moment.clone(),
+            self.gate_filter.filter,
             width,
             height,
             row_builds,
@@ -979,28 +1168,28 @@ impl ViewportMomentCache {
             return Err(RenderError::GeometryCacheMismatch);
         }
         let geometry = geometry_cache.geometry();
-        let row_builds = match &grid.storage {
-            MomentStorage::U8(values) => {
-                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
-                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
-            MomentStorage::U16(values) => {
-                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
-                    resolve_compact_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
-            MomentStorage::F32(values) => {
-                build_sample_cache_rows_from_geometry(geometry_cache.height, geometry, |sample| {
-                    resolve_f32_sample(values, grid, &self.row_lookup, sample)
-                })
-            }
+        let row_builds = match self.row_lookup.censor() {
+            None => sample_rows_from_geometry(
+                grid,
+                &self.row_lookup,
+                geometry_cache.height,
+                geometry,
+                NoCensor,
+            ),
+            Some(censor) => sample_rows_from_geometry(
+                grid,
+                &self.row_lookup,
+                geometry_cache.height,
+                geometry,
+                censor,
+            ),
         };
 
         Ok(viewport_sample_cache_from_rows(
             self.volume_ptr,
             self.cut_index,
             self.moment.clone(),
+            self.gate_filter.filter,
             geometry_cache.width,
             geometry_cache.height,
             row_builds,
@@ -1145,20 +1334,46 @@ impl ViewportMomentCache {
         let (cut, grid) = self.cut_and_grid(volume)?;
         let (width, height) = viewport_dimensions(options);
         ensure_rgba_buffer(pixels, width, height)?;
-        render_storm_relative_velocity_viewport_grid_into(
-            cut,
-            grid,
-            StormRelativeRenderCache {
-                row_lookup: &self.row_lookup,
-                storm_motion_basis: self.storm_motion_basis.as_ref(),
-                color_table: self.color_lookup.color_table(),
-                palette_cache,
-            },
-            storm_motion,
-            options,
-            pixels,
-            true,
-        );
+        // Once per frame, not once per candidate, and as a TYPE - the same
+        // choice `render_moment_viewport_grid_into` and `build_sample_cache`
+        // make. Both arms are spelled out so neither can pick `NoCensor` while
+        // a mask is present. See `SampleCensor`.
+        match self.row_lookup.censor() {
+            None => render_storm_relative_velocity_viewport_grid_into(
+                cut,
+                grid,
+                StormRelativeRenderCache {
+                    lookup: CensoredLookup {
+                        rows: &self.row_lookup,
+                        censor: NoCensor,
+                    },
+                    storm_motion_basis: self.storm_motion_basis.as_ref(),
+                    color_table: self.color_lookup.color_table(),
+                    palette_cache,
+                },
+                storm_motion,
+                options,
+                pixels,
+                true,
+            ),
+            Some(censor) => render_storm_relative_velocity_viewport_grid_into(
+                cut,
+                grid,
+                StormRelativeRenderCache {
+                    lookup: CensoredLookup {
+                        rows: &self.row_lookup,
+                        censor,
+                    },
+                    storm_motion_basis: self.storm_motion_basis.as_ref(),
+                    color_table: self.color_lookup.color_table(),
+                    palette_cache,
+                },
+                storm_motion,
+                options,
+                pixels,
+                true,
+            ),
+        }
         Ok((width, height))
     }
 
@@ -1262,7 +1477,13 @@ impl ViewportMomentCache {
             cut,
             grid,
             StormRelativeRenderCache {
-                row_lookup: &self.row_lookup,
+                // The sample cache resolved every pixel against the censor
+                // when it was built, so this arm has nothing left to ask and
+                // is handed the censor that answers no.
+                lookup: CensoredLookup {
+                    rows: &self.row_lookup,
+                    censor: NoCensor,
+                },
                 storm_motion_basis: self.storm_motion_basis.as_ref(),
                 color_table: self.color_lookup.color_table(),
                 palette_cache,
@@ -1290,6 +1511,13 @@ impl ViewportMomentCache {
                 expected: self.moment.clone(),
                 actual: sample_cache.moment.clone(),
             });
+        }
+        // A censor changes which gate a pixel resolves to, so samples baked
+        // under one filter are not this cache's samples. Refusing is the only
+        // safe answer: replaying them would draw the other filter's picture
+        // under this one's badge.
+        if self.gate_filter.filter != sample_cache.gate_filter {
+            return Err(RenderError::CacheGateFilterMismatch);
         }
         Ok(())
     }
@@ -1357,6 +1585,83 @@ fn apply_display_quality(
     apply_display_quality_unguarded(cut, source, quality)
 }
 
+/// The display-quality passes with a gate filter's censor carried across them.
+///
+/// `moment` present means the guarded entry point (softening refused for the
+/// fields whose interpolation is guarded); absent means the caller has already
+/// decided softening is safe, which only the dealiased-velocity path may say.
+///
+/// With no mask this is exactly `apply_display_quality` and nothing else, so
+/// the unfiltered path costs what it always did.
+///
+/// # Why the quality passes run twice when a filter is on
+///
+/// The censor is applied BEFORE softening and upsampling, for the reason given
+/// on `ViewportMomentCache::new_display_quality_filtered`: filtering afterwards
+/// would let a removed gate contribute its value to the interpolated
+/// neighbours that survive it, so a bloom would leave a halo behind after being
+/// "removed". But the upsampler inserts sub-beams and sub-gates, so the mask
+/// built against the sweep in the cut names nothing the raster will walk.
+///
+/// So the passes are run over the sweep as it arrived as well, and the gates
+/// that went absent between the two runs become the mask the raster uses
+/// (`gate_filter::absence_delta_mask`). Running the clean pass is what makes
+/// the candidate ranking equal to the unfiltered one, too: `row_valid_extent`
+/// ranks candidates in a bin by row length, censoring shortens rows, and a
+/// lookup ranked off the censored copy would repaint pixels whose own gate the
+/// filter never touched, at ranges the censor never reached.
+fn display_quality_with_censor(
+    cut: &ElevationCut,
+    moment: Option<&MomentType>,
+    source: &MomentGrid,
+    quality: DisplayQuality,
+    mask: Option<&GateFilterMask>,
+) -> (Option<MomentGrid>, AzimuthLookup) {
+    let upgrade = |grid: &MomentGrid| match moment {
+        Some(moment) => apply_display_quality(cut, moment, grid, quality),
+        None => apply_display_quality_unguarded(cut, grid, quality),
+    };
+
+    let Some(mask) = mask else {
+        return upgrade(source);
+    };
+
+    let Some(censored_source) = gate_filter::masked_grid(source, mask) else {
+        // This grid's encoding has no way to say "absent" that would not also
+        // change the meaning of gates the filter never selected, so there is no
+        // censored copy to soften or upsample. The sweep is drawn native with
+        // the censor in the lookup instead: a native picture that obeys the
+        // filter beats an upgraded one that quietly does not.
+        return (
+            None,
+            AzimuthLookup::new(cut, source).with_censor(Some(mask.clone())),
+        );
+    };
+
+    let (clean, row_lookup) = upgrade(source);
+    let Some(clean) = clean else {
+        // The quality passes did nothing, which they decide from the lattice
+        // and not from the values, so they would do nothing to the censored
+        // copy either. The mask already indexes this shape.
+        return (
+            Some(censored_source),
+            row_lookup.with_censor(Some(mask.clone())),
+        );
+    };
+
+    let (censored_upgrade, censored_lookup) = upgrade(&censored_source);
+    let censored = censored_upgrade.unwrap_or(censored_source);
+    match gate_filter::absence_delta_mask(&clean, &censored) {
+        Some(delta) => (Some(censored), row_lookup.with_censor(Some(delta))),
+        // Either the two upgrades disagreed about the lattice - which they
+        // should not, the factors are chosen from the geometry and not from the
+        // values - or the censor left nothing absent after the upgrade. Either
+        // way, use the lookup built for the grid actually being drawn rather
+        // than index a mask against a shape it was not built for.
+        None => (Some(censored), censored_lookup),
+    }
+}
+
 /// As `apply_display_quality`, but the caller has already decided softening is
 /// safe for this field. Only the dealiased-velocity path may say that.
 fn apply_display_quality_unguarded(
@@ -1397,6 +1702,41 @@ fn render_moment_viewport_grid_into(
     pixels: &mut [u8],
     clear_pixels: bool,
 ) -> Result<()> {
+    // Once for the whole viewport, not once per candidate, and as a TYPE rather
+    // than a value - the same choice `build_sample_cache` makes, for the same
+    // reason. See `SampleCensor`. Both arms are spelled out, so no arm can pick
+    // `NoCensor` while a mask is present.
+    match row_lookup.censor() {
+        None => render_moment_viewport_grid_into_censored(
+            grid,
+            row_lookup,
+            color_lookup,
+            options,
+            pixels,
+            NoCensor,
+            clear_pixels,
+        ),
+        Some(censor) => render_moment_viewport_grid_into_censored(
+            grid,
+            row_lookup,
+            color_lookup,
+            options,
+            pixels,
+            censor,
+            clear_pixels,
+        ),
+    }
+}
+
+fn render_moment_viewport_grid_into_censored<C: SampleCensor>(
+    grid: &MomentGrid,
+    row_lookup: &AzimuthLookup,
+    color_lookup: &CachedColorLookup,
+    options: ViewportRasterOptions,
+    pixels: &mut [u8],
+    censor: C,
+    clear_pixels: bool,
+) -> Result<()> {
     let geometry = viewport_geometry(grid, options);
     let lookup_table = ViewportLookupTable::new(grid, geometry);
 
@@ -1407,7 +1747,10 @@ fn render_moment_viewport_grid_into(
                 values,
                 palette.as_ref(),
                 grid,
-                row_lookup,
+                CensoredLookup {
+                    rows: row_lookup,
+                    censor,
+                },
                 &lookup_table,
                 clear_pixels,
             );
@@ -1418,7 +1761,10 @@ fn render_moment_viewport_grid_into(
                 values,
                 palette,
                 grid,
-                row_lookup,
+                CensoredLookup {
+                    rows: row_lookup,
+                    censor,
+                },
                 &lookup_table,
                 clear_pixels,
             );
@@ -1428,7 +1774,10 @@ fn render_moment_viewport_grid_into(
                 pixels,
                 values,
                 grid,
-                row_lookup,
+                CensoredLookup {
+                    rows: row_lookup,
+                    censor,
+                },
                 color_lookup.color_table(),
                 &lookup_table,
                 clear_pixels,
@@ -1621,10 +1970,20 @@ pub fn render_storm_relative_velocity_viewport_rgba_into(
     cache.render_storm_relative_velocity_rgba_into(volume, storm_motion, options, pixels)
 }
 
-fn render_storm_relative_velocity_viewport_grid_into(
+/// Storm-relative velocity, rastered straight into the viewport.
+///
+/// Generic over the censor for the reason [`SampleCensor`] gives, and this is
+/// the arm where it was worth the most: measured in one process on a real KDVN
+/// volume at 1920x1080, asking `AzimuthLookup::censor` per candidate rather
+/// than compiling the test away costs this path 1.1 % to 1.8 % against a noise
+/// floor of 0.2 %, reproducibly. Its per-candidate body does the most
+/// arithmetic of any arm here, so a second cache line in the dependency chain
+/// has the most to take from it. See
+/// `what_an_off_gate_filter_costs_the_direct_raster`.
+fn render_storm_relative_velocity_viewport_grid_into<C: SampleCensor>(
     cut: &ElevationCut,
     grid: &MomentGrid,
-    render_cache: StormRelativeRenderCache<'_>,
+    render_cache: StormRelativeRenderCache<'_, C>,
     storm_motion: StormMotion,
     options: ViewportRasterOptions,
     pixels: &mut [u8],
@@ -1654,7 +2013,7 @@ fn render_storm_relative_velocity_viewport_grid_into(
                 pixels,
                 values,
                 grid,
-                render_cache.row_lookup,
+                render_cache.lookup,
                 row_palettes,
                 &lookup_table,
                 clear_pixels,
@@ -1669,7 +2028,7 @@ fn render_storm_relative_velocity_viewport_grid_into(
                 pixels,
                 values,
                 grid,
-                render_cache.row_lookup,
+                render_cache.lookup,
                 StormRelativeValueLookup {
                     row_motion: &row_motion,
                     color_table: render_cache.color_table,
@@ -1687,7 +2046,7 @@ fn render_storm_relative_velocity_viewport_grid_into(
                 pixels,
                 values,
                 grid,
-                render_cache.row_lookup,
+                render_cache.lookup,
                 StormRelativeValueLookup {
                     row_motion: &row_motion,
                     color_table: render_cache.color_table,
@@ -1702,7 +2061,7 @@ fn render_storm_relative_velocity_viewport_grid_into(
 fn render_storm_relative_velocity_sample_cache_grid_into(
     cut: &ElevationCut,
     grid: &MomentGrid,
-    render_cache: StormRelativeRenderCache<'_>,
+    render_cache: StormRelativeRenderCache<'_, NoCensor>,
     storm_motion: StormMotion,
     sample_cache: &ViewportSampleCache,
     pixels: &mut [u8],
@@ -1767,8 +2126,19 @@ fn render_storm_relative_velocity_sample_cache_grid_into(
     }
 }
 
-struct StormRelativeRenderCache<'a> {
-    row_lookup: &'a AzimuthLookup,
+/// Everything the storm-relative arms need besides the sweep itself.
+///
+/// `lookup` carries the censor as a TYPE (see [`CensoredLookup`] and
+/// [`SampleCensor`]), which is what keeps the per-candidate filter test out of
+/// the machine code on the OFF path. The choice is made once, by the two
+/// `ViewportMomentCache` methods that build this, with both arms spelled out.
+///
+/// The sample-cache arm never reads `lookup`: its samples were resolved
+/// against the censor when the cache was built, so re-asking per pixel would
+/// be the same question twice. It is handed [`NoCensor`] and ignores it,
+/// rather than the struct being split in two over one unused field.
+struct StormRelativeRenderCache<'a, C: SampleCensor> {
+    lookup: CensoredLookup<'a, C>,
     storm_motion_basis: Option<&'a StormMotionBasis>,
     color_table: &'a ColorTable,
     palette_cache: Option<&'a StormRelativePaletteCache>,
@@ -2058,6 +2428,12 @@ fn render_compact_storage<T: RawMomentValue, G: LookupGeometry>(
                     continue;
                 };
                 for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`.
+                    if row_lookup.censors(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied() else {
                         continue;
@@ -2074,12 +2450,12 @@ fn render_compact_storage<T: RawMomentValue, G: LookupGeometry>(
         });
 }
 
-fn render_compact_viewport_storage<T: RawMomentValue>(
+fn render_compact_viewport_storage<T: RawMomentValue, C: SampleCensor>(
     pixels: &mut [u8],
     values: &[T],
     palette: &[[u8; 4]],
     grid: &MomentGrid,
-    row_lookup: &AzimuthLookup,
+    lookup: CensoredLookup<'_, C>,
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
 ) {
@@ -2098,10 +2474,17 @@ fn render_compact_viewport_storage<T: RawMomentValue>(
                 return;
             };
             for x in row_lookup_table.x_range.clone() {
-                let Some(sample) = row_lookup_table.lookup(x, row_lookup) else {
+                let Some(sample) = row_lookup_table.lookup(x, lookup.rows) else {
                     continue;
                 };
-                for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                for candidate in lookup.rows.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`. Compiled away entirely when `C`
+                    // is `NoCensor` - see [`SampleCensor`].
+                    if lookup.censor.hides(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied() else {
                         continue;
@@ -2185,6 +2568,12 @@ fn render_f32_storage<G: LookupGeometry>(
                     continue;
                 };
                 for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`.
+                    if row_lookup.censors(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(value) = values.get(index).copied().filter(|value| value.is_finite())
                     else {
@@ -2202,11 +2591,11 @@ fn render_f32_storage<G: LookupGeometry>(
         });
 }
 
-fn render_f32_viewport_storage(
+fn render_f32_viewport_storage<C: SampleCensor>(
     pixels: &mut [u8],
     values: &[f32],
     grid: &MomentGrid,
-    row_lookup: &AzimuthLookup,
+    lookup: CensoredLookup<'_, C>,
     color_table: &ColorTable,
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
@@ -2226,10 +2615,17 @@ fn render_f32_viewport_storage(
                 return;
             };
             for x in row_lookup_table.x_range.clone() {
-                let Some(sample) = row_lookup_table.lookup(x, row_lookup) else {
+                let Some(sample) = row_lookup_table.lookup(x, lookup.rows) else {
                     continue;
                 };
-                for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                for candidate in lookup.rows.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`. Compiled away entirely when `C`
+                    // is `NoCensor` - see [`SampleCensor`].
+                    if lookup.censor.hides(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(value) = values.get(index).copied().filter(|value| value.is_finite())
                     else {
@@ -2317,6 +2713,12 @@ fn render_storm_relative_storage<T: RawMomentValue, G: LookupGeometry>(
                     continue;
                 };
                 for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`.
+                    if row_lookup.censors(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied().map(RawMomentValue::to_usize) else {
                         continue;
@@ -2347,11 +2749,11 @@ fn render_storm_relative_storage<T: RawMomentValue, G: LookupGeometry>(
         });
 }
 
-fn render_storm_relative_viewport_storage<T: RawMomentValue>(
+fn render_storm_relative_viewport_storage<T: RawMomentValue, C: SampleCensor>(
     pixels: &mut [u8],
     values: &[T],
     grid: &MomentGrid,
-    row_lookup: &AzimuthLookup,
+    lookup: CensoredLookup<'_, C>,
     value_lookup: StormRelativeValueLookup<'_>,
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
@@ -2371,10 +2773,17 @@ fn render_storm_relative_viewport_storage<T: RawMomentValue>(
                 return;
             };
             for x in row_lookup_table.x_range.clone() {
-                let Some(sample) = row_lookup_table.lookup(x, row_lookup) else {
+                let Some(sample) = row_lookup_table.lookup(x, lookup.rows) else {
                     continue;
                 };
-                for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                for candidate in lookup.rows.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`. Compiled away entirely when `C`
+                    // is `NoCensor` - see [`SampleCensor`].
+                    if lookup.censor.hides(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied().map(RawMomentValue::to_usize) else {
                         continue;
@@ -2468,6 +2877,12 @@ fn render_storm_relative_u8_storage<G: LookupGeometry>(
                     continue;
                 };
                 for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`.
+                    if row_lookup.censors(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied() else {
                         continue;
@@ -2487,11 +2902,11 @@ fn render_storm_relative_u8_storage<G: LookupGeometry>(
         });
 }
 
-fn render_storm_relative_u8_viewport_storage(
+fn render_storm_relative_u8_viewport_storage<C: SampleCensor>(
     pixels: &mut [u8],
     values: &[u8],
     grid: &MomentGrid,
-    row_lookup: &AzimuthLookup,
+    lookup: CensoredLookup<'_, C>,
     row_palettes: &[[[u8; 4]; 256]],
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
@@ -2511,10 +2926,17 @@ fn render_storm_relative_u8_viewport_storage(
                 return;
             };
             for x in row_lookup_table.x_range.clone() {
-                let Some(sample) = row_lookup_table.lookup(x, row_lookup) else {
+                let Some(sample) = row_lookup_table.lookup(x, lookup.rows) else {
                     continue;
                 };
-                for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                for candidate in lookup.rows.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`. Compiled away entirely when `C`
+                    // is `NoCensor` - see [`SampleCensor`].
+                    if lookup.censor.hides(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(raw) = values.get(index).copied() else {
                         continue;
@@ -2656,6 +3078,12 @@ fn render_storm_relative_f32_storage<G: LookupGeometry>(
                     continue;
                 };
                 for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`.
+                    if row_lookup.censors(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(velocity) =
                         values.get(index).copied().filter(|value| value.is_finite())
@@ -2680,11 +3108,11 @@ fn render_storm_relative_f32_storage<G: LookupGeometry>(
         });
 }
 
-fn render_storm_relative_f32_viewport_storage(
+fn render_storm_relative_f32_viewport_storage<C: SampleCensor>(
     pixels: &mut [u8],
     values: &[f32],
     grid: &MomentGrid,
-    row_lookup: &AzimuthLookup,
+    lookup: CensoredLookup<'_, C>,
     value_lookup: StormRelativeValueLookup<'_>,
     lookup_table: &ViewportLookupTable,
     clear_pixels: bool,
@@ -2704,10 +3132,17 @@ fn render_storm_relative_f32_viewport_storage(
                 return;
             };
             for x in row_lookup_table.x_range.clone() {
-                let Some(sample) = row_lookup_table.lookup(x, row_lookup) else {
+                let Some(sample) = row_lookup_table.lookup(x, lookup.rows) else {
                     continue;
                 };
-                for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+                for candidate in lookup.rows.candidates_for_bin(sample.azimuth_bin) {
+                    // Removed by the pane's gate filter: leave the pixel empty
+                    // rather than falling through to the next beam. See
+                    // `AzimuthLookup::censors`. Compiled away entirely when `C`
+                    // is `NoCensor` - see [`SampleCensor`].
+                    if lookup.censor.hides(candidate.row, sample.gate) {
+                        break;
+                    }
                     let index = candidate.row * gate_count + sample.gate;
                     let Some(velocity) =
                         values.get(index).copied().filter(|value| value.is_finite())
@@ -2776,6 +3211,64 @@ fn render_storm_relative_f32_sample_cache_storage(
                 pixel += 4;
             }
         });
+}
+
+/// Resolve every pixel of a viewport to a gate, under one censor.
+///
+/// The storage match lives here rather than at the call site so that adding a
+/// censor did not double a three-armed `match` into six. `C` is chosen once by
+/// the caller and the whole walk is compiled against it - see [`SampleCensor`].
+fn sample_rows<C: SampleCensor>(
+    grid: &MomentGrid,
+    row_lookup: &AzimuthLookup,
+    height: u32,
+    lookup_table: &ViewportLookupTable,
+    censor: C,
+) -> Vec<CachedRowBuild> {
+    match &grid.storage {
+        MomentStorage::U8(values) => {
+            build_sample_cache_rows(height, lookup_table, row_lookup, |sample| {
+                resolve_compact_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+        MomentStorage::U16(values) => {
+            build_sample_cache_rows(height, lookup_table, row_lookup, |sample| {
+                resolve_compact_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+        MomentStorage::F32(values) => {
+            build_sample_cache_rows(height, lookup_table, row_lookup, |sample| {
+                resolve_f32_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+    }
+}
+
+/// The same, replaying a geometry cache instead of recomputing the geometry.
+fn sample_rows_from_geometry<C: SampleCensor>(
+    grid: &MomentGrid,
+    row_lookup: &AzimuthLookup,
+    height: u32,
+    geometry: CachedViewportGeometry<'_>,
+    censor: C,
+) -> Vec<CachedRowBuild> {
+    match &grid.storage {
+        MomentStorage::U8(values) => {
+            build_sample_cache_rows_from_geometry(height, geometry, |sample| {
+                resolve_compact_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+        MomentStorage::U16(values) => {
+            build_sample_cache_rows_from_geometry(height, geometry, |sample| {
+                resolve_compact_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+        MomentStorage::F32(values) => {
+            build_sample_cache_rows_from_geometry(height, geometry, |sample| {
+                resolve_f32_sample(values, grid, row_lookup, censor, sample)
+            })
+        }
+    }
 }
 
 fn build_sample_cache_rows<R>(
@@ -2939,6 +3432,7 @@ fn viewport_sample_cache_from_rows(
     volume_ptr: usize,
     cut_index: usize,
     moment: MomentType,
+    gate_filter: GateFilter,
     width: u32,
     height: u32,
     row_builds: Vec<CachedRowBuild>,
@@ -2948,6 +3442,7 @@ fn viewport_sample_cache_from_rows(
         volume_ptr,
         cut_index,
         moment,
+        gate_filter,
         width,
         height,
         sample_count,
@@ -2993,14 +3488,94 @@ fn push_cached_sample_skip(samples: &mut Vec<CachedSample>, mut pixel_count: u32
     }
 }
 
-fn resolve_compact_sample<T: RawMomentValue>(
+/// Whether a hoisted censor removed this gate of this row.
+///
+/// The one rule, in one place: [`AzimuthLookup::censors`] and every caller
+/// holding a censor of its own both come through here, so the hot-loop
+/// spelling and the convenient spelling cannot answer differently.
+#[inline]
+fn censors(censor: Option<&GateFilterMask>, row: usize, gate: usize) -> bool {
+    censor.is_some_and(|censor| censor.hides(row, gate))
+}
+
+/// A censor the sample resolvers are compiled against rather than branch on.
+///
+/// The sample cache is where a pixel is matched to a gate, and it is the
+/// hottest loop in this crate: one candidate walk per pixel per rebuild, with a
+/// body of a few nanoseconds. Asking `Option<&GateFilterMask>` inside that walk
+/// is not free even when the answer is always no - measured on a real KDVN
+/// volume with the filter OFF, against 2e5ecf1, a per-candidate `Option` test
+/// cost `geometry_cache_resolve` +39% to +52% and `sample_cache_build` +13% to
+/// +23% across four viewport and product combinations, while
+/// `decode_from_bytes`, which neither commit touches, stayed inside 1.4%.
+/// Hoisting the `Option` into a register recovered the second of those and none
+/// of the first; deleting the test recovered both, which is what identified it.
+///
+/// So the test is compiled away instead. [`NoCensor`] is a zero-sized type
+/// whose answer is a constant, and the resolvers are generic over this trait,
+/// so the uncensored build is the loop that existed before the gate filter
+/// did, which is what makes "OFF costs nothing" a fact about the machine code
+/// rather than a hope about the branch predictor.
+///
+/// The choice is made once per sample-cache build, in
+/// [`ViewportMomentCache::build_sample_cache`] and
+/// [`ViewportMomentCache::build_sample_cache_from_geometry_cache`], off the
+/// lookup's own censor. Neither can pick `NoCensor` while a mask is present:
+/// there is one `match` and both arms are spelled out.
+/// A candidate list and the censor that belongs to it, carried as one value.
+///
+/// The two are never meaningfully apart: the censor is the mask
+/// [`AzimuthLookup`] was built with, and every loop that walks the candidates
+/// has to ask the censor about the same rows. Passing them separately let a
+/// raster arm take a censor that did not come from its own lookup, and cost
+/// each of these functions an eighth parameter; this makes the pairing the
+/// type rather than a convention.
+#[derive(Clone, Copy)]
+struct CensoredLookup<'a, C: SampleCensor> {
+    rows: &'a AzimuthLookup,
+    censor: C,
+}
+
+trait SampleCensor: Copy + Sync {
+    fn hides(self, row: usize, gate: usize) -> bool;
+}
+
+/// The censor of a pane that is filtering nothing.
+#[derive(Clone, Copy)]
+struct NoCensor;
+
+impl SampleCensor for NoCensor {
+    #[inline(always)]
+    fn hides(self, _row: usize, _gate: usize) -> bool {
+        false
+    }
+}
+
+impl SampleCensor for &GateFilterMask {
+    #[inline(always)]
+    fn hides(self, row: usize, gate: usize) -> bool {
+        GateFilterMask::hides(self, row, gate)
+    }
+}
+
+fn resolve_compact_sample<T: RawMomentValue, C: SampleCensor>(
     values: &[T],
     grid: &MomentGrid,
     row_lookup: &AzimuthLookup,
+    censor: C,
     sample: SampleLookup,
 ) -> Option<ResolvedSample> {
     let gate_count = grid.gate_range.gate_count;
     for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+        // A sample cache is the raster's answer baked once and replayed every
+        // frame, so a censored gate has to stop the walk here for the same
+        // reason it stops it there: the alternative is a cached pixel that
+        // shows a neighbouring beam wherever the filter removed one.
+        //
+        // Compiled away entirely when `C` is `NoCensor` - see [`SampleCensor`].
+        if censor.hides(candidate.row, sample.gate) {
+            return None;
+        }
         let index = candidate.row * gate_count + sample.gate;
         if index >= values.len() {
             continue;
@@ -3017,14 +3592,18 @@ fn resolve_compact_sample<T: RawMomentValue>(
     None
 }
 
-fn resolve_f32_sample(
+fn resolve_f32_sample<C: SampleCensor>(
     values: &[f32],
     grid: &MomentGrid,
     row_lookup: &AzimuthLookup,
+    censor: C,
     sample: SampleLookup,
 ) -> Option<ResolvedSample> {
     let gate_count = grid.gate_range.gate_count;
     for candidate in row_lookup.candidates_for_bin(sample.azimuth_bin) {
+        if censor.hides(candidate.row, sample.gate) {
+            return None;
+        }
         let index = candidate.row * gate_count + sample.gate;
         if index < values.len() && values[index].is_finite() {
             return Some(ResolvedSample {
@@ -3604,9 +4183,70 @@ fn azimuth_from_xy(dx: f32, dy: f32) -> f32 {
 
 struct AzimuthLookup {
     bins: Vec<AzimuthBin>,
+    /// Gates a [`GateFilter`] removed, indexed against the grid this lookup was
+    /// built for. `None` on every unfiltered path, which is all of them by
+    /// default.
+    censor: Option<GateFilterMask>,
 }
 
 impl AzimuthLookup {
+    /// Attach the gates a filter censored, so the raster stops at them instead
+    /// of falling through to the next beam.
+    fn with_censor(mut self, censor: Option<GateFilterMask>) -> Self {
+        self.censor = censor;
+        self
+    }
+
+    /// True when a filter removed this gate of this row.
+    ///
+    /// Every raster arm asks this FIRST, at the top of its candidate walk, and
+    /// stops the walk when the answer is yes. One rule, and it is the rule the
+    /// whole gate filter rests on: a censored gate must not be painted, and it
+    /// must not be stepped past either. The next candidate in the bin is a
+    /// DIFFERENT radial - the 0.1 degree raster bins overlap, so roughly a
+    /// third of them list two beams - and painting it would put a neighbouring
+    /// beam's value where a removed gate was. The pixel would change colour
+    /// instead of emptying out, and nothing on screen would say so. Stopping
+    /// makes every pixel an active filter changes go one way only: opaque to
+    /// fully transparent, never opaque to a different opaque, and never
+    /// transparent to opaque.
+    ///
+    /// The cost of stopping is bounded and worth naming: a pixel whose own gate
+    /// was censored goes empty even in the rare case where the unfiltered
+    /// raster had painted it from a neighbour because that gate's value fell
+    /// off the bottom of the colour table. That pixel's own gate is one the
+    /// analyst asked to remove, so emptying it is the answer to the question
+    /// they asked; showing the neighbour there was already an artefact of the
+    /// fall-through.
+    ///
+    /// Free when nothing is censored: one `Option` test per candidate.
+    #[inline]
+    fn censors(&self, row: usize, gate: usize) -> bool {
+        censors(self.censor(), row, gate)
+    }
+
+    /// The censor itself, for a caller that is about to ask about it many
+    /// times and can hold the answer.
+    ///
+    /// [`AzimuthLookup::censors`] reads `self.censor` on every call, and
+    /// `AzimuthLookup` is 88 bytes: the `bins` pointer the candidate walk is
+    /// already using and the `Option<GateFilterMask>` discriminant are not
+    /// reliably on the same cache line, so a per-candidate `censors` puts a
+    /// second line in the dependency chain of a loop whose whole body is a few
+    /// nanoseconds. Measured on a real KDVN volume with the filter OFF, against
+    /// 2e5ecf1: `geometry_cache_resolve` +34% to +48% and `sample_cache_build`
+    /// +13% to +23%, reproducible across four viewport/product combinations
+    /// while `decode_from_bytes` - which neither commit touches - stayed within
+    /// 1.4%. The raster arms did not move, because they do more work per
+    /// candidate and already touch the values array.
+    ///
+    /// Hoisting turns that into a nullable pointer the caller keeps in a
+    /// register. It is the same test in the same place, so nothing about which
+    /// gates are censored changes - only how often the question costs a load.
+    #[inline]
+    fn censor(&self) -> Option<&GateFilterMask> {
+        self.censor.as_ref()
+    }
     fn new(cut: &ElevationCut, grid: &MomentGrid) -> Self {
         Self::from_row_azimuths_iter(
             grid,
@@ -3664,11 +4304,11 @@ impl AzimuthLookup {
 
         let mut bins = vec![AzimuthBin::default(); AZIMUTH_BINS];
         if groups.is_empty() {
-            return Self { bins };
+            return Self { bins, censor: None };
         }
         if groups.len() == 1 {
             fill_azimuth_bins(&mut bins, 0.0, 360.0, &groups[0].candidates);
-            return Self { bins };
+            return Self { bins, censor: None };
         }
 
         for index in 0..groups.len() {
@@ -3695,7 +4335,7 @@ impl AzimuthLookup {
             );
         }
 
-        Self { bins }
+        Self { bins, censor: None }
     }
 
     #[cfg(test)]
@@ -4394,8 +5034,8 @@ mod tests {
         let MomentStorage::U8(values) = &grid.storage else {
             panic!("test grid should use u8 storage");
         };
-        let resolved =
-            resolve_compact_sample(values, &grid, &lookup, sample).expect("sample should resolve");
+        let resolved = resolve_compact_sample(values, &grid, &lookup, NoCensor, sample)
+            .expect("sample should resolve");
         assert_eq!(resolved.row, 1);
         assert_eq!(resolved.gate, 3);
     }
@@ -4437,6 +5077,7 @@ mod tests {
             values,
             &grid,
             &lookup,
+            NoCensor,
             SampleLookup {
                 azimuth_bin: azimuth_bin(0.0),
                 gate: 3,
@@ -4865,6 +5506,503 @@ mod tests {
         (cut, grid)
     }
 
+    fn gate_filter_viewport_options() -> ViewportRasterOptions {
+        ViewportRasterOptions {
+            width: 128,
+            height: 128,
+            radar_x_px: 64.0,
+            radar_y_px: 64.0,
+            km_per_px_x: 0.1,
+            km_per_px_y: 0.1,
+        }
+    }
+
+    fn render_with_cache(cache: &ViewportMomentCache, volume: &RadarVolume) -> Vec<u8> {
+        let options = gate_filter_viewport_options();
+        let mut pixels = vec![0; viewport_rgba_buffer_len(options)];
+        cache
+            .render_moment_rgba_into(volume, options, &mut pixels)
+            .expect("viewport render");
+        pixels
+    }
+
+    /// The pin that keeps the default free. If this ever fails, the filter has
+    /// started charging the unfiltered path for its existence.
+    #[test]
+    fn an_inactive_gate_filter_renders_the_same_raster_as_no_filter_at_all() {
+        let volume = test_volume();
+        let plain = render_moment_image(
+            &volume,
+            0,
+            MomentType::Reflectivity,
+            RasterOptions::default(),
+        )
+        .expect("plain raster");
+        let filtered = render_moment_image_filtered(
+            &volume,
+            0,
+            MomentType::Reflectivity,
+            RasterOptions::default(),
+            None,
+            &GateFilter::OFF,
+        )
+        .expect("filtered raster");
+
+        assert_eq!(plain.as_raw(), filtered.image.as_raw());
+        assert_eq!(filtered.report, GateFilterReport::INACTIVE);
+    }
+
+    #[test]
+    fn an_inactive_gate_filter_builds_the_same_viewport_cache() {
+        let volume = test_volume();
+        let plain =
+            ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity).expect("plain cache");
+        let filtered = ViewportMomentCache::new_filtered(
+            &volume,
+            0,
+            MomentType::Reflectivity,
+            &ColorTableSet::default(),
+            &GateFilter::OFF,
+        )
+        .expect("filtered cache");
+
+        assert!(
+            filtered.display_grid().is_none(),
+            "an inactive filter must not allocate a display grid"
+        );
+        assert!(filtered.gate_filter_mask().is_none());
+        assert!(filtered.gate_filter_report().is_inactive());
+        assert_eq!(
+            render_with_cache(&plain, &volume),
+            render_with_cache(&filtered, &volume)
+        );
+    }
+
+    #[test]
+    fn an_inactive_gate_filter_leaves_the_display_quality_path_alone() {
+        let volume = test_volume();
+        let tables = ColorTableSet::default();
+        for quality in [
+            DisplayQuality::NATIVE,
+            DisplayQuality::SMOOTH,
+            DisplayQuality::HIGH,
+        ] {
+            let plain = ViewportMomentCache::new_display_quality(
+                &volume,
+                0,
+                MomentType::Reflectivity,
+                &tables,
+                quality,
+            )
+            .expect("plain quality cache");
+            let filtered = ViewportMomentCache::new_display_quality_filtered(
+                &volume,
+                0,
+                MomentType::Reflectivity,
+                &tables,
+                quality,
+                &GateFilter::OFF,
+            )
+            .expect("filtered quality cache");
+
+            assert_eq!(
+                render_with_cache(&plain, &volume),
+                render_with_cache(&filtered, &volume),
+                "{quality:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inactive_gate_filter_leaves_the_dealiased_velocity_path_alone() {
+        let volume = test_volume();
+        let tables = ColorTableSet::default();
+        let plain =
+            ViewportMomentCache::new_dealiased_velocity(&volume, 0).expect("plain dealiased cache");
+        let filtered = ViewportMomentCache::new_dealiased_velocity_filtered(
+            &volume,
+            0,
+            &tables,
+            &GateFilter::OFF,
+        )
+        .expect("filtered dealiased cache");
+
+        assert!(filtered.gate_filter_report().is_inactive());
+        assert_eq!(
+            render_with_cache(&plain, &volume),
+            render_with_cache(&filtered, &volume)
+        );
+    }
+
+    /// An active filter must change the picture, must say so, and must do it by
+    /// leaving pixels transparent rather than by painting them a colour.
+    #[test]
+    fn an_active_gate_filter_removes_pixels_and_reports_what_it_removed() {
+        let volume = test_volume();
+        let tables = ColorTableSet::default();
+        // The fixture's reflectivity encodes raw words as dBZ directly, so a
+        // 45 dBZ floor removes the 20, 30 and 40 gates of every radial.
+        let filter = GateFilter {
+            min_reflectivity_dbz: Some(45.0),
+            ..GateFilter::OFF
+        };
+        let plain =
+            ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity).expect("plain cache");
+        let filtered = ViewportMomentCache::new_filtered(
+            &volume,
+            0,
+            MomentType::Reflectivity,
+            &tables,
+            &filter,
+        )
+        .expect("filtered cache");
+
+        let report = filtered.gate_filter_report();
+        assert_eq!(report.gates_visible, 24);
+        assert_eq!(report.gates_hidden, 12);
+        assert_eq!(report.hidden_by_min_reflectivity, 12);
+        assert!(
+            filtered.display_grid().is_none(),
+            "the censor rides in the lookup; the sweep is not copied"
+        );
+        assert_eq!(
+            filtered
+                .gate_filter_mask()
+                .map(GateFilterMask::hidden_count),
+            Some(12)
+        );
+
+        let plain_pixels = render_with_cache(&plain, &volume);
+        let filtered_pixels = render_with_cache(&filtered, &volume);
+        assert_ne!(plain_pixels, filtered_pixels);
+
+        // Every pixel the filter changed became transparent; none was
+        // recoloured, and none that was already transparent gained a colour.
+        for (index, (before, after)) in plain_pixels
+            .chunks_exact(4)
+            .zip(filtered_pixels.chunks_exact(4))
+            .enumerate()
+        {
+            if before == after {
+                continue;
+            }
+            assert_ne!(before[3], 0, "pixel {index} appeared out of nothing");
+            assert_eq!(
+                after,
+                [0, 0, 0, 0],
+                "pixel {index} was recoloured instead of removed"
+            );
+        }
+    }
+
+    /// A sweep whose radials are half a degree apart, which is what a real
+    /// super-resolution WSR-88D sweep looks like and what the four-radial
+    /// fixture above is not.
+    ///
+    /// Half a degree apart means each radial group's half-width reaches its
+    /// neighbours, and `fill_azimuth_bins` rounds those bounds outward, so
+    /// adjacent groups write into the SAME 0.1 degree raster bins - roughly a
+    /// third of the 3,600 bins end up listing two radials. That overlap is the
+    /// whole reason a censored gate has to stop the candidate walk, and no
+    /// fixture without it can catch a censor that falls through to the beam
+    /// next door.
+    ///
+    /// The values are arranged so both ways a fall-through can go wrong are in
+    /// range of one filter:
+    ///
+    /// * EVEN radials carry 60 dBZ out to gate 49 and 10 dBZ from 50 to 99.
+    /// * ODD radials carry 35 dBZ out to gate 79 and nothing beyond.
+    ///
+    /// Unfiltered, the even radials are the longer rows, so they rank first in
+    /// every shared bin and the picture is theirs. A 20 dBZ floor censors the
+    /// even radials' outer half and nothing else. A raster that steps past a
+    /// censored gate paints the odd radial's 35 dBZ there instead of leaving it
+    /// empty; a raster that ranks candidates off the censored copy finds the
+    /// even rows shortened to 50 gates, promotes the odd rows, and repaints
+    /// even the INNER half - gates whose own value the filter never touched.
+    fn overlapping_beam_volume() -> RadarVolume {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 250,
+            gate_count: 100,
+        };
+        let mut cut = ElevationCut::new(0.5, Some(212));
+        for row in 0..720 {
+            cut.radials.push(Radial {
+                azimuth_deg: row as f32 * 0.5,
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(32.0),
+                radial_status: None,
+            });
+        }
+
+        let mut reflectivity = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range,
+            1.0,
+            0.0,
+            Some(0),
+            Some(1),
+        );
+        for row in 0..720 {
+            let values: Vec<u8> = (0..100)
+                .map(|gate| {
+                    if row % 2 == 0 {
+                        if gate < 50 { 60 } else { 10 }
+                    } else if gate < 80 {
+                        35
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            reflectivity
+                .push_u8_row_slice(row, &values)
+                .expect("reflectivity row");
+        }
+        cut.moments.insert(MomentType::Reflectivity, reflectivity);
+
+        let mut volume = RadarVolume::new(RadarSite::new("TST"), chrono::Utc::now());
+        volume.cuts.push(cut);
+        volume
+    }
+
+    /// Count what a filter did to a picture, pixel by pixel.
+    ///
+    /// `(removed, recoloured, appeared)`. Only the first may be non-zero: a
+    /// censor takes echo away and does nothing else. A recoloured pixel is a
+    /// pixel showing a value from a beam the analyst did not ask about, and an
+    /// appeared pixel is echo conjured out of a filter.
+    fn pixel_accounting(before: &[u8], after: &[u8]) -> (usize, usize, usize) {
+        let mut removed = 0;
+        let mut recoloured = 0;
+        let mut appeared = 0;
+        for (before, after) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
+            if before == after {
+                continue;
+            }
+            match (before[3] == 0, after[3] == 0) {
+                (false, true) => removed += 1,
+                (true, false) => appeared += 1,
+                _ => recoloured += 1,
+            }
+        }
+        (removed, recoloured, appeared)
+    }
+
+    fn overlapping_beam_raster(filter: &GateFilter) -> (Vec<u8>, GateFilterReport) {
+        let volume = overlapping_beam_volume();
+        let rendered = render_moment_image_filtered(
+            &volume,
+            0,
+            MomentType::Reflectivity,
+            RasterOptions::default(),
+            None,
+            filter,
+        )
+        .expect("raster");
+        (rendered.image.into_raw(), rendered.report)
+    }
+
+    /// The pin for the fall-through. Revert `AzimuthLookup::censors` - or build
+    /// the lookup from the censored copy instead of the sweep as it arrived -
+    /// and this fails with thousands of recoloured pixels.
+    #[test]
+    fn a_censored_gate_is_never_replaced_by_the_beam_beside_it() {
+        let (plain, plain_report) = overlapping_beam_raster(&GateFilter::OFF);
+        assert!(plain_report.is_inactive());
+
+        let (filtered, report) = overlapping_beam_raster(&GateFilter {
+            min_reflectivity_dbz: Some(20.0),
+            ..GateFilter::OFF
+        });
+        // 360 even radials, 50 censored gates each.
+        assert_eq!(report.gates_hidden, 360 * 50);
+
+        let (removed, recoloured, appeared) = pixel_accounting(&plain, &filtered);
+        assert!(removed > 0, "an active filter must change the picture");
+        assert_eq!(
+            recoloured, 0,
+            "a censored gate was painted from another beam"
+        );
+        assert_eq!(appeared, 0, "a filter conjured echo out of nothing");
+    }
+
+    /// True when every pixel in `changed` has a pixel of `removed` within
+    /// `radius` of it.
+    ///
+    /// This is how the display-quality paths are held to the rule that the
+    /// native path is held to exactly. Softening and interpolation run over the
+    /// CENSORED sweep, so a gate that survives next to one that did not can
+    /// legitimately change colour - its interpolated value no longer has the
+    /// removed gate in it, which is the whole reason censoring happens before
+    /// the quality passes rather than after. What such a change cannot be is
+    /// FAR from anything that was removed: the smoothing and interpolation
+    /// footprints are a gate wide. A censor that fell through to the beam
+    /// beside it, or a lookup re-ranked off the censored copy, repaints pixels
+    /// nowhere near a removed gate, and that is what this catches.
+    fn changes_hug_the_removals(
+        removed: &[bool],
+        changed: &[(usize, usize)],
+        width: usize,
+        height: usize,
+        radius: i32,
+    ) -> Option<(usize, usize)> {
+        changed.iter().copied().find(|(x, y)| {
+            let near = (-radius..=radius).any(|dy| {
+                (-radius..=radius).any(|dx| {
+                    let nx = *x as i32 + dx;
+                    let ny = *y as i32 + dy;
+                    nx >= 0
+                        && ny >= 0
+                        && (nx as usize) < width
+                        && (ny as usize) < height
+                        && removed[ny as usize * width + nx as usize]
+                })
+            });
+            !near
+        })
+    }
+
+    /// The same picture, through the viewport cache and the display-quality
+    /// passes, where the censor has to be carried across a grid whose lattice
+    /// the upsampler has changed.
+    #[test]
+    fn a_censored_gate_survives_the_display_quality_passes_without_recolouring() {
+        let volume = overlapping_beam_volume();
+        let tables = ColorTableSet::default();
+        let filter = GateFilter {
+            min_reflectivity_dbz: Some(20.0),
+            ..GateFilter::OFF
+        };
+        let options = ViewportRasterOptions {
+            width: 256,
+            height: 256,
+            radar_x_px: 128.0,
+            radar_y_px: 128.0,
+            km_per_px_x: 0.12,
+            km_per_px_y: 0.12,
+        };
+
+        for quality in [
+            DisplayQuality::NATIVE,
+            DisplayQuality::SMOOTH,
+            DisplayQuality::HIGH,
+        ] {
+            let plain = ViewportMomentCache::new_display_quality(
+                &volume,
+                0,
+                MomentType::Reflectivity,
+                &tables,
+                quality,
+            )
+            .expect("plain quality cache");
+            let censored = ViewportMomentCache::new_display_quality_filtered(
+                &volume,
+                0,
+                MomentType::Reflectivity,
+                &tables,
+                quality,
+                &filter,
+            )
+            .expect("filtered quality cache");
+
+            let mut before = vec![0; viewport_rgba_buffer_len(options)];
+            let mut after = vec![0; viewport_rgba_buffer_len(options)];
+            plain
+                .render_moment_rgba_into(&volume, options, &mut before)
+                .expect("plain raster");
+            censored
+                .render_moment_rgba_into(&volume, options, &mut after)
+                .expect("filtered raster");
+
+            let (removed_count, recoloured, appeared) = pixel_accounting(&before, &after);
+            assert!(removed_count > 0, "{quality:?}: nothing was removed");
+            assert_eq!(appeared, 0, "{quality:?}: a pixel appeared");
+            if !quality.soften && !quality.interpolate {
+                assert_eq!(
+                    recoloured, 0,
+                    "{quality:?}: nothing resamples here, so nothing may change colour"
+                );
+            }
+
+            let width = options.width as usize;
+            let height = options.height as usize;
+            let mut removed = vec![false; width * height];
+            let mut changed = Vec::new();
+            for (index, (before, after)) in before
+                .chunks_exact(4)
+                .zip(after.chunks_exact(4))
+                .enumerate()
+            {
+                if before == after {
+                    continue;
+                }
+                if before[3] != 0 && after[3] == 0 {
+                    removed[index] = true;
+                } else {
+                    changed.push((index % width, index / width));
+                }
+            }
+            assert_eq!(
+                changes_hug_the_removals(&removed, &changed, width, height, 4),
+                None,
+                "{quality:?}: a pixel changed colour nowhere near anything the filter removed"
+            );
+        }
+    }
+
+    /// The sample cache bakes the raster's pixel-to-gate answer once and
+    /// replays it every frame, so the censor has to reach it too. Without the
+    /// check in `resolve_compact_sample` the cached frame shows the neighbour
+    /// beam wherever the filter removed a gate - and shows it for as long as
+    /// the cache lives.
+    #[test]
+    fn a_sample_cached_frame_obeys_the_gate_filter() {
+        let volume = overlapping_beam_volume();
+        let tables = ColorTableSet::default();
+        let options = ViewportRasterOptions {
+            width: 256,
+            height: 256,
+            radar_x_px: 128.0,
+            radar_y_px: 128.0,
+            km_per_px_x: 0.12,
+            km_per_px_y: 0.12,
+        };
+
+        let render_through_sample_cache = |filter: &GateFilter| {
+            let cache = ViewportMomentCache::new_filtered(
+                &volume,
+                0,
+                MomentType::Reflectivity,
+                &tables,
+                filter,
+            )
+            .expect("cache");
+            let sample_cache = cache
+                .build_sample_cache(&volume, options)
+                .expect("sample cache");
+            let mut pixels = vec![0; viewport_rgba_buffer_len(options)];
+            cache
+                .render_moment_rgba_with_sample_cache(&volume, &sample_cache, &mut pixels)
+                .expect("sample-cached raster");
+            pixels
+        };
+
+        let before = render_through_sample_cache(&GateFilter::OFF);
+        let after = render_through_sample_cache(&GateFilter {
+            min_reflectivity_dbz: Some(20.0),
+            ..GateFilter::OFF
+        });
+
+        let (removed, recoloured, appeared) = pixel_accounting(&before, &after);
+        assert!(removed > 0, "the sample cache ignored the filter entirely");
+        assert_eq!(recoloured, 0, "a cached pixel came from another beam");
+        assert_eq!(appeared, 0, "a cached pixel appeared");
+    }
+
     fn test_volume() -> RadarVolume {
         let gate_range = GateRange {
             first_gate_m: 0,
@@ -4954,5 +6092,356 @@ mod tests {
         let mut volume = RadarVolume::new(RadarSite::new("U16"), chrono::Utc::now());
         volume.cuts.push(cut);
         volume
+    }
+
+    /// The censor a caller pays for per candidate: the shape the direct
+    /// raster used before the OFF path was compiled against a type.
+    ///
+    /// Only the A/B below constructs this. It exists so the two shapes can be
+    /// measured in ONE process against ONE volume, interleaved - a number
+    /// taken from two separately built binaries on a loaded machine measures
+    /// the machine as much as the code.
+    #[derive(Clone, Copy)]
+    struct LookupCensor<'a>(&'a AzimuthLookup);
+
+    impl SampleCensor for LookupCensor<'_> {
+        #[inline(always)]
+        fn hides(self, row: usize, gate: usize) -> bool {
+            self.0.censors(row, gate)
+        }
+    }
+
+    /// Report one A/B and say whether it is allowed to fail the test.
+    ///
+    /// `control` is a THIRD arm running the identical `NoCensor` shape as
+    /// `compiled`, so the gap between those two is measurement error by
+    /// construction: it is the noise floor, measured in the same seconds as
+    /// the signal rather than assumed.
+    ///
+    /// The verdict rule is the one this repository already learned the hard
+    /// way on its upsample-cost test: a millisecond count, or a fixed
+    /// percentage, fails on a busy machine for reasons that have nothing to do
+    /// with the code. So a round whose own noise floor is over 2 % is
+    /// DISCARDED and asserts nothing - it did not measure this loop, it
+    /// measured whatever else had the core - and a round that is quiet enough
+    /// to mean something is held to its own measured floor.
+    fn report_censor_cost(
+        label: &str,
+        compiled: Vec<f64>,
+        per_candidate: Vec<f64>,
+        control: Vec<f64>,
+    ) {
+        /// Mean of the three fastest samples: on a loaded machine the mean of
+        /// all of them measures the load, and the fastest are the ones where
+        /// this loop actually had the core.
+        fn best_mean(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples.iter().take(3).sum::<f64>() / 3.0
+        }
+
+        let compiled_ms = best_mean(compiled);
+        let per_candidate_ms = best_mean(per_candidate);
+        let control_ms = best_mean(control);
+        let cost = (per_candidate_ms - compiled_ms) / compiled_ms * 100.0;
+        let noise = (control_ms - compiled_ms) / compiled_ms * 100.0;
+        println!(
+            "{label} | compiled-away {compiled_ms:.3} ms | per-candidate \
+             {per_candidate_ms:.3} ms ({cost:+.1}%) | noise floor {noise:+.1}%"
+        );
+
+        const USABLE_NOISE_PERCENT: f64 = 2.0;
+        if noise.abs() > USABLE_NOISE_PERCENT {
+            println!(
+                "{label} | DISCARDED: a {noise:+.1}% floor means this round measured the \
+                 machine, not the loop"
+            );
+            return;
+        }
+        assert!(
+            cost >= -(noise.abs() + 0.5),
+            "{label}: compiling the censor test away made the OFF path SLOWER \
+             ({compiled_ms:.3} ms against {per_candidate_ms:.3} ms, {cost:+.1}%) by more \
+             than the {noise:+.1}% this round could resolve. That is the opposite of \
+             the point of `SampleCensor`"
+        );
+    }
+
+    /// What an OFF gate filter costs the direct raster, measured rather than
+    /// asserted.
+    ///
+    /// The two shapes are the SAME loop over the same pixels of the same real
+    /// sweep; the only difference is whether the per-candidate censor test is
+    /// a compile-time constant (`NoCensor`) or a load of
+    /// `AzimuthLookup::censor` followed by an `is_some_and`
+    /// ([`LookupCensor`]). Both run in this process, alternating, on a
+    /// one-thread rayon pool, so the estimator sees the same cache state, the
+    /// same clocks and the same contention.
+    ///
+    /// The estimator is the mean of the three fastest rounds per shape. On a
+    /// machine running other work - which is the machine this was written on -
+    /// the mean of all rounds measures the other work; the fastest rounds are
+    /// the ones where this loop had the core, and they are the only samples
+    /// that describe the code. The noise floor is reported as the spread of a
+    /// third arm that renders with `NoCensor` twice: it is the same shape
+    /// measured against itself, so whatever it reports is measurement error
+    /// rather than signal, and a difference smaller than it means nothing.
+    ///
+    /// Point `NEXRAD_LEVEL2_SAMPLE` at one Archive II volume and run:
+    ///
+    /// ```text
+    /// cargo test --release -p render2d --lib -- --ignored --nocapture \
+    ///     what_an_off_gate_filter_costs_the_direct_raster
+    /// ```
+    #[test]
+    #[ignore = "set NEXRAD_LEVEL2_SAMPLE to one real Archive II volume"]
+    fn what_an_off_gate_filter_costs_the_direct_raster() {
+        use std::time::Instant;
+
+        let path = std::env::var("NEXRAD_LEVEL2_SAMPLE")
+            .expect("set NEXRAD_LEVEL2_SAMPLE to one real Archive II volume");
+        let volume = nexrad_io::decode_volume_from_path(std::path::Path::new(&path))
+            .unwrap_or_else(|error| panic!("{path} did not decode: {error}"));
+
+        // One thread, so a round measures this loop rather than how many cores
+        // the rest of the machine left free that second.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool");
+
+        let options = ViewportRasterOptions {
+            width: 1320,
+            height: 820,
+            radar_x_px: 660.0,
+            radar_y_px: 410.0,
+            km_per_px_x: 0.5,
+            km_per_px_y: 0.5,
+        };
+
+        for (moment, label) in [
+            (MomentType::Reflectivity, "REF"),
+            (MomentType::Velocity, "VEL"),
+        ] {
+            let Some(cut_index) = volume
+                .cuts
+                .iter()
+                .position(|cut| cut.moments.contains_key(&moment))
+            else {
+                continue;
+            };
+            let cache = ViewportMomentCache::new(&volume, cut_index, moment.clone())
+                .expect("a cache for a moment the volume carries");
+            let (_, grid) = cache.cut_and_grid(&volume).expect("the grid");
+            assert!(
+                cache.row_lookup.censor().is_none(),
+                "this measures the OFF path; a censor is present"
+            );
+            let lookup = &cache.row_lookup;
+            let color_lookup = &cache.color_lookup;
+            let mut pixels = vec![0_u8; viewport_rgba_buffer_len(options)];
+
+            const ROUNDS: usize = 12;
+            let mut compiled = Vec::with_capacity(ROUNDS);
+            let mut per_candidate = Vec::with_capacity(ROUNDS);
+            let mut control = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                for arm in 0..3 {
+                    let started = Instant::now();
+                    pool.install(|| {
+                        match arm {
+                            1 => render_moment_viewport_grid_into_censored(
+                                grid,
+                                lookup,
+                                color_lookup,
+                                options,
+                                &mut pixels,
+                                LookupCensor(lookup),
+                                true,
+                            ),
+                            // Arms 0 and 2 are the SAME shape. Arm 2 is the
+                            // noise floor: whatever separates it from arm 0 is
+                            // measurement error by construction.
+                            _ => render_moment_viewport_grid_into_censored(
+                                grid,
+                                lookup,
+                                color_lookup,
+                                options,
+                                &mut pixels,
+                                NoCensor,
+                                true,
+                            ),
+                        }
+                        .expect("the raster ran");
+                    });
+                    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                    std::hint::black_box(&pixels);
+                    match arm {
+                        0 => compiled.push(elapsed),
+                        1 => per_candidate.push(elapsed),
+                        _ => control.push(elapsed),
+                    }
+                }
+            }
+
+            report_censor_cost(
+                &format!("{label} direct raster cut={cut_index} 1320x820"),
+                compiled,
+                per_candidate,
+                control,
+            );
+        }
+
+        // And storm-relative velocity, which is the case an independent
+        // measurement found slower on the tip in 13 of 14 rounds. Its
+        // per-candidate body does the most arithmetic of any raster arm here,
+        // so a second cache line in the dependency chain has the most to cost
+        // it.
+        let Some(cut_index) = volume
+            .cuts
+            .iter()
+            .position(|cut| cut.moments.contains_key(&MomentType::Velocity))
+        else {
+            return;
+        };
+        let cache = ViewportMomentCache::new(&volume, cut_index, MomentType::Velocity)
+            .expect("a velocity cache");
+        let (cut, grid) = cache.cut_and_grid(&volume).expect("the grid");
+        assert!(cache.row_lookup.censor().is_none());
+        let storm_motion = StormMotion {
+            direction_deg: 240.0,
+            speed_mps: 15.0,
+        };
+        let wide = ViewportRasterOptions {
+            width: 1920,
+            height: 1080,
+            radar_x_px: 960.0,
+            radar_y_px: 540.0,
+            km_per_px_x: 0.4,
+            km_per_px_y: 0.4,
+        };
+        let mut pixels = vec![0_u8; viewport_rgba_buffer_len(wide)];
+        // A closure cannot be generic, and the two arms need two censor types,
+        // so this is a fn rather than a `let`.
+        fn render_cache<'a, C: SampleCensor>(
+            cache: &'a ViewportMomentCache,
+            censor: C,
+        ) -> StormRelativeRenderCache<'a, C> {
+            StormRelativeRenderCache {
+                lookup: CensoredLookup {
+                    rows: &cache.row_lookup,
+                    censor,
+                },
+                storm_motion_basis: cache.storm_motion_basis.as_ref(),
+                color_table: cache.color_lookup.color_table(),
+                palette_cache: None,
+            }
+        }
+
+        const ROUNDS: usize = 12;
+        let mut compiled = Vec::with_capacity(ROUNDS);
+        let mut per_candidate = Vec::with_capacity(ROUNDS);
+        let mut control = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            for arm in 0..3 {
+                let started = Instant::now();
+                pool.install(|| match arm {
+                    1 => render_storm_relative_velocity_viewport_grid_into(
+                        cut,
+                        grid,
+                        render_cache(&cache, LookupCensor(&cache.row_lookup)),
+                        storm_motion,
+                        wide,
+                        &mut pixels,
+                        true,
+                    ),
+                    _ => render_storm_relative_velocity_viewport_grid_into(
+                        cut,
+                        grid,
+                        render_cache(&cache, NoCensor),
+                        storm_motion,
+                        wide,
+                        &mut pixels,
+                        true,
+                    ),
+                });
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                std::hint::black_box(&pixels);
+                match arm {
+                    0 => compiled.push(elapsed),
+                    1 => per_candidate.push(elapsed),
+                    _ => control.push(elapsed),
+                }
+            }
+        }
+        report_censor_cost(
+            &format!("SRV direct raster cut={cut_index} 1920x1080"),
+            compiled,
+            per_candidate,
+            control,
+        );
+
+        // And the geometry-cache resolve, which an independent measurement put
+        // at +2.9% against the pre-filter base on REF cut 0 - the one figure
+        // that came out over the 2% budget. This arm asks the only question
+        // this branch can answer for it: what does the CENSOR cost that walk?
+        // It is answered against the walk itself rather than against another
+        // build, so nothing about the machine's other work is in the number.
+        let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
+            .expect("a reflectivity cache on cut 0");
+        let (_, grid) = cache.cut_and_grid(&volume).expect("the grid");
+        let geometry_cache = cache
+            .build_geometry_cache(&volume, options)
+            .expect("a geometry cache");
+        let geometry = geometry_cache.geometry();
+        let mut compiled = Vec::with_capacity(ROUNDS);
+        let mut per_candidate = Vec::with_capacity(ROUNDS);
+        let mut control = Vec::with_capacity(ROUNDS);
+        // One resolve is under 4 ms, which is short enough that the timer and
+        // the scheduler are a large part of the sample - the first version of
+        // this arm reported a 5 % noise floor. Eight resolves per sample puts
+        // it in the same 30 ms range as the raster arms above, where the floor
+        // is a few tenths of a percent.
+        const RESOLVES_PER_SAMPLE: usize = 8;
+        for _ in 0..ROUNDS {
+            for arm in 0..3 {
+                let started = Instant::now();
+                let rows = pool.install(|| {
+                    let mut last = Vec::new();
+                    for _ in 0..RESOLVES_PER_SAMPLE {
+                        last = match arm {
+                            1 => sample_rows_from_geometry(
+                                grid,
+                                &cache.row_lookup,
+                                geometry_cache.height,
+                                geometry,
+                                LookupCensor(&cache.row_lookup),
+                            ),
+                            _ => sample_rows_from_geometry(
+                                grid,
+                                &cache.row_lookup,
+                                geometry_cache.height,
+                                geometry,
+                                NoCensor,
+                            ),
+                        };
+                        std::hint::black_box(&last);
+                    }
+                    last
+                });
+                let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                std::hint::black_box(&rows);
+                match arm {
+                    0 => compiled.push(elapsed),
+                    1 => per_candidate.push(elapsed),
+                    _ => control.push(elapsed),
+                }
+            }
+        }
+        report_censor_cost(
+            &format!("geometry_cache_resolve REF cut=0 1320x820 x{RESOLVES_PER_SAMPLE}"),
+            compiled,
+            per_candidate,
+            control,
+        );
     }
 }

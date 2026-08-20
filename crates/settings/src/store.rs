@@ -18,6 +18,7 @@
 //!   oldest unsaved change while a slider is still moving. Nothing here ever
 //!   writes per frame.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,6 +195,90 @@ impl SettingsStore {
         removed
     }
 
+    /// Remove every stored value in every category, including categories and
+    /// ids this build does not declare. Returns how many values went.
+    ///
+    /// The count is the point: the window states it before asking, so
+    /// "reset everything" is never a button whose blast radius the analyst
+    /// has to guess at.
+    pub fn reset_all_values(&mut self) -> usize {
+        let removed: usize = self.document.values.values().map(BTreeMap::len).sum();
+        if removed > 0 {
+            self.document.values.clear();
+            self.mark_changed();
+        }
+        removed
+    }
+
+    /// Every category id the file holds values under, sorted. Includes ids no
+    /// category in this build declares - a page a future build added, or one
+    /// this build dropped - because a summary that hid them would understate
+    /// what a reset is about to remove.
+    pub fn stored_categories(&self) -> Vec<&str> {
+        self.document
+            .values
+            .iter()
+            .filter(|(_, values)| !values.is_empty())
+            .map(|(category, _)| category.as_str())
+            .collect()
+    }
+
+    /// Every setting id stored under `category`, sorted.
+    pub fn stored_ids(&self, category: &str) -> Vec<&str> {
+        self.document
+            .values
+            .get(category)
+            .map(|values| values.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// The whole document, for a caller that reads or copies it wholesale
+    /// rather than one key at a time: export and import's before/after diff,
+    /// and [`crate::profiles`], which snapshots it into a named file and
+    /// compares the live one against it.
+    pub fn document(&self) -> &SettingsDocument {
+        &self.document
+    }
+
+    /// Replace every stored value with `values`, keeping the workspace
+    /// snapshot and any unknown top-level fields. Returns whether anything
+    /// moved.
+    ///
+    /// This is import's landing point, and it deliberately leaves the
+    /// workspace alone: pane layout, cameras and window geometry are what the
+    /// analyst has on screen right now, and an imported file replacing them
+    /// under the cursor is not something a settings import should do. The
+    /// window says so in the import summary rather than leaving it to be
+    /// discovered.
+    pub fn replace_values(&mut self, values: BTreeMap<String, BTreeMap<String, Json>>) -> bool {
+        let changed = self.document.values != values;
+        if changed {
+            self.document.values = values;
+            self.mark_changed();
+        }
+        changed
+    }
+
+    /// Replace the whole document, as a profile switch does. Returns whether
+    /// anything actually changed.
+    ///
+    /// Deliberately the whole document and not a set of keys: a replacement
+    /// carries values under categories and ids this build has never heard of,
+    /// which is the property that lets a profile written by a newer build - or
+    /// by a branch landing tomorrow - survive being switched to and away from
+    /// here. See the profiles module for the argument in full.
+    ///
+    /// Unlike [`Self::replace_values`] this does carry the workspace, because
+    /// a profile is a whole named bench and the analyst asked for it by name.
+    pub fn replace_document(&mut self, document: SettingsDocument) -> bool {
+        let changed = self.document != document;
+        if changed {
+            self.document = document;
+            self.mark_changed();
+        }
+        changed
+    }
+
     pub fn workspace(&self) -> &WorkspaceSnapshot {
         &self.document.workspace
     }
@@ -335,7 +420,15 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn write_atomically(path: &Path, document: &SettingsDocument) -> io::Result<()> {
+/// Write `document` to `path` through a temp file and a rename, so a crash
+/// mid-save leaves the previous file intact - the same crash safety the
+/// store's own saves get.
+///
+/// Generic over what is being written, and visible to the crate, because both
+/// [`crate::transfer`] (settings export) and [`crate::profiles`] (named
+/// profile files) write into this directory tree, and neither should do it
+/// with a second, less careful copy of this writer.
+pub(crate) fn write_atomically<T: serde::Serialize>(path: &Path, document: &T) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

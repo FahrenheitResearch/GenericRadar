@@ -48,6 +48,7 @@ use std::fmt;
 use product_engine::units::METERS_PER_SECOND_TO_KNOTS;
 
 use crate::probe::ProbeValue;
+use crate::units::UnitSystem;
 
 /// The largest couplet diameter either paper accepts: 5 nautical miles, which
 /// is exactly 9.26 km (a nautical mile is exactly 1852 m).
@@ -362,14 +363,22 @@ pub fn measure(
 ///
 /// Knots first because that is the unit both papers and every warning are
 /// written in; m/s beside it because that is what the gates hold.
-pub fn report(measurement: &VrotMeasurement) -> String {
+///
+/// `units` governs the two GEOMETRY figures only — the couplet's separation
+/// and its height above the radar. The velocities stay in knots and m/s
+/// whatever the analyst reads distances in, because those two are the science
+/// rather than the display: the damage-rating bins are published in knots, the
+/// gates are stored in m/s, and `analysis/vrot_units` already owns which of
+/// the two leads. Under [`UnitSystem::default`] this writes exactly what it
+/// always wrote, character for character.
+pub fn report(measurement: &VrotMeasurement, units: UnitSystem) -> String {
     let mut text = format!(
-        "Vrot {:.0} kt ({:.1} m/s) | delta-V {:.1} m/s | separation {:.2} km | height {:.2} km ARL | {:.1} deg cut {}",
+        "Vrot {:.0} kt ({:.1} m/s) | delta-V {:.1} m/s | separation {} | height {} ARL | {:.1} deg cut {}",
         measurement.vrot_knots(),
         measurement.vrot_mps,
         measurement.delta_v_mps,
-        measurement.separation_km,
-        measurement.couplet_height_arl_m / 1000.0,
+        units.distance(measurement.separation_km, 2),
+        units.altitude(measurement.couplet_height_arl_m, 2),
         measurement.first.elevation_deg,
         measurement.first.cut_index,
     );
@@ -468,7 +477,7 @@ mod tests {
         );
         assert_eq!(measurement.warnings, vec![VrotWarning::SameSign]);
         assert!(
-            report(&measurement).contains("WARNING"),
+            report(&measurement, UnitSystem::default()).contains("WARNING"),
             "a same-sign couplet must say so in the readout"
         );
     }
@@ -571,9 +580,47 @@ mod tests {
         second.beam_height_arl_m = 620.0;
         let measurement = measure(first, second, true).expect("a 1 km couplet must measure");
         assert_eq!(
-            report(&measurement),
+            report(&measurement, UnitSystem::default()),
             "Vrot 58 kt (30.0 m/s) | delta-V 60.0 m/s | separation 1.00 km | height 0.62 km ARL | 0.5 deg cut 0"
         );
+    }
+
+    /// The same couplet, reported to an analyst working in miles and feet.
+    ///
+    /// This is the defect this test exists to keep closed: the Vrot report was
+    /// the one measurement readout the unit rollout did not reach, so a
+    /// session switched to statute miles read its pane corner in miles and its
+    /// Vrot line in kilometres. The two VELOCITIES are deliberately untouched
+    /// — knots and m/s are the published units of the measurement, not a
+    /// display preference.
+    #[test]
+    fn the_report_writes_its_geometry_in_the_analysts_own_units() {
+        let (mut first, mut second) = pair(-30.0, 30.0);
+        first.beam_height_arl_m = 500.0;
+        second.beam_height_arl_m = 620.0;
+        let measurement = measure(first, second, true).expect("a 1 km couplet must measure");
+        let imperial = UnitSystem {
+            distance: crate::units::DistanceUnit::StatuteMiles,
+            altitude: crate::units::AltitudeUnit::Feet,
+            ..UnitSystem::default()
+        };
+        let text = report(&measurement, imperial);
+        // 1.00 km is 0.62 statute miles; 620 m is 2034 ft.
+        assert!(
+            text.contains("separation 0.62 mi"),
+            "the separation must follow the distance unit: {text}"
+        );
+        assert!(
+            text.contains("height 2034 ft ARL"),
+            "the couplet height must follow the altitude unit: {text}"
+        );
+        assert!(
+            !text.contains(" km"),
+            "no kilometre may survive in a miles-and-feet session: {text}"
+        );
+        // The science is untouched.
+        assert!(text.starts_with("Vrot 58 kt (30.0 m/s)"), "{text}");
+        assert!(text.contains("delta-V 60.0 m/s"), "{text}");
     }
 
     #[test]

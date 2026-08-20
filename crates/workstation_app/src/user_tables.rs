@@ -97,24 +97,26 @@ pub fn is_colour_table_drop(path: &Path) -> bool {
         .is_some_and(|extension| USER_TABLE_EXTENSIONS.contains(&extension.as_str()))
 }
 
-/// Split one drop into the colour tables in it and the radar volume in it.
+/// Split one drop into the colour tables in it and everything else.
 ///
 /// A drop can carry several files, and a handful of palettes is exactly the
 /// kind of thing an analyst drags in one go, so every colour table is kept.
-/// A pane draws one volume, so the FIRST non-palette path wins and the rest
-/// are ignored - which is what the load path did before colour tables were
-/// droppable, and is unchanged by this.
-pub fn split_drop(paths: impl IntoIterator<Item = PathBuf>) -> (Vec<PathBuf>, Option<PathBuf>) {
+/// The rest are returned in the order they were dropped rather than reduced
+/// to one here: a pane draws one volume, but WHICH of the remaining paths is
+/// the volume is the load path's judgement to make
+/// ([`crate::app_support::choose_dropped_radar_file`] looks at the names),
+/// and this function has no business guessing on its behalf.
+pub fn split_drop(paths: impl IntoIterator<Item = PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut tables = Vec::new();
-    let mut volume = None;
+    let mut rest = Vec::new();
     for path in paths {
         if is_colour_table_drop(&path) {
             tables.push(path);
-        } else if volume.is_none() {
-            volume = Some(path);
+        } else {
+            rest.push(path);
         }
     }
-    (tables, volume)
+    (tables, rest)
 }
 
 /// The application's view of the folder: what is in it, and what the last
@@ -356,19 +358,27 @@ Color:  60 219  60  60   255 255 255
         // The regression this guards: routing the whole drop to the load
         // path, which is what happened before colour tables were droppable
         // and would have made a dragged palette a failed volume decode.
-        let (tables, volume) = split_drop([
+        let (tables, rest) = split_drop([
             PathBuf::from("a.pal"),
             PathBuf::from("KDVN20260819_150217_V06"),
             PathBuf::from("b.txt"),
             PathBuf::from("KDVN20260819_151500_V06"),
         ]);
         assert_eq!(tables, [PathBuf::from("a.pal"), PathBuf::from("b.txt")]);
-        assert_eq!(volume, Some(PathBuf::from("KDVN20260819_150217_V06")));
+        // Every non-palette path survives, in drop order: choosing between
+        // them belongs to the load path, not here.
+        assert_eq!(
+            rest,
+            [
+                PathBuf::from("KDVN20260819_150217_V06"),
+                PathBuf::from("KDVN20260819_151500_V06"),
+            ]
+        );
 
         // A drop with no palette in it is exactly what it was before.
-        let (tables, volume) = split_drop([PathBuf::from("KDVN20260819_150217_V06")]);
+        let (tables, rest) = split_drop([PathBuf::from("KDVN20260819_150217_V06")]);
         assert!(tables.is_empty());
-        assert_eq!(volume, Some(PathBuf::from("KDVN20260819_150217_V06")));
+        assert_eq!(rest, [PathBuf::from("KDVN20260819_150217_V06")]);
     }
 
     #[test]

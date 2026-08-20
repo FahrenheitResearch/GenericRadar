@@ -2220,7 +2220,7 @@ fn the_strip_stands_on_the_same_ground_as_the_preview_in_both_theme_variants() {
         .into_iter()
         .map(|colour| colour.to_tuple())
         .collect();
-    for variant in [crate::theme::Variant::Dark, crate::theme::Variant::Light] {
+    for variant in ["dark", "light"] {
         let dir = scratch_dir("strip-ground");
         // A table whose lowest stop is transparent, which is what the ground
         // is there for. `sample_table`'s first stop is alpha 0.
@@ -2229,7 +2229,7 @@ fn the_strip_stands_on_the_same_ground_as_the_preview_in_both_theme_variants() {
             &sample_table().to_color_table().expect("builds"),
             dir.clone(),
         );
-        crate::theme::apply(&bench.context, variant);
+        crate::theme::apply(&bench.context, &crate::theme::Appearance::by_id(variant));
         bench.idle();
         bench.idle();
 

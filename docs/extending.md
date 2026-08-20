@@ -1,10 +1,9 @@
 # Extending GenericRadar
 
-How a new capability — a data
-provider, a derived product, an overlay, a whole module ported from BowEcho —
-plugs into this workspace so that it appears in the application, appears in
-the master settings window, persists its state, and passes the gates. It is
-written for an agent doing the work: exact seams, exact files, no narrative.
+How a new capability — a data provider, a derived product, an overlay, a
+whole new module — plugs into this workspace so that it appears in the
+application, appears in the master settings window, persists its state, and
+passes the gates. Exact seams, exact files, no narrative.
 
 Baseline for this document: the settings system landed with the
 `settings` crate rewrite and `workstation_app/src/settings_ui.rs`.
@@ -82,6 +81,28 @@ code does not read it yet. The window draws it disabled with an honest note.
 Use it when a setting should exist ahead of its feature (`map/range_rings`
 and `data/live_cache_limit_mb` are current examples).
 
+`SettingSpec::group("…")` puts an item under a subsection heading, so a long
+page reads as structure rather than as a wall:
+
+```rust
+SettingSpec::new("opacity", "Opacity", …).group("How the volume is drawn"),
+SettingSpec::new("density", "Density", …).group("How the volume is drawn"),
+SettingSpec::new("show_grid", "Height grid", …).group("Annotations"),
+```
+
+Sections are **runs of consecutive items** carrying the same heading
+(`SettingsCategory::sections`), so declaration order is the order on screen
+and nothing is silently reordered. Two rules the catalog's own tests enforce,
+and yours should keep: group *all* of a page's items or none of them (an
+ungrouped item above the first heading has nothing naming it), and do not use
+one heading in two separate runs (it draws twice and reads as a mistake).
+Headings are presentation only — they are never stored, and renaming one
+loses nothing. A page that declares no headings renders exactly as it did
+before headings existed; a test over every ungrouped page in the real catalog
+compares the two shape-for-shape.
+
+Short pages should stay ungrouped. A heading over three toggles is noise.
+
 ### 2.2 How a crate contributes
 
 1. In your crate: `pub fn settings_category() -> settings::SettingsCategory`
@@ -90,7 +111,10 @@ and `data/live_cache_limit_mb` are current examples).
 2. At the collection point — `workstation_app/src/settings_ui/catalog.rs`,
    `registry()` — add one line: `registry.register(mycrate::settings_category());`.
    That is the only application edit. The window has **zero** per-setting
-   code; your items render, search, reset and persist immediately.
+   code; your items render, search, group under their headings, carry a
+   modified mark with their own Reset, join their page's reset and the
+   whole-application one, travel in an export and come back through an
+   import, and persist — immediately, with nothing written here.
    Registering an existing category id merges items into that page, so a
    crate can extend "Map" instead of creating "Map 2".
 3. Values persist automatically under `(category id, setting id)` in the
@@ -343,6 +367,68 @@ immediately rather than after an alt-tab.
 <level2-file> <out-dir>` drives the editor end to end on a real volume:
 edit-and-repaint, unit round trips, a shared GR palette opened and re-saved
 pixel-identically, and the real window photographed in both themes.
+
+## 3d. Adding a theme
+
+A theme is **data**: one value, in one file, registered on one line.
+
+1. **Write the file.** `crates/workstation_app/src/theme/<id>.rs`, where
+   `<id>` is the theme's stable id with hyphens written as underscores
+   (`amber_crt.rs` for id `amber-crt`). Copy `light.rs` or `dark.rs` — they
+   are the two worked examples — and change the values. The module exposes
+   exactly one item:
+
+   ```rust
+   pub const THEME: ThemeSpec = ThemeSpec {
+       id: "amber-crt",           // stable, persisted, never reused
+       label: "Amber CRT",        // what the settings list shows
+       description: "…",          // one clause about what it is FOR
+       ground: Ground::Dark,      // seeds egui's own mode defaults
+       palette: Palette { … },    // all 20 roles, no inheritance
+   };
+   ```
+
+   The 20 roles, each documented in `theme/palette.rs`: `face`,
+   `face_raised`, `face_pressed`, `hover`, `well`, `text`, `text_weak`,
+   `text_disabled`, `border`, `border_strong`, `link`, `selection_bg`,
+   `selection_text`, `selection_tint`, `warn`, `error`, `hi_outer`,
+   `hi_inner`, `sh_inner`, `sh_outer`.
+
+2. **Register it.** One line in the `catalog!` list in
+   `crates/workstation_app/src/theme/catalog.rs`, in alphabetical order:
+
+   ```rust
+   catalog! {
+       amber_crt,
+       dark,
+       light,
+   }
+   ```
+
+   That is the whole registration. The settings page derives its options
+   from the catalog, the contact sheet photographs the catalog, and the
+   contrast audit measures the catalog — none of them are edited.
+
+3. **Pass the audit.** `cargo test --release -p workstation_app --test
+   theme_catalog` measures every registered theme crossed with every accent
+   against every pairing the chrome paints, and names the theme, the accent,
+   the pairing and the ratio it failed on. The floors and their WCAG
+   citations are in that file's module docs.
+
+4. **Look at it.**
+
+   ```text
+   cargo run --release -p workstation_app --example theme_gallery --        --volume <level2-file>
+   ```
+
+   writes `sheet_<id>.png` — the whole chrome plus a real radar pane — for
+   every registered theme, plus `gallery_<id>_1x.png` / `_2x.png` at both
+   device scales. A theme nobody has looked at over real echo is not done.
+
+The four customization axes (`theme::Accent`, `Density`, `ChromeEdges`,
+`UiScale`) are orthogonal to a theme and a theme author does not touch them.
+An accent supplies four roles per ground and is added to `Accent` in
+`theme/appearance.rs`; the same audit measures it against every theme.
 
 ## 4. Getting a pane overlay or map layer in front of the user
 
