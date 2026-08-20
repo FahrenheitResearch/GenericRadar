@@ -259,11 +259,30 @@ pub fn render_moment_png(
     Ok(())
 }
 
+/// Render a decoded polar moment on the colour table this build ships for its
+/// family.
 pub fn render_moment_image(
     volume: &RadarVolume,
     cut_index: usize,
     moment: MomentType,
     options: RasterOptions,
+) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+    render_moment_image_with_table(volume, cut_index, moment, options, None)
+}
+
+/// The same raster on a caller-supplied colour table.
+///
+/// `None` means the shipped table for the moment's family, which is what
+/// [`render_moment_image`] passes; anything else draws the same gates through
+/// the given table. That is what lets a palette editor show its work on real
+/// echo instead of on a gradient - the only honest way to judge a colour
+/// table is against the field it will be read on.
+pub fn render_moment_image_with_table(
+    volume: &RadarVolume,
+    cut_index: usize,
+    moment: MomentType,
+    options: RasterOptions,
+    table: Option<&ColorTable>,
 ) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
     let cut = volume
         .cuts
@@ -294,7 +313,8 @@ pub fn render_moment_image(
 
     let mut pixels = vec![0; width as usize * height as usize * 4];
     let color_tables = ColorTableSet::default();
-    let color_table = color_tables.for_family(color_family_for_moment(&grid.moment));
+    let color_table =
+        table.unwrap_or_else(|| color_tables.for_family(color_family_for_moment(&grid.moment)));
 
     match &grid.storage {
         MomentStorage::U8(values) => {

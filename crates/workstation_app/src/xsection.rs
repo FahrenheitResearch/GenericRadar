@@ -175,14 +175,17 @@ impl XSection {
         if open { self.open = true } else { self.close() }
     }
 
-    /// The window was dismissed. Closing is walking away from the tool, so it
-    /// also puts the placement cursor down: leaving `armed` set would keep
-    /// stealing pane clicks after the window is gone, and every completed
-    /// pair of them would place a new line and reopen it.
+    /// The window was dismissed. Closing is walking away from the tool, so
+    /// the whole tool goes away: the placement cursor comes down (leaving
+    /// `armed` set would keep stealing pane clicks, and every completed pair
+    /// of them would place a new line and reopen the window) and the line
+    /// with its A/B handles comes off the glass (2026-08-19 field report:
+    /// "the x section points stay on after you exit the window"). A section
+    /// is cheap to place again; a marker nothing on screen explains is not.
     fn close(&mut self) {
         self.open = false;
         self.armed = false;
-        self.pending_first = None;
+        self.clear_line();
     }
 }
 
@@ -1468,11 +1471,13 @@ mod tests {
         );
     }
 
-    /// The field bug of 2026-08-19: close the window while armed, and every
-    /// later pane click kept placing endpoints - each completed pair reopening
-    /// the window with a line nobody asked for.
+    /// The field bugs of 2026-08-19, both halves: close the window while
+    /// armed and every later pane click kept placing endpoints, each
+    /// completed pair reopening the window with a line nobody asked for; and
+    /// a PLACED line kept its A/B handles on the panes after the window was
+    /// gone, with nothing on screen to remove them.
     #[test]
-    fn closing_the_window_disarms_placement() {
+    fn closing_the_window_disarms_placement_and_takes_the_line_off_the_glass() {
         let mut xs = XSection::default();
         xs.toggle_armed();
         xs.handle_pane_click((10.0, 5.0));
@@ -1484,6 +1489,19 @@ mod tests {
             "clicks after closing belong to the panes again"
         );
         assert!(xs.line.is_none(), "no line appeared from beyond the grave");
+
+        // The placed-line half: exit the window with a finished section on
+        // the map, and the section leaves with it.
+        xs.toggle_armed();
+        xs.handle_pane_click((10.0, 5.0));
+        xs.handle_pane_click((40.0, -5.0));
+        assert!(xs.line.is_some(), "two clicks placed a line");
+        xs.close();
+        assert!(
+            xs.line.is_none(),
+            "the line and its endpoints must come off the glass with the window"
+        );
+        assert!(xs.status.is_empty(), "no status for a section that is gone");
     }
 
     #[test]

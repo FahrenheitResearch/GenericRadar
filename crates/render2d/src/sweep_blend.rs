@@ -2452,9 +2452,11 @@ mod tests {
             "the under-paint was decoded with the wrong header"
         );
         // Raw 75 read through the INCOMING sweep's scale is 4.5 dBZ, which the
-        // reflectivity table leaves transparent - so the wedge would have gone
-        // blank rather than merely wrong, and a colour test would still catch it.
-        assert_eq!(reflectivity_color(&incoming_grid, 75), [0, 0, 0, 0]);
+        // default table paints a visibly different colour from 45 dBZ (the
+        // old default left it blank outright; AWIPS Wilson shows low dBZ on
+        // purpose) - either way the wedge test above catches a wrong-header
+        // decode.
+        assert_ne!(reflectivity_color(&incoming_grid, 75), forty_five);
     }
 
     #[test]

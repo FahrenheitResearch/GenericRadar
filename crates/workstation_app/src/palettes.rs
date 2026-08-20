@@ -75,6 +75,13 @@ mod color_families {
 /// water, no hail, zero probability - paints nothing rather than painting a
 /// dark wash over the whole map. That transparency is also what the legend's
 /// inked span reads to decide where the bar should start.
+///
+/// It is a floor marker and not a mask: the segment above it fades up into the
+/// second colour, so the bottom seventh of a product's range - hail under
+/// 14 mm, echo tops under 3 km - is drawn rather than blanked. That comes free
+/// from a stop that declares no end colour, which is every stop here. Only a
+/// clear *row* of GR `.pal` text holds its colour across its segment, and none
+/// of these are parsed from text.
 fn ramp_over(descriptor: &ProductDescriptor, colors: &[(u8, u8, u8)]) -> ColorTable {
     let range = descriptor.domain.declared_engine_range;
     let last = colors.len().saturating_sub(1).max(1) as f32;
@@ -90,6 +97,9 @@ fn ramp_over(descriptor: &ProductDescriptor, colors: &[(u8, u8, u8)]) -> ColorTa
                 } else {
                     Rgba8::opaque(*red, *green, *blue)
                 },
+                // Every step runs to the next colour in the sequence, which is
+                // what an undeclared end means.
+                end_color: None,
             }
         })
         .collect();
@@ -152,16 +162,70 @@ mod tests {
         assert_eq!(table.stops().last().expect("stops exist").value, 100.0);
     }
 
+    /// Every product `table_for` synthesises a ramp for, found through the
+    /// registry rather than listed.
+    ///
+    /// A list of ids is a guard that only covers the products someone
+    /// remembered to add to it, and a seventh derived product would join the
+    /// build without joining the test. The condition here is `table_for`'s own:
+    /// a derived volume that is not composite reflectivity gets `ramp_over`.
+    fn every_synthesised_ramp() -> Vec<(String, ColorTable)> {
+        let tables = ColorTableSet::default();
+        let ramps: Vec<_> = ProductRegistry::builtin()
+            .all()
+            .iter()
+            .filter(|descriptor| {
+                !matches!(
+                    descriptor.computation.derived_volume(),
+                    None | Some(DerivedVolumeId::CompositeReflectivity)
+                )
+            })
+            .map(|descriptor| (descriptor.id.0.clone(), table_for(descriptor, &tables)))
+            .collect();
+        assert!(
+            ramps.len() >= 6,
+            "the registry stopped offering the derived products these guards are about"
+        );
+        ramps
+    }
+
     #[test]
     fn the_bottom_of_every_synthesised_ramp_paints_nothing() {
         // Zero hail and zero liquid water must not wash the whole map, and the
         // legend reads this transparency to decide where its bar starts.
-        for id in ["ET18", "VIL", "VILD", "MESH", "POH", "POSH"] {
-            let table = table_for(descriptor(id), &ColorTableSet::default());
+        for (id, table) in every_synthesised_ramp() {
             assert_eq!(
                 table.stops().first().expect("stops exist").color.a,
                 0,
                 "{id} paints its floor"
+            );
+        }
+    }
+
+    /// The floor marker is a fade, not a mask.
+    ///
+    /// The floor stop is a seventh or a fifth of the product's range below the
+    /// first opaque one, so whether that segment fades up or holds clear is the
+    /// difference between drawing hail under 14 mm and echo tops under 3 km and
+    /// blanking them. It fades because the stop declares no end colour and a
+    /// stop list has no dialect; the GR clear-row hold belongs to parsed `.pal`
+    /// text and reaches these tables through nothing.
+    ///
+    /// Pinned per product rather than per ramp constant so a product that stops
+    /// going through `ramp_over` is noticed here.
+    #[test]
+    fn a_synthesised_ramp_fades_up_out_of_its_clear_floor() {
+        for (id, table) in every_synthesised_ramp() {
+            let stops = table.stops();
+            let floor = stops[0];
+            let first_band = stops[1];
+            assert_eq!(floor.end_color, None, "{id} floor declares a ramp target");
+
+            let halfway = (floor.value + first_band.value) / 2.0;
+            let painted = table.sample(halfway);
+            assert!(
+                painted.a > 0 && painted.a < 255,
+                "{id} at {halfway} came back {painted:?} instead of part-way up the fade"
             );
         }
     }

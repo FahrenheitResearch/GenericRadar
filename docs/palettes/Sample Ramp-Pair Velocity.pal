@@ -1,0 +1,46 @@
+; Sample Ramp-Pair Velocity - a sample user colour table.
+;
+; The colours below are original to this file and to Fahrenheit Research. Only
+; the DIALECT is borrowed: this is written in the GR2Analyst / RadarScope .pal
+; text format, which is the format analysts already trade palettes in. Nothing
+; here is taken from, endorsed by, or affiliated with either product.
+;
+; The file is in the two-colour ramp form those files are usually traded in:
+; each Color: row names the colour AT its own data value and the colour at the
+; far end of that row's interval, so a reader interpolates within a row rather
+; than between rows.
+;
+;   Color: <value> <r1> <g1> <b1> [<r2> <g2> <b2>]
+;
+; The scheme is the classic inbound-green / outbound-red velocity display an
+; analyst reads couplets on, with the extremes pushed into magenta and white
+; so aliased and near-aliased gates stand out from ordinary storm-scale flow.
+; Zero is a dark neutral rather than a colour, because a velocity display is
+; read by where the colour CHANGES, and a bright zero line hides the change.
+;
+; Drop this file on the window, or copy it into
+;   <settings folder>/colortables/
+; and it appears at the bottom of the Velocity palette list.
+
+Product: BV
+Units: KTS
+RF: 119 76 190
+
+Color: -140 255 255 255   230 130 255
+Color: -100 230 130 255   180   0 190
+Color:  -80 180   0 190   110   0 160
+Color:  -64 110   0 160    40 130 190
+Color:  -50  40 130 190    30 190 190
+Color:  -35  30 190 190    30 210 120
+Color:  -20  30 210 120    20 130  60
+Color:   -8  20 130  60    16  40  30
+Color:   -2  16  40  30    16  22  26
+Color:    2  40  20  20    40  20  20
+Color:    8  60  20  20   150  30  30
+Color:   20 150  30  30   225  60  40
+Color:   35 225  60  40   250 150  40
+Color:   50 250 150  40   250 230  90
+Color:   64 250 230  90   255 120 200
+Color:   80 255 120 200   255 190 225
+Color:  100 255 190 225   255 255 255
+Color:  140 255 255 255   255 255 255

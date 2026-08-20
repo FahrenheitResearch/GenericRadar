@@ -182,6 +182,168 @@ To add a product today:
    on load `app.rs` resolves them through `try_from_product_id` and resets
    unknown ids to the default **with a visible status line**.
 
+## 3b. The user colour table folder
+
+Analysts bring their own palettes. GenericRadar reads them out of one folder,
+resolved from the same root the settings file uses:
+
+```
+<settings folder>/colortables/
+```
+
+* Windows: `%LOCALAPPDATA%\FahrenheitResearch\RadarWorkstation\colortables`
+* Linux/BSD: `$XDG_CONFIG_HOME/radar-workstation/colortables`
+  (`~/.config/...` when unset)
+* macOS/iOS: `~/Library/Application Support/RadarWorkstation/colortables`
+  — on iOS the shell has already injected the sandbox root, so this follows
+  it automatically.
+
+Never spell any of that out in code, and never derive it a second time
+either: it is `settings::user_colortables_dir()`, one function, and both
+front doors on to it — `workstation_app/src/user_tables.rs::user_tables_dir`
+for the scanner and `palette_editor::store::user_colortables_dir` for the
+editor — are one line over it. It hangs off `settings::app_config_root()`, so
+an injected root moves the palettes with the rest of the application's state.
+**Anything that writes a palette for this application to read (the colour
+table editor, an importer, a sync job) writes it here, and the next scan
+picks it up.** The folder is created on demand: it does not exist until the
+first table lands in it, and a missing folder is not an error anywhere.
+
+What the reader does (`color_tables::user`, `workstation_app/src/user_tables.rs`):
+
+* every `*.pal` and `*.txt` in the folder is parsed with
+  `ColorTable::parse` — the GR2Analyst/RadarScope dialect, no conversion
+  step;
+* the file's `Product:` header routes it to a `ColorTableFamily`
+  (`BR`/`REF` → Reflectivity, `BV`/`VEL` → Velocity, `SW`, `ZDR`,
+  `CC`/`RHO`, `PHI`, `KDP`; case- and punctuation-insensitive). A missing or
+  unrecognised header lands in `Generic` rather than being refused;
+* the table's name is the `Name:` row **inside** the file, falling back to
+  the file stem for a hand-dropped GR palette, which never carries the row.
+  Never the filename a name would produce: that mapping is lossy and
+  many-to-one. This is one rule — `color_tables::files::palette_identity` —
+  shared with `color_tables::palette_named_in`, the search the colour table
+  editor and the launch-time restore both call, so a row the picker offers is
+  a row that resolves;
+* that name is suffixed `" (user)"` when this build cannot carry it as an
+  analyst's own — it is a shipped palette's base name in the same family, or
+  it ends in a rendering suffix — and numbered when two files **in the same
+  family** would otherwise share a name. The numbering is per family, so a
+  reflectivity `Mine.pal` and a velocity `Mine.txt` are both offered as
+  "Mine" — they never share a picker list. **Which names those are is one
+  function, `color_tables::user_palette_name_fault`**, and the colour table
+  editor asks the same one before it writes a file: a refusal where there is
+  still somebody on screen to tell, this rename where there is not. Change
+  the rule in one place or the editor writes files this scan renames out from
+  under the name the settings file stored;
+* a symlink is followed, so `ln -s ~/Dropbox/palettes/Mine.pal
+  <config>/colortables/` is a perfectly ordinary way to keep palettes in
+  sync. The listing describes the file at the far end of the link, so an
+  edit made over there is an edit this folder sees;
+* a file that does not parse is **skipped, never silent**: it is listed with
+  its name, the parser's reason and the line number under
+  *Settings → Radar → Your colour tables*. So is a file over 2 MB, which is
+  not read at all — `.txt` is admitted because shared palettes wear it, and
+  a stray 50 MB pile of notes in that folder must not be parsed on the UI
+  thread. Its fault row names its size. So is anything past the **8 MB one
+  scan reads in total**: the per-file cap alone bounds N × 2 MB and nothing
+  more, and twenty files that are each just legal are a third of a second of
+  frozen window. The budget is spent in name order, so the same files load
+  every time, and the ones it turns away say which budget they ran into;
+* the folder is re-read at startup, whenever the window regains focus, after
+  a drop, and one frame after the colour table editor saves — a save made
+  inside the window is a change the focus rescan can never see, because focus
+  was never lost. There is no watcher thread and no polling. A rescan whose
+  directory listing (name, length, modification time per entry) matches the
+  last one stops there: an untouched folder costs one listing and zero
+  parses, so an alt-tab is never a pause;
+* **what a listing can and cannot see**, which is the same problem `git` has
+  with its index and gets the same answer. A filesystem stamps a file from a
+  clock that moves in steps (~15 ms on NTFS, whole seconds on HFS+), so a
+  save that lands in the step the scan ran in carries a stamp the scan
+  cannot order against itself: any entry stamped within a second of its own
+  scan is therefore distrusted and re-read next time. What survives that is
+  one case — a change that keeps the byte count **and** carries a
+  deliberately back-dated timestamp, which is what a timestamp-preserving
+  copy does (`robocopy` by default, `rsync -t`, an archive extraction). That
+  is documented rather than papered over, and the *Rescan colour table
+  folder* button is the way out: it never looks at the listing and always
+  re-reads every file.
+
+Dropping a `.pal` (or `.txt`) on the window copies it into the folder and
+loads it immediately, answering in a floating notice — the table's name and
+family, or the parser's reason and line. A dropped file that does not parse
+is reported and **left where it was**; it is never filed and never
+overwrites anything, and a name already taken in the folder gets a numbered
+sibling. A drop past the 2 MB cap is turned away on its size before its
+bytes are read at all — a mis-dragged half-gigabyte file costs one
+`metadata` call rather than half a gigabyte on the UI thread — and it is
+told it is *too large for this build*, naming the cap, rather than that it is
+not a colour table: a 3 MB palette in a dialect this build reads fluently is
+a colour table, and a message that says otherwise sends the analyst hunting
+for a fault that is not there. A drop whose *bytes* are already in the folder files nothing and
+answers "already imported as …", so re-dropping a palette you have not
+edited cannot fill the picker with copies of one table.
+
+Persistence is by name (`settings_ui/palettes.rs`). A stored name resolves
+against the shipped catalogue first and the folder second — through the
+running scan when there is one, and otherwise through
+`color_tables::palette_named_in`, the same search the editor uses to find the
+file behind a table it has been asked to edit. Both read the folder in one
+order and identify a file by one rule, so where both answer they answer with
+the same file. A name nothing can
+resolve falls back to the family default on screen **and is kept in the
+settings file**, because the file may come back — so a drive that had not
+mounted yet does not cost the analyst their palette.
+`docs/palettes/Sample Ramp-Pair Velocity.pal` is a worked example of the
+format — original colours in a borrowed dialect, which is the rule for
+anything shipped in that folder: name a file after the format it is written
+in, never after somebody else's product;
+`cargo run --release -p workstation_app --example user_table_proof --
+<level2-file> <out-dir>` drives one through the whole chain on a real volume
+and writes the two frames to compare.
+
+## 3c. The colour table editor
+
+The other end of the same folder. `workstation_app/src/palette_editor` is a
+full editor for the dialect §3b reads, opened from a per-row affordance in the
+product picker and from *Settings → Radar → Colour tables*, and it writes
+`.pal` files into the folder §3b scans. Four modules: `model` (what a table
+is, and the two crossings to `color_tables::ColorTable`), `pal` (reading a
+file back, including the `Scale:` row a `ColorTable` applies and forgets),
+`store` (where files go and the round-trip check a save must pass), `ui` (the
+window).
+
+Three things hold the two features together, and each is one function rather
+than two agreeing implementations:
+
+* **one folder** — `settings::user_colortables_dir()`; see §3b;
+* **one identity** — the `Name:` row inside a file, falling back to its stem
+  (`color_tables::files::palette_identity`). The scanner names its rows with
+  it and `color_tables::palette_named_in` resolves with it, so Edit opens the
+  file the next launch installs;
+* **one name policy** — `color_tables::user_palette_name_fault`. The editor
+  refuses to save under a name that ends in a rendering suffix or that a
+  shipped palette already holds, because such a file is written perfectly and
+  the palette is gone at the next launch; the scanner applies the same rule to
+  a file already on disk by renaming the row it offers.
+
+Which rows offer *Edit* and which offer *Copy* is the caller's answer, not the
+editor's: `color_tables::is_builtin_table` — cached with the picker's rows in
+`settings_ui::PaletteOfferCache` — says whether this build ships the palette.
+A shipped preset is duplicated under a free name and claims no file; anything
+else is edited in the file whose `Name:` row matches it. There is no code path
+in the editor that writes over a preset.
+
+Save reports its path back to the application, which re-reads the folder one
+frame later (§3b), so a table an analyst has just written is in the picker
+immediately rather than after an alt-tab.
+
+`cargo run --release -p workstation_app --example palette_editor_proof --
+<level2-file> <out-dir>` drives the editor end to end on a real volume:
+edit-and-repaint, unit round trips, a shared GR palette opened and re-saved
+pixel-identically, and the real window photographed in both themes.
+
 ## 4. Getting a pane overlay or map layer in front of the user
 
 * Per-pane radar overlays (legend, badges, probe) enter through

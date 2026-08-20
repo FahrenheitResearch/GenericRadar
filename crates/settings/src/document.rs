@@ -136,6 +136,14 @@ pub struct PaletteChoice {
     pub name: String,
     #[serde(default)]
     pub rendering: String,
+    /// Which era of shipped defaults wrote this choice. The every-frame
+    /// mirror stores whatever palette is installed, so when a build changes
+    /// its default the store is full of names nobody picked; the generation
+    /// lets the reader migrate those exactly once (a file from before the
+    /// field deserializes to 0) while respecting the same name written by a
+    /// deliberate pick under the current generation.
+    #[serde(default)]
+    pub generation: u32,
     #[serde(flatten)]
     pub unknown: JsonMap<String, Json>,
 }

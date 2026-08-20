@@ -46,6 +46,10 @@ impl eframe::App for Preview {
                 registry: &self.registry,
                 store: &mut self.store,
                 color_tables: Some(&mut self.color_tables),
+                // The preview owns no colour table folder: the window is
+                // photographed with the shipped palettes alone, so the shot
+                // does not change with whatever is in a developer's folder.
+                user_tables: None,
             },
         );
         if !outcome.changed.is_empty() || outcome.palette_changed {

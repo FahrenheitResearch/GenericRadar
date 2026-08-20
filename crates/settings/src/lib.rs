@@ -39,7 +39,7 @@ pub use document::{
 };
 pub use paths::{
     app_cache_root, app_config_root, default_settings_file, is_fallback_root, set_app_cache_root,
-    set_app_config_root,
+    set_app_config_root, user_colortables_dir,
 };
 pub use registry::{ChoiceOption, SettingKind, SettingSpec, SettingsCategory, SettingsRegistry};
 pub use store::{LoadStatus, SettingsStore};

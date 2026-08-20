@@ -9,6 +9,7 @@ mod legend;
 mod live_service;
 mod load_service;
 mod nearest_site;
+mod palette_editor;
 mod palettes;
 mod pane_canvas;
 mod popup;
@@ -28,6 +29,13 @@ mod sites_service;
 mod sweep;
 #[allow(dead_code)]
 mod theme;
+// Also compiled in a second home - `examples/user_table_proof.rs` includes
+// it by `#[path]` to drive a real palette through the real drop path - so
+// items this binary does not call (the notice text the proof prints) are
+// still live API. `dead_code` is judged per compilation unit and cannot see
+// that caller.
+#[allow(dead_code)]
+mod user_tables;
 mod vol3d;
 mod vrot;
 mod warnings_service;

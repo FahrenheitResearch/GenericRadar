@@ -23,7 +23,8 @@
 
 use std::collections::BTreeSet;
 
-use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, palette_offers_for_family};
+use color_tables::user::UserTableLibrary;
+use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use eframe::egui;
 use product_engine::registry::DerivedVolumeId;
 use product_engine::{
@@ -34,6 +35,7 @@ use render2d::color_family_for_moment;
 
 use crate::product::DisplayProduct;
 use crate::product_availability::{ProductAvailabilityIndex, ProductEntry};
+use crate::settings_ui::PaletteOfferCache;
 
 /// Wide enough for a display name and its range on one line without wrapping.
 const PICKER_WIDTH: f32 = 468.0;
@@ -43,6 +45,10 @@ const ROW_HEIGHT: f32 = 34.0;
 const GROUP_HEADER_HEIGHT: f32 = 26.0;
 const PALETTE_ROW_HEIGHT: f32 = 26.0;
 const SWATCH_WIDTH: f32 = 150.0;
+/// The edit affordance on a palette row. Two touch targets wide, because the
+/// label is a word and mobile is a standing requirement (WCAG 2.2 SC 2.5.8 is
+/// 24 points per side and this row is exactly that tall).
+const EDIT_BUTTON_WIDTH: f32 = 48.0;
 /// Strips per palette preview. Fifty is past the point where the seams show at
 /// 150 px and well short of the cost of a per-pixel ramp.
 const SWATCH_STRIPS: usize = 50;
@@ -78,14 +84,24 @@ pub struct ProductPickerState {
     /// keystroke after opening filters instead of going nowhere.
     focus_filter: bool,
     scroll_to_focus: bool,
-    /// `palette_offers_for_family` parses its tables from text. Rebuilding
-    /// eight of them every frame the picker is open would be parsing colour
-    /// tables at the frame rate, so they are kept until the family or the
-    /// installed palette changes. The installed palette is part of the key
-    /// because the list is drawn in whichever way that one is drawn, and
-    /// because the last row is that one flipped. Its `name()` carries both the
-    /// palette and the drawing, so it is a complete key on its own.
-    palettes: Option<(ColorTableFamily, String, Vec<ColorTable>)>,
+    /// The palette rows for the focused product's family, and the set of base
+    /// names this build ships. Rebuilding either every frame the picker is
+    /// open would be parsing colour tables at the frame rate; the one cache
+    /// the toolbar and the settings window also use holds both, keyed on the
+    /// family, the installed palette and the colour table folder's scan
+    /// generation.
+    ///
+    /// The shipped-name set is kept beside the offers because the offers list
+    /// cannot be asked: a user table an analyst installed is appended to it
+    /// and looks exactly like a preset from the outside. It is what decides
+    /// whether a row's edit affordance opens the table or duplicates it.
+    ///
+    /// `a_table_dropped_while_the_picker_is_open_appears_in_the_list` is the
+    /// pin for the scan generation; `pressing_a_palette_rows_edit_affordance_
+    /// opens_the_editor_without_installing_it` and
+    /// `a_palette_this_build_does_not_ship_opens_for_editing_rather_than_
+    /// copying` are the pins for the shipped-name set.
+    palettes: PaletteOfferCache,
 }
 
 impl ProductPickerState {
@@ -115,23 +131,20 @@ impl ProductPickerState {
         self.focus
     }
 
-    fn palettes_for(&mut self, family: ColorTableFamily, installed: &ColorTable) -> &[ColorTable] {
-        if self
-            .palettes
-            .as_ref()
-            .is_none_or(|(cached, cached_name, _)| {
-                *cached != family || cached_name != installed.name()
-            })
-        {
-            self.palettes = Some((
-                family,
-                installed.name().to_owned(),
-                palette_offers_for_family(family, installed),
-            ));
-        }
-        self.palettes
-            .as_ref()
-            .map_or(&[][..], |(_, _, tables)| tables.as_slice())
+    fn palettes_for(
+        &mut self,
+        family: ColorTableFamily,
+        installed: &ColorTable,
+        user_tables: Option<&UserTableLibrary>,
+    ) -> &[ColorTable] {
+        self.palettes.offers(family, installed, user_tables)
+    }
+
+    /// Whether a palette is one this build ships, and therefore one the editor
+    /// must duplicate rather than open. Answered from the same cache entry the
+    /// rows came from, so the two can never disagree about one row.
+    fn is_builtin(&self, base_name: &str) -> bool {
+        self.palettes.is_builtin(base_name)
     }
 }
 
@@ -146,6 +159,9 @@ pub struct ProductPickerInput<'a> {
     /// The colour tables in force, so the palette section can mark the one
     /// already installed for the family.
     pub tables: &'a ColorTableSet,
+    /// The analyst's own colour table folder, whose tables are offered after
+    /// the built-ins. `None` offers the built-ins alone.
+    pub user_tables: Option<&'a UserTableLibrary>,
     /// Whether experimental products are offered. Passed through to the
     /// registry's own visibility rule rather than judged here.
     pub show_experimental: bool,
@@ -162,6 +178,18 @@ pub struct PaletteSelection {
     pub table: ColorTable,
 }
 
+/// A palette row's edit affordance was pressed.
+///
+/// `duplicate` is the shipped-preset rule made explicit at the boundary: the
+/// picker knows which palettes this build ships, and the editor never has to
+/// guess. A preset is copied under a new name and the original is left alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaletteEditRequest {
+    pub family: ColorTableFamily,
+    pub table: ColorTable,
+    pub duplicate: bool,
+}
+
 /// What the analyst did this frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProductPickerOutcome {
@@ -169,6 +197,8 @@ pub struct ProductPickerOutcome {
     pub product: Option<DisplayProduct>,
     /// A palette was chosen for the focused product's family.
     pub palette: Option<PaletteSelection>,
+    /// A palette row asked to be opened in the colour table editor.
+    pub edit_palette: Option<PaletteEditRequest>,
     /// The picker asked to close: Escape, or a product was chosen. Advisory -
     /// the caller owns the open flag and may keep it open.
     pub dismissed: bool,
@@ -347,6 +377,7 @@ pub fn draw_product_picker(
         current,
         availability,
         tables,
+        user_tables,
         show_experimental,
     } = input;
 
@@ -415,7 +446,14 @@ pub fn draw_product_picker(
             // an analyst arrowing onto velocity is asking about velocity's
             // palettes.
             let palette_product = state.focus.unwrap_or(current);
-            if let Some(palette) = palette_section(ui, state, palette_product, tables) {
+            if let Some(palette) = palette_section(
+                ui,
+                state,
+                palette_product,
+                tables,
+                user_tables,
+                &mut outcome,
+            ) {
                 outcome.palette = Some(palette);
             }
         });
@@ -737,6 +775,8 @@ fn palette_section(
     state: &mut ProductPickerState,
     product: DisplayProduct,
     tables: &ColorTableSet,
+    user_tables: Option<&UserTableLibrary>,
+    outcome: &mut ProductPickerOutcome,
 ) -> Option<PaletteSelection> {
     let descriptor = product.descriptor();
     let Some(family) = palette_family(product) else {
@@ -755,7 +795,7 @@ fn palette_section(
     let mut chosen = None;
     // Cloned out of the cache: the rows borrow `state` mutably to draw, and a
     // colour table is a few dozen stops.
-    let palettes: Vec<ColorTable> = state.palettes_for(family, installed).to_vec();
+    let palettes: Vec<ColorTable> = state.palettes_for(family, installed, user_tables).to_vec();
     // Said on the heading rather than left to be inferred from the list: the
     // last row is never another palette, it is this one drawn the other way,
     // and that row is the whole of the smooth/stepped control.
@@ -773,7 +813,15 @@ fn palette_section(
     };
     label_row(ui, heading);
     for table in palettes {
-        if palette_row(ui, &table, table.name() == in_use, descriptor).clicked() {
+        let duplicate = state.is_builtin(table.base_name());
+        let row = palette_row(ui, &table, table.name() == in_use, descriptor, duplicate);
+        if row.edit.clicked() {
+            outcome.edit_palette = Some(PaletteEditRequest {
+                family,
+                table: table.clone(),
+                duplicate,
+            });
+        } else if row.row.clicked() {
             chosen = Some(PaletteSelection {
                 family,
                 table: table.clone(),
@@ -795,15 +843,32 @@ fn label_row(ui: &mut egui::Ui, text: String) {
     );
 }
 
+/// The two things a palette row can be clicked on.
+struct PaletteRow {
+    row: egui::Response,
+    edit: egui::Response,
+}
+
 fn palette_row(
     ui: &mut egui::Ui,
     table: &ColorTable,
     in_use: bool,
     descriptor: &ProductDescriptor,
-) -> egui::Response {
+    duplicate: bool,
+) -> PaletteRow {
     let width = ui.available_width();
     let (_, rect) = ui.allocate_space(egui::vec2(width, PALETTE_ROW_HEIGHT));
     let response = ui.interact(rect, palette_row_id(table.name()), egui::Sense::CLICK);
+    // Registered AFTER the row, so it sits above it: a click on the edit
+    // affordance must open the editor, not also install the palette.
+    let edit_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - SWATCH_WIDTH - 18.0 - EDIT_BUTTON_WIDTH,
+            rect.top(),
+        ),
+        egui::vec2(EDIT_BUTTON_WIDTH, rect.height()),
+    );
+    let edit = ui.interact(edit_rect, palette_edit_id(table.name()), egui::Sense::CLICK);
     let painter = ui.painter();
     let fill = if in_use {
         ROW_SELECTED
@@ -838,11 +903,37 @@ fn palette_row(
             egui::StrokeKind::Outside,
         );
     }
-    response.on_hover_text(format!(
+    // "Copy" and not "Edit" on a shipped preset, because that is what pressing
+    // it does: the catalogue is never written over, so a preset opens as a
+    // duplicate under a new name. The full sentence is on the hover.
+    let edit_label = if duplicate { "Copy" } else { "Edit" };
+    painter.rect_filled(
+        edit_rect.shrink2(egui::vec2(0.0, 3.0)),
+        3.0,
+        if edit.hovered() {
+            ROW_SELECTED
+        } else {
+            FIELD_BACKGROUND
+        },
+    );
+    painter.text(
+        edit_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        edit_label,
+        egui::FontId::proportional(11.0),
+        if edit.hovered() { TEXT } else { TEXT_DIM },
+    );
+    let edit = edit.on_hover_text(if duplicate {
+        "Duplicate and edit. Shipped presets are never overwritten, so this opens a copy."
+    } else {
+        "Edit this colour table."
+    });
+    let row = response.on_hover_text(format!(
         "{} · previewed over {}",
         table.name(),
         range_summary(descriptor)
-    ))
+    ));
+    PaletteRow { row, edit }
 }
 
 /// Paint a palette across the span of the product it would draw.
@@ -895,12 +986,18 @@ fn palette_row_id(name: &str) -> egui::Id {
     egui::Id::new(("radar-product-picker-palette", name))
 }
 
+fn palette_edit_id(name: &str) -> egui::Id {
+    egui::Id::new(("radar-product-picker-palette-edit", name))
+}
+
 fn filter_id() -> egui::Id {
     egui::Id::new("radar-product-picker-filter")
 }
 
 #[cfg(test)]
 mod tests {
+    use color_tables::palette_offers_for_family;
+
     use super::*;
     // Test-only: production code offers palettes through
     // `palette_offers_for_family`; the tests compare that list against the
@@ -1504,7 +1601,7 @@ mod tests {
         let mut state = ProductPickerState::default();
         let defaults = ColorTableSet::default();
         let vel_installed = defaults.for_family(ColorTableFamily::Velocity);
-        let first = state.palettes_for(ColorTableFamily::Velocity, vel_installed);
+        let first = state.palettes_for(ColorTableFamily::Velocity, vel_installed, None);
         // Counted against the family list rather than a literal. A literal here
         // says "there are seven velocity tables", which is not what this test
         // is about and which fails every time a palette is added - so the
@@ -1518,7 +1615,7 @@ mod tests {
         let address = first.as_ptr();
         assert_eq!(
             state
-                .palettes_for(ColorTableFamily::Velocity, vel_installed)
+                .palettes_for(ColorTableFamily::Velocity, vel_installed, None)
                 .as_ptr(),
             address
         );
@@ -1526,7 +1623,8 @@ mod tests {
             state
                 .palettes_for(
                     ColorTableFamily::Reflectivity,
-                    defaults.for_family(ColorTableFamily::Reflectivity)
+                    defaults.for_family(ColorTableFamily::Reflectivity),
+                    None
                 )
                 .len(),
             builtin_tables_for_family(ColorTableFamily::Reflectivity).len() + 1
@@ -1566,10 +1664,12 @@ mod tests {
 
     #[test]
     fn clicking_a_palette_returns_the_table_and_its_family() {
+        // An interpolated-authored table, so the picker's offer carries the
+        // same name the catalog does regardless of the analyst's rendering.
         let alternative = builtin_tables_for_family(ColorTableFamily::Velocity)
             .into_iter()
-            .nth(1)
-            .expect("the velocity family has more than one table");
+            .find(|table| table.name() == "Smooth Doppler VEL (interpolated)")
+            .expect("the velocity family ships Smooth Doppler");
         let mut picker = Harness::open(DisplayProduct::Velocity);
         let outcome = picker.click(palette_row_id(alternative.name()));
         let selection = outcome.palette.expect("a palette was chosen");
@@ -1581,6 +1681,195 @@ mod tests {
         );
     }
 
+    /// A velocity palette in the GR2Analyst/RadarScope dialect, for the
+    /// tests that put a file in a folder and expect a picker row.
+    const USER_VELOCITY_PAL: &str = "Product: BV
+Units: KTS
+Color: -60 200   0 200    60 220 220
+Color:  60 220  60  60   255 255 255
+";
+
+    /// A colour table folder of this test's own, removed at the end.
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("product-picker-user-tables")
+            .join(format!(
+                "{test}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after 1970")
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_table_dropped_while_the_picker_is_open_appears_in_the_list() {
+        // The pin for the `user_generation` third of the palette cache's key
+        // (`settings_ui::PaletteOfferCache`). Take that clause out and an
+        // open picker keeps serving the list it built on the frame it
+        // opened - which is exactly the window in which an analyst drops a
+        // palette onto the application. Nothing else in this file renders a
+        // user-table row at all, so without this the whole suite stays green
+        // through that deletion.
+        let folder = scratch_dir("dropped-while-open");
+        let mut picker = Harness::open(DisplayProduct::Velocity).reading_tables_from(&folder);
+        assert!(
+            !picker
+                .painted()
+                .iter()
+                .any(|text| text.contains("Dropped Velocity")),
+            "the folder starts empty"
+        );
+
+        std::fs::write(folder.join("Dropped Velocity.pal"), USER_VELOCITY_PAL)
+            .expect("write palette");
+        picker.rescan_user_tables();
+        assert!(
+            picker
+                .painted()
+                .iter()
+                .any(|text| text.contains("Dropped Velocity")),
+            "a table that arrived while the picker was open must appear in it"
+        );
+
+        // And it is a real row, not just painted text: it can be clicked and
+        // it installs that table for the family.
+        let installed = ColorTableSet::default()
+            .for_family(ColorTableFamily::Velocity)
+            .clone();
+        let row = color_tables::user::palette_offers_with_user_tables(
+            ColorTableFamily::Velocity,
+            &installed,
+            picker.user_tables.as_ref().expect("a folder was given"),
+        )
+        .into_iter()
+        .find(|table| table.base_name() == "Dropped Velocity")
+        .expect("the dropped table is offered");
+        let selection = picker
+            .click(palette_row_id(row.name()))
+            .palette
+            .expect("the dropped table's row is clickable");
+        assert_eq!(selection.family, ColorTableFamily::Velocity);
+        assert_eq!(selection.table.base_name(), "Dropped Velocity");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The edit affordance sits on top of the row it is drawn in, so pressing
+    /// it opens the editor and does NOT also install the palette. Pinned
+    /// because the two hit rects overlap and the answer depends on the order
+    /// they are registered in.
+    #[test]
+    fn pressing_a_palette_rows_edit_affordance_opens_the_editor_without_installing_it() {
+        let alternative = builtin_tables_for_family(ColorTableFamily::Velocity)
+            .into_iter()
+            .find(|table| table.name() == "Smooth Doppler VEL (interpolated)")
+            .expect("the velocity family ships Smooth Doppler");
+        let mut picker = Harness::open(DisplayProduct::Velocity);
+        let outcome = picker.click(palette_edit_id(alternative.name()));
+        let request = outcome.edit_palette.expect("the editor was asked for");
+        assert_eq!(request.family, ColorTableFamily::Velocity);
+        assert_eq!(request.table.name(), alternative.name());
+        assert!(
+            request.duplicate,
+            "a shipped preset must open as a duplicate; presets are never overwritten"
+        );
+        assert_eq!(
+            outcome.palette, None,
+            "pressing edit must not also install the palette"
+        );
+        assert_eq!(outcome.product, None);
+    }
+
+    /// A palette the catalogue does not hold - one an analyst loaded - is
+    /// opened rather than copied, because there is a file of theirs to write.
+    #[test]
+    fn a_palette_this_build_does_not_ship_opens_for_editing_rather_than_copying() {
+        let mut tables = ColorTableSet::default();
+        let loaded = marker_table();
+        tables.set_family(ColorTableFamily::Velocity, loaded.clone());
+        let mut picker = Harness::open(DisplayProduct::Velocity);
+        picker.tables = tables;
+        let outcome = picker.click(palette_edit_id(loaded.name()));
+        let request = outcome.edit_palette.expect("the editor was asked for");
+        assert!(
+            !request.duplicate,
+            "a table that is not in the catalogue is the analyst's own"
+        );
+        assert_eq!(request.table.name(), loaded.name());
+    }
+
+    /// The two affordances, on the two kinds of row, decided by the same
+    /// cached set - with a real file in a real folder rather than a table
+    /// handed in by a test.
+    ///
+    /// This is where the folder feature and the editor feature meet: the
+    /// picker offers the analyst's own tables beside the shipped ones, and the
+    /// row's affordance has to tell them apart. A shipped preset opens as a
+    /// COPY, because presets are never overwritten. An imported file opens for
+    /// EDITING, because there is a file of the analyst's to write back to. Get
+    /// that backwards and either the catalogue is editable or an analyst's own
+    /// table can only ever be duplicated.
+    #[test]
+    fn an_imported_table_offers_edit_while_a_shipped_preset_offers_copy() {
+        let folder = scratch_dir("edit-vs-copy");
+        std::fs::write(folder.join("Field Velocity.pal"), USER_VELOCITY_PAL)
+            .expect("write palette");
+        let mut picker = Harness::open(DisplayProduct::Velocity).reading_tables_from(&folder);
+
+        let installed = ColorTableSet::default()
+            .for_family(ColorTableFamily::Velocity)
+            .clone();
+        let offers = color_tables::user::palette_offers_with_user_tables(
+            ColorTableFamily::Velocity,
+            &installed,
+            picker.user_tables.as_ref().expect("a folder was given"),
+        );
+        let imported = offers
+            .iter()
+            .find(|table| table.base_name() == "Field Velocity")
+            .expect("the imported file is offered")
+            .clone();
+        let shipped = offers
+            .iter()
+            .find(|table| {
+                color_tables::is_builtin_table(ColorTableFamily::Velocity, table.base_name())
+            })
+            .expect("the shipped catalogue is offered too")
+            .clone();
+
+        let request = picker
+            .click(palette_edit_id(imported.name()))
+            .edit_palette
+            .expect("the imported row asks for the editor");
+        assert!(
+            !request.duplicate,
+            "an analyst's own file has a file to write back to, so it is edited"
+        );
+        assert_eq!(request.table.base_name(), "Field Velocity");
+        assert_eq!(request.family, ColorTableFamily::Velocity);
+
+        let request = picker
+            .click(palette_edit_id(shipped.name()))
+            .edit_palette
+            .expect("the shipped row asks for the editor");
+        assert!(
+            request.duplicate,
+            "a shipped preset is copied; presets are never overwritten"
+        );
+
+        // And the table the editor is handed is the FILE's, not a preset of
+        // the same shape: its first stop is the one the file declares.
+        assert_eq!(
+            imported.stops()[0].color,
+            color_tables::Rgba8::opaque(200, 0, 200),
+            "the row carried the imported file's own colours"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// A table no built-in family holds, so "did this change?" has one answer.
     fn marker_table() -> ColorTable {
         use color_tables::{ColorStop, Rgba8};
@@ -1590,10 +1879,12 @@ mod tests {
                 ColorStop {
                     value: -1000.0,
                     color: Rgba8::opaque(1, 2, 3),
+                    end_color: None,
                 },
                 ColorStop {
                     value: 1000.0,
                     color: Rgba8::opaque(4, 5, 6),
+                    end_color: None,
                 },
             ],
         )
@@ -1609,6 +1900,10 @@ mod tests {
         context: egui::Context,
         state: ProductPickerState,
         tables: ColorTableSet,
+        /// The analyst's colour table folder, when a test supplies one.
+        /// `None` is the shipped catalogue alone, which is what almost every
+        /// test here is about.
+        user_tables: Option<UserTableLibrary>,
         availability: ProductAvailabilityIndex,
         current: DisplayProduct,
     }
@@ -1622,9 +1917,32 @@ mod tests {
                 context: egui::Context::default(),
                 state,
                 tables: ColorTableSet::default(),
+                user_tables: None,
                 availability: ProductAvailabilityIndex::unrestricted(),
                 current,
             }
+        }
+
+        /// Give this picker an analyst's colour table folder, scanned now.
+        /// Without this every test here runs on the shipped catalogue alone,
+        /// which is what left the folder's half of the palette cache key
+        /// with no coverage at all.
+        fn reading_tables_from(mut self, directory: &std::path::Path) -> Self {
+            self.user_tables = Some(UserTableLibrary::open(directory));
+            self
+        }
+
+        /// Re-read that folder, the way the application does when its window
+        /// comes back to the front.
+        fn rescan_user_tables(&mut self) {
+            let library = self
+                .user_tables
+                .as_mut()
+                .expect("this harness was given a folder");
+            assert!(
+                library.refresh(),
+                "the folder moved, so the rescan must read it"
+            );
         }
 
         fn filtered(mut self, filter: &str) -> Self {
@@ -1665,6 +1983,7 @@ mod tests {
                         current: self.current,
                         availability: &self.availability,
                         tables: &self.tables,
+                        user_tables: self.user_tables.as_ref(),
                         show_experimental: false,
                     },
                 );

@@ -7,14 +7,20 @@
 //! them without touching a single stop. [`TableRendering`] is the two-valued
 //! control an analyst actually holds.
 
+pub mod files;
 pub mod hazards;
 pub mod oklab;
 pub mod presets;
+pub mod user;
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+pub use files::{
+    PALETTE_EXTENSION, PaletteFile, UserNameFault, palette_named_in, palette_names_in,
+    user_palette_name_fault,
+};
 pub use presets::*;
 
 use presets::{
@@ -155,10 +161,31 @@ impl ColorTableFamily {
     }
 }
 
+/// One row of a palette: a value, the colour at that value, and optionally the
+/// colour the segment above it reaches.
+///
+/// The second colour is the GR2Analyst/RadarScope `.pal` two-colour ramp
+/// entry, `color: <value> <r> <g> <b> <r2> <g2> <b2>`, which shared palettes
+/// use constantly. A row that declares one says "ramp from my colour to *this* by
+/// the next row", which is not the same picture as "ramp to the next row's
+/// colour": the two differ wherever a palette wants a hard edge between bands
+/// and a gradient inside them, which is most of what a hand-tuned reflectivity
+/// table is doing.
+///
+/// `None` means the row declares one colour, and the segment above it ramps to
+/// whatever the next row opens with. That is the older, simpler dialect and
+/// the shape every table built from [`stop`] has.
+///
+/// Which of the two a mode actually paints is [`ColorTable::sample`]'s
+/// business, and the banded modes deliberately ignore it: a hard band has one
+/// colour.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorStop {
     pub value: f32,
     pub color: Rgba8,
+    /// The colour this stop's segment reaches just before the next stop, when
+    /// the row declared one.
+    pub end_color: Option<Rgba8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +216,14 @@ pub struct ColorTable {
     /// perceptual sampler runs only the inverse transform per sample; see
     /// [`oklab`] for why that matters at the per-pixel call rate.
     stop_oklab: Vec<oklab::Oklab>,
+    /// The colour each segment ramps *to*, in Oklab, resolved by
+    /// `segment_end_color` at construction and never separately mutated, so
+    /// `segment_end_oklab.len() == stops.len()` always holds.
+    ///
+    /// Kept resolved rather than stored per declaration so the perceptual
+    /// sampler makes one array read instead of re-deciding which of the three
+    /// targets applies on every pixel.
+    segment_end_oklab: Vec<oklab::Oklab>,
 }
 
 impl ColorTable {
@@ -286,6 +321,11 @@ impl ColorTable {
             }
             sample_mode = sample_mode.scale_values(unit_scale);
         }
+        // The text is written in the GR `.pal` dialect by definition of having
+        // arrived here, so its clear rows carry that dialect's hold. Tables
+        // built from stops in Rust do not, and must not pick it up from the
+        // sampler - see `hold_clear_gr_rows`.
+        hold_clear_gr_rows(&mut stops);
 
         Self::from_parts(name, product, units, range_folded, sample_mode, stops)
     }
@@ -348,12 +388,7 @@ impl ColorTable {
     /// A palette whose name carries no mode - anything an analyst loads from a
     /// file - is returned unchanged.
     pub fn base_name(&self) -> &str {
-        for suffix in SampleMode::NAME_SUFFIXES {
-            if let Some(head) = self.name.strip_suffix(suffix) {
-                return head;
-            }
-        }
-        &self.name
+        base_name_of(&self.name)
     }
 
     /// The same palette, drawn the other way.
@@ -373,11 +408,12 @@ impl ColorTable {
     ///   gate that painted before stops painting and the inked span does not
     ///   move. For a palette authored banded - which is every palette whose
     ///   default this change touched - that holds in both directions and the
-    ///   flip is a pure recolouring of the echo. The five palettes authored as
-    ///   sRGB ramps carry a half-dBZ alpha lead-in that hard bands cannot
-    ///   express, so flipping one of *those* to stepped drops a one-step fringe
-    ///   at the outermost edge of the echo, which is what asking for hard bands
-    ///   means.
+    ///   flip is a pure recolouring of the echo. It holds in both directions
+    ///   for the palettes authored as sRGB ramps too, with one exception:
+    ///   AWIPS Wilson opens on a clear row that declares an opaque second
+    ///   colour, so its continuous drawings fade the bottom ten dBZ in and
+    ///   hard bands, which have one colour per band, cannot. Flipping that one
+    ///   to stepped drops the fade, which is what asking for hard bands means.
     ///
     /// The name follows the mode, so the two renderings never collide in a
     /// list - which is what lets a picker go on identifying a row by its name.
@@ -463,12 +499,17 @@ impl ColorTable {
         }
         let left = self.stops[index - 1];
         let span = (right.value - left.value).max(f32::EPSILON);
-        left.color.lerp(right.color, (value - left.value) / span)
+        left.color.lerp(
+            segment_end_color(&self.stops, index - 1),
+            (value - left.value) / span,
+        )
     }
 
     /// `sample_interpolated`'s lookup with `oklab::mix` in place of the sRGB
-    /// lerp. The bracketing arithmetic is deliberately identical, so the two
-    /// continuous modes can only ever disagree about the colour they invent.
+    /// lerp. The bracketing arithmetic and the segment's target colour are
+    /// deliberately identical, so the two continuous modes can only ever
+    /// disagree about the colour they invent between the two ends, never about
+    /// the ends themselves.
     fn sample_perceptual(&self, value: f32) -> Rgba8 {
         let Some(first) = self.stops.first() else {
             return Rgba8::TRANSPARENT;
@@ -493,12 +534,21 @@ impl ColorTable {
         oklab::mix(
             left.color,
             self.stop_oklab[index - 1],
-            right.color,
-            self.stop_oklab[index],
+            segment_end_color(&self.stops, index - 1),
+            self.segment_end_oklab[index - 1],
             (value - left.value) / span,
         )
     }
 
+    /// One flat band per stop interval, painted in the band's *own* colour.
+    ///
+    /// A stop's declared end colour is deliberately not drawn here. A hard band
+    /// has one colour by definition; painting the second one somewhere inside
+    /// the band would put a seam where the whole point of the rendering is that
+    /// there is none, and painting it instead of the first would move every
+    /// band's colour up one row. The second colour is what the *continuous*
+    /// renderings ramp toward, and asking for bands is asking for that ramp to
+    /// be collapsed onto the value it starts from.
     fn sample_stepped(&self, value: f32) -> Rgba8 {
         let Some(first) = self.stops.first() else {
             return Rgba8::TRANSPARENT;
@@ -532,7 +582,59 @@ impl ColorTable {
     }
 
     /// The engine-value range over which this table actually puts ink on the
-    /// screen: from the first stop with a non-zero alpha to the last such stop.
+    /// screen.
+    ///
+    /// Read off the *segments* rather than off the stops, because a stop's
+    /// colour is only half of what its segment paints. A segment contributes
+    /// its lower bound when it opens opaque and its upper bound - the next
+    /// stop's value - when it arrives opaque, and those are two independent
+    /// facts once a row can declare a second colour. Scanning stop colours
+    /// alone ties the two together and gets both ends wrong on a table with
+    /// declared targets: a clear row that declares an opaque end, which is what
+    /// mirroring a lead-in transparent preset produces, inks up to the next
+    /// stop even when that stop is itself clear, and a clear row carrying the
+    /// dialect's transparent hold inks none of its interval even though the row
+    /// above it is opaque.
+    ///
+    /// Which colour a segment *arrives* at depends on the drawing, so this
+    /// reads `sample_mode` for it through `paints_ramp_targets`. A `Stepped`
+    /// band arrives at the colour it opened with, because that is the only
+    /// colour it has; every other mode reaches the interpolated sampler and
+    /// arrives at the ramp target. Reading the ramp target for a `Stepped`
+    /// table would report ink at the top of a stretch the bands leave blank,
+    /// and miss the last band of a palette whose top row is clear.
+    ///
+    /// Where inside a fading segment the alpha crosses zero is a rounding
+    /// artefact - Wilson crosses alpha 1 at -29.98 dBZ - so the segment's
+    /// declared bounds are what get reported. They are the numbers the palette
+    /// actually states.
+    ///
+    /// That makes a fade a lead-in or a lead-out and not part of the span, the
+    /// same way a clear lead-in is, and it cuts both ways. Wilson's ink is
+    /// reported from -20 dBZ, the value at which its first band arrives, not
+    /// from the -30 its fade opens at; symmetrically, an opaque row followed by
+    /// a clear one with no declared target fades out across its interval and is
+    /// reported up to its *own* value, not up to the clear stop it disappears
+    /// into. A legend labels where the palette is itself, at both ends. That is
+    /// only visible on a continuously drawn table: a `Stepped` one holds its
+    /// last colour flat to the clear stop, so its high bound is that stop.
+    ///
+    /// A lead-in leads in to something, though, and a table can be nothing but
+    /// the fade: `step: 5` over one clear row that declares an opaque second
+    /// colour and one clear row above it paints a thousand values and declares
+    /// no opaque stop at all. Read strictly, that table's ink is a single
+    /// value at the clear stop the fade arrives on - which is the one value in
+    /// the interval it does *not* paint - and a caller that suppresses a
+    /// zero-width bar suppresses the legend of a palette an analyst can see on
+    /// the scope. So when a declared fade is the only ink, the lowest one
+    /// contributes its opening as well and the span is the stretch it covers.
+    ///
+    /// "Declared" is what separates that from a clear stop with no second
+    /// colour, which fades into whatever the row above it is and stays a
+    /// lead-in: the row above is opaque, so it is already the low bound and
+    /// the span has extent or is honestly a single value. A row that writes
+    /// its own second colour is the palette saying that interval paints, and
+    /// when nothing else does, that is the palette.
     ///
     /// Prevents a legend that advertises a range where nothing is ever painted.
     /// Twelve of the forty-seven built-in tables open with exactly two alpha-0
@@ -557,32 +659,77 @@ impl ColorTable {
     /// intercepts before value conversion, so it has no engine value and letting
     /// it widen the span would hang a number on a non-numeric category.
     ///
-    /// Returns `None` only when every stop is fully transparent; such a table
-    /// can never ink anything and its legend must be suppressed, not drawn
-    /// empty. Note this differs from `first_opaque_value`, which reports `None`
-    /// for the common case of a palette whose first stop is already opaque.
+    /// Returns `None` only for a table that can never ink anything: every stop
+    /// transparent *and* no segment arriving anywhere opaque either. Its legend
+    /// must be suppressed rather than drawn empty. Note this differs from
+    /// `first_opaque_value`, which reports `None` for the common case of a
+    /// palette whose first stop is already opaque.
     ///
-    /// The two bounds can be equal. `from_parts` guarantees at least two stops
-    /// but not two *inked* stops, so a loaded palette of one transparent stop
-    /// and one opaque stop reports a zero-width span such as `(10.0, 10.0)`.
-    /// That is the honest answer - the table inks exactly one value - but a
-    /// legend that places a tick at `(value - low) / (high - low)` divides by
-    /// zero and gets NaN coordinates, so the caller must test for `high == low`
-    /// before laying out a bar. No built-in table has this shape.
+    /// The two bounds can still be equal, for the one shape where a single
+    /// value really is all the ink there is: a `.pal` whose clear lead-in row
+    /// declares nothing picks up the dialect's transparent hold, so it fades
+    /// nowhere and a table of that row plus one opaque stop reports
+    /// `(10.0, 10.0)`. A legend that places a tick at
+    /// `(value - low) / (high - low)` divides by zero and gets NaN
+    /// coordinates, so the caller must still test for `high == low` before
+    /// laying out a bar. No built-in table has this shape.
     pub fn inked_value_span(&self) -> Option<(f32, f32)> {
         let mut first_inked: Option<f32> = None;
         let mut last_inked: Option<f32> = None;
-        for stop in &self.stops {
-            if stop.color.a == 0 {
-                continue;
-            }
+        // Where the lowest lead-in fade opens, held back in case those fades
+        // turn out to be the only ink the table has.
+        let mut first_fade_opened_at: Option<f32> = None;
+        // Every bound this loop offers is either `stops[index].value` or
+        // `stops[index + 1].value`, and the stops are sorted, so the offers
+        // arrive in non-decreasing order and first/last are the extremes
+        // without a running min and max.
+        let mut inked_at = |value: f32| {
             if first_inked.is_none() {
-                first_inked = Some(stop.value);
+                first_inked = Some(value);
             }
-            last_inked = Some(stop.value);
+            last_inked = Some(value);
+        };
+        let paints_ramp_targets = self.sample_mode.paints_ramp_targets();
+        for (index, stop) in self.stops.iter().enumerate() {
+            if stop.color.a > 0 {
+                inked_at(stop.value);
+            }
+            // What the segment arrives at, which is the ramp target only where
+            // the drawing paints one. A `Stepped` band arrives at the colour it
+            // opened with, so there an opaque row followed by a clear one inks
+            // its whole band and a clear row followed by an opaque one inks
+            // none of it.
+            let arrives_at = if paints_ramp_targets {
+                segment_end_color(&self.stops, index)
+            } else {
+                stop.color
+            };
+            if let Some(next) = self.stops.get(index + 1)
+                && arrives_at.a > 0
+            {
+                // A clear row that DECLARES an opaque second colour is a row
+                // stating that its own interval paints. A clear row that
+                // declares nothing is a lead-in to the stop above it, and that
+                // stop is already where the span starts.
+                if stop.color.a == 0 && stop.end_color.is_some() && first_fade_opened_at.is_none() {
+                    first_fade_opened_at = Some(stop.value);
+                }
+                inked_at(next.value);
+            }
         }
         match (first_inked, last_inked) {
-            (Some(low), Some(high)) => Some((low, high)),
+            // A declared fade is normally not part of the span, because it
+            // leads in to the opaque stop that is. When it is the only ink the
+            // table has there is nothing for it to lead in to, so the fade is
+            // the palette and its own opening is the low bound - otherwise the
+            // report is a single value at the clear stop the fade ends on,
+            // which is the one value in the whole interval that paints
+            // nothing, and it puts the caller's `high == low` guard between an
+            // analyst and a legend for a table that visibly paints.
+            (Some(low), Some(high)) => match first_fade_opened_at {
+                Some(fade) if low >= high && fade < low => Some((fade, high)),
+                _ => Some((low, high)),
+            },
             _ => None,
         }
     }
@@ -618,19 +765,162 @@ impl ColorTable {
         for stop in &self.stops {
             stop.value.to_bits().hash(&mut hasher);
             stop.color.hash(&mut hasher);
+            // The ramp target is part of the picture in both continuous
+            // renderings, so two tables that differ only in where their
+            // segments are heading must not share a cached raster.
+            stop.end_color.hash(&mut hasher);
         }
         hasher.finish()
     }
 
+    /// The same palette with the sign of every value flipped, for reading a
+    /// velocity field under the opposite convention.
+    ///
+    /// Mirrors *what the table is currently drawing*, which is why it reads
+    /// `sample_mode` and why a caller that also wants to switch the rendering
+    /// should call [`ColorTable::rendered`] first and mirror the result. The
+    /// two drawings do not reverse the same way:
+    ///
+    /// * A continuous rendering paints a segment as a ramp from its stop's
+    ///   colour to the segment's resolved end colour, so reversing it means
+    ///   turning each segment around: the colour a segment ramped *to* becomes
+    ///   the colour its mirror image opens with, and the colour it opened with
+    ///   becomes the colour the mirror ramps to. Every mirrored stop therefore
+    ///   declares an end colour even when the original did not - what was
+    ///   implicit in one direction has to be spelled out in the other.
+    /// * A banded rendering paints the half-open interval `[v_i, v_i+1)` in
+    ///   `c_i` and never paints a ramp target at all, so reflecting it means
+    ///   moving each colour down one stop: the band that ran up to `v_i+1`
+    ///   becomes the band that runs *from* `-v_i+1`, so the mirror's stop just
+    ///   above `-v_i+1` carries `c_i`. Reversing the colours without that
+    ///   shift - which is what this did until the reflection was written down -
+    ///   hands every band its neighbour's colour and paints a gate at -3 m/s in
+    ///   the colour the palette gives +5 to +20.
+    ///
+    /// The mirror of a single-colour palette drawn continuously paints exactly
+    /// what it painted before, because an undeclared target *is* the next
+    /// stop's colour and the two rules agree wherever nothing is declared.
+    ///
+    /// # Exactly at a stop value, and why the numbers look wrong
+    ///
+    /// A stop list describes a function that is continuous from the right -
+    /// `sample` answers `c_i` at `v_i` and answers what the band or segment
+    /// below was heading for just under it - and reflecting such a function
+    /// makes it continuous from the *left*, which no single stop can say. That
+    /// is not a rounding detail: velocity is a discrete field whose values land
+    /// on these palettes' stops by construction. A NEXRAD velocity moment
+    /// encodes multiples of 0.5 m/s and this crate's dealiased grid multiples
+    /// of 0.1 m/s, so a palette banded at integer m/s has a fully populated
+    /// gate population sitting on every one of its stops, the near-zero ones
+    /// most of all. Handing those the neighbouring band's colour mis-painted a
+    /// third of a real velocity sweep.
+    ///
+    /// So a stop with a hard edge becomes *two* stops in the mirror: the
+    /// reflected point value keeps `-v_i`, and the reflected band or segment
+    /// opens at [`f32::next_up`] of it, the next representable float, which is
+    /// the smallest gap that leaves nothing between them. Reading the mirror's
+    /// stops back therefore shows values like `-9.9999990` beside `-10.0`,
+    /// which is the price of the reflection being exact at every value the
+    /// radar can encode rather than only between them. Where the reflected
+    /// opening is already the colour the original paints at the stop - every
+    /// stop of a palette that declares no ramp targets - nothing is split and
+    /// the mirror keeps the palette's own numbers. A quantised drawing splits
+    /// only on stops its grid can actually land on, because the values between
+    /// grid points are never looked up.
+    ///
+    /// What is left is a byte of rounding, and only in a continuous drawing: a
+    /// mirrored segment opens one ULP later than the original's closed, so its
+    /// `t` differs in the last place and a channel whose exact mix lands on a
+    /// half rounds the other way. Over 800,460 samples of all ten built-in
+    /// velocity palettes drawn both ways that is 3 samples, each off by one in
+    /// one channel, none of them a value the radar can encode.
+    /// `a_flip_of_every_velocity_palette_is_exact_at_every_value_a_radar_sends`
+    /// measures both halves of that claim.
+    ///
+    /// # What a mirror still cannot carry
+    ///
+    /// The clamps come out right - a table clamps below its first stop and
+    /// above its last, and the mirror's outermost stops now carry the
+    /// reflected point values those clamps hold - but two things about a table
+    /// are not values and do not reverse:
+    ///
+    /// * the range-folded colour, which is chosen by a code in the moment data
+    ///   rather than by a velocity, and is copied across unchanged;
+    /// * the transparency cut-off the continuous modes apply below a palette's
+    ///   first opaque stop, which follows the stop list and so ends up at the
+    ///   mirror's *bottom* while the reflected clear rows sit at its top. No
+    ///   shipped velocity palette has a transparent row, which is the only
+    ///   family the application ever mirrors.
     pub fn mirrored_values(&self, name: impl Into<String>) -> Self {
-        let stops = self
-            .stops
-            .iter()
-            .map(|stop| ColorStop {
-                value: -stop.value,
+        let paints_ramp_targets = self.sample_mode.paints_ramp_targets();
+        let mirrored_mode = self.sample_mode.mirrored_values();
+        let mut stops = Vec::with_capacity(self.stops.len() * 2);
+        for (index, stop) in self.stops.iter().enumerate().rev() {
+            // What the reflected band or segment OPENS with, just above the
+            // mirrored stop.
+            let (color, end_color) = if !paints_ramp_targets {
+                // Bands, shifted down one interval. `saturating_sub` is the
+                // duplicate the bottom of the table needs: the original's
+                // first colour is both the band above its first stop and
+                // the colour it clamps to below it, and the mirror needs it
+                // at its own top twice for the same reason.
+                (self.stops[index.saturating_sub(1)].color, None)
+            } else {
+                match index.checked_sub(1) {
+                    Some(below) => (
+                        segment_end_color(&self.stops, below),
+                        Some(self.stops[below].color),
+                    ),
+                    // The original's first stop becomes the mirror's last,
+                    // and a last stop has no segment above it to ramp
+                    // across.
+                    None => (stop.color, None),
+                }
+            };
+            let mirrored_value = -stop.value;
+            // Everything under the mirror's lowest stop clamps to it, so that
+            // one is read whatever the drawing rounds to and always has to
+            // carry the reflected point value - it is the original's
+            // open-ended top band or top clamp seen from the other side.
+            let is_the_mirrors_clamp = index + 1 == self.stops.len();
+            if color == stop.color
+                || !(is_the_mirrors_clamp || mirrored_mode.paints_value(mirrored_value))
+            {
+                // Nothing to separate: either the reflected opening is already
+                // the colour the original paints at this stop, or the drawing
+                // is quantised and no grid point can land on this stop, so
+                // nothing will ever ask for the value that would differ. One
+                // stop says everything, and the mirror keeps the palette's own
+                // numbers.
+                stops.push(ColorStop {
+                    value: mirrored_value,
+                    color,
+                    end_color,
+                });
+                continue;
+            }
+            // A hard edge, and the one place a naive `v -> -v` gets a whole
+            // population of gates wrong. The original answers `stop.color` AT
+            // `stop.value`, so the reflection owes that colour at
+            // `-stop.value` exactly and owes the opening colour above it, and
+            // one stop cannot say both: a stop list is continuous from the
+            // right, its reflection is continuous from the left. So the point
+            // value keeps the mirrored stop and the opening moves up by one
+            // ULP, which is the smallest gap that leaves no `f32` between
+            // them. The mirrored point stop declares no end colour: the sliver
+            // it opens holds no other float, and letting it declare one would
+            // hand `inked_value_span` a bound one ULP off the palette's own.
+            stops.push(ColorStop {
+                value: mirrored_value,
                 color: stop.color,
-            })
-            .collect::<Vec<_>>();
+                end_color: None,
+            });
+            stops.push(ColorStop {
+                value: mirrored_value.next_up(),
+                color,
+                end_color,
+            });
+        }
         Self::from_parts_with_authored(
             name.into(),
             self.product.clone(),
@@ -674,9 +964,15 @@ impl ColorTable {
     ) -> Result<Self, ColorTableError> {
         stops.retain(|stop| stop.value.is_finite());
         stops.sort_by(|left, right| left.value.total_cmp(&right.value));
-        stops.dedup_by(|left, right| {
-            if left.value.to_bits() == right.value.to_bits() {
-                *left = *right;
+        // Two rows at one value: the last one written wins, which is what GR
+        // does with a file that says the same value twice and what a person
+        // editing a palette expects from a later line. `sort_by` is stable, so
+        // "last" is still last in file order after the sort. `dedup_by` hands
+        // the *later* element first and removes it, so the surviving row is
+        // `kept` and the later row's colours have to be copied into it.
+        stops.dedup_by(|later, kept| {
+            if later.value.to_bits() == kept.value.to_bits() {
+                *kept = *later;
                 true
             } else {
                 false
@@ -691,6 +987,9 @@ impl ColorTable {
             .iter()
             .map(|stop| oklab::oklab_from_rgb(stop.color))
             .collect();
+        let segment_end_oklab = (0..stops.len())
+            .map(|index| oklab::oklab_from_rgb(segment_end_color(&stops, index)))
+            .collect();
 
         Ok(Self {
             name,
@@ -701,6 +1000,7 @@ impl ColorTable {
             authored_mode,
             stops,
             stop_oklab,
+            segment_end_oklab,
         })
     }
 }
@@ -714,11 +1014,13 @@ pub enum SampleMode {
     /// Straight-line mix of the sRGB bytes.
     ///
     /// The legacy continuous path. Kept as its own mode, rather than folded
-    /// into `Continuous`, because five built-in palettes were authored against
-    /// it - their stops were chosen by eye *through* this mixing - and their
-    /// half-dBZ alpha lead-ins and their published colours are pinned by tests
-    /// to the byte. Changing what they paint to make the crate tidier would be
-    /// changing palettes nobody complained about.
+    /// into `Continuous`, because the built-in palettes written as sRGB ramps
+    /// were authored against it - their stops were chosen by eye *through* this
+    /// mixing - and their published colours are pinned by tests to the byte.
+    /// Changing what they paint to make the crate tidier would be changing
+    /// palettes nobody complained about. Both shipped defaults are in this
+    /// group, and both are GR `.pal` ports whose ramp rows only make sense
+    /// under it.
     Interpolated,
     /// One flat band per stop interval.
     Stepped,
@@ -766,6 +1068,54 @@ impl SampleMode {
         match self {
             Self::QuantizedInterpolated { step, .. } => Some(step),
             Self::Interpolated | Self::Stepped | Self::Continuous => None,
+        }
+    }
+
+    /// Whether this drawing ever puts a stop's *second* colour on the screen.
+    ///
+    /// Only [`SampleMode::Stepped`] answers `false`. It paints one flat band
+    /// per stop interval in the band's own colour, so a stop's second colour is
+    /// inert - see [`ColorTable::sample_stepped`] for why that is the right
+    /// reading of a hard band rather than an oversight.
+    ///
+    /// `QuantizedInterpolated` answers `true` even though it is banded, because
+    /// what it bands is the *value* and not the palette: it rounds the value
+    /// onto the grid and then hands the result to `sample_interpolated`, which
+    /// reads [`segment_end_color`]. A `.pal` is under no obligation to put its
+    /// rows on multiples of its own `step:` - this crate's own shipped
+    /// `GR2Analyst Classic REF` declares `step: 5` and then writes rows at 7.5,
+    /// 62.5, 67.5, 72.5 and 92.5 - so a grid point routinely lands *between*
+    /// two stops and paints the mix, which is a colour no stop declares. Where
+    /// a row also declares a ramp target, that target is what the mix runs
+    /// toward, and a transform that dropped it would repaint the band.
+    ///
+    /// Anything that rewrites stops rather than reading them -
+    /// [`ColorTable::mirrored_values`] is the one - has to ask, because a ramp
+    /// and a band do not reverse the same way.
+    fn paints_ramp_targets(self) -> bool {
+        match self {
+            Self::Interpolated | Self::Continuous | Self::QuantizedInterpolated { .. } => true,
+            Self::Stepped => false,
+        }
+    }
+
+    /// Whether this drawing can ever be asked for exactly this value.
+    ///
+    /// Three of the four modes hand the value straight to a sampler, so every
+    /// value is one of theirs. `QuantizedInterpolated` rounds first, so the
+    /// only values it ever looks up are its own grid points and a stop that
+    /// falls between two of them is never read at all.
+    ///
+    /// [`ColorTable::mirrored_values`] asks before it spends a stop on a
+    /// value's exact reflection: a stop no grid point can land on cannot be
+    /// painted, so splitting it would move the ramp geometry by an ULP and buy
+    /// nothing.
+    fn paints_value(self, value: f32) -> bool {
+        match self {
+            Self::Interpolated | Self::Continuous | Self::Stepped => true,
+            Self::QuantizedInterpolated { step, origin } => {
+                quantize_value(value, step, origin) == value
+            }
         }
     }
 
@@ -961,6 +1311,7 @@ pub(crate) fn stop(value: f32, r: u8, g: u8, b: u8) -> ColorStop {
     ColorStop {
         value,
         color: Rgba8::opaque(r, g, b),
+        end_color: None,
     }
 }
 
@@ -970,15 +1321,115 @@ pub(crate) fn stop(value: f32, r: u8, g: u8, b: u8) -> ColorStop {
 /// built from stops needs the same thing so that a scan's noise floor stays off
 /// the scope instead of covering it in the first stop's colour, which is what
 /// `sample` would otherwise do for every value below the first stop.
+///
+/// Declares no end colour, so the segment above it fades up into the next
+/// stop's colour the way any other undeclared segment does. A clear stop in a
+/// Rust-built table is the bottom of a gradient, not a mask; the mask is the GR
+/// `.pal` dialect's reading of a clear *row*, and [`hold_clear_gr_rows`] writes
+/// that one in at parse time where it belongs. A table that wants the mask says
+/// so by declaring `Rgba8::TRANSPARENT` as the end colour, which is what a
+/// parsed lead-in ends up carrying.
 pub(crate) fn clear_stop(value: f32) -> ColorStop {
     ColorStop {
         value,
         color: Rgba8::TRANSPARENT,
+        end_color: None,
     }
 }
 
 fn default_range_folded_color() -> Rgba8 {
     Rgba8::new(126, 80, 196, 245)
+}
+
+/// The colour the segment that opens at `index` ramps *to*.
+///
+/// Two cases, and no third:
+///
+/// * the row declared a second colour, and that is the target;
+/// * the row is a single colour, and the target is the next row's colour,
+///   which is the older one-colour-per-row reading a stop list has always had.
+///
+/// Deliberately *not* a place where a clear row acquires a hold. GR2Analyst
+/// does hold a transparent row's colour across its interval rather than ramping
+/// out of it, but that is a fact about the `.pal` dialect, and the tables this
+/// crate builds in Rust from [`stop`] and [`clear_stop`] are not written in it.
+/// A resolver that applied the rule to every table would mask the floor segment
+/// of any preset whose lowest stop happens to be transparent, which is a large
+/// and silent blast radius: the three interpolated reflectivity presets and
+/// every synthesised derived-product ramp are that shape, and each would lose
+/// the bottom of its range without a line of them changing. The rule lives at
+/// the edge instead - [`hold_clear_gr_rows`] writes it into the parsed stops as
+/// a declared end colour - so a `.pal` gets the dialect's reading of its clear
+/// rows, a table built from stops ramps between them, and `stops()` shows which
+/// one a caller is holding.
+///
+/// A free function rather than a method because the constructor has to resolve
+/// every segment before there is a `ColorTable` to call a method on, and the
+/// two must not be allowed to drift apart.
+///
+/// `index` is the segment's *lower* stop, which every sampling caller has
+/// already bracketed, so `index + 1` is in range whenever the answer can
+/// matter. The last stop has no segment above it and answers with its own
+/// colour, which is what `sample` clamps to there anyway.
+fn segment_end_color(stops: &[ColorStop], index: usize) -> Rgba8 {
+    let stop = stops[index];
+    if let Some(end) = stop.end_color {
+        return end;
+    }
+    stops
+        .get(index + 1)
+        .map(|next| next.color)
+        .unwrap_or(stop.color)
+}
+
+/// Write GR2Analyst's clear-row hold into the stops it applies to.
+///
+/// A GR `.pal` row that paints nothing and declares no second colour holds
+/// transparent right up to the next row: a palette's lead-in is a mask, not the
+/// bottom of a gradient, and ramping it up into the first inked row would fade
+/// a band of noise floor onto the scope the author asked to keep off it. A row
+/// that really does want a fade-in says so by declaring an opaque second
+/// colour, which is what the AWIPS Wilson table's -30 dBZ row does.
+///
+/// The hold is recorded as an ordinary declared end colour rather than left for
+/// the sampler to infer, because it belongs to the file and not to the format
+/// this crate samples: only text that came through [`ColorTable::parse`] and
+/// friends is written in the dialect. Making it explicit also means `stops()`,
+/// `signature()` and any editor built on them see the same palette the sampler
+/// does, with no rule hidden between them.
+///
+/// Provenance: BowEcho's `color_tables` reads the same dialect and states the
+/// rule the same way - "Plain Color: rows ramp to the next row in GR ... EXCEPT
+/// that GR holds a transparent row's color across its interval; interpolated
+/// tables lerp through it" - and keeps the two readings apart rather than
+/// merging them.
+///
+/// Applies to the last row too, harmlessly: it has no segment above it, so the
+/// declaration is never read.
+///
+/// # What this does *not* claim
+///
+/// Getting the clear-row hold right closes one gap between this reader and
+/// GR2Analyst; it does not close them all, and nobody should read a `.pal`
+/// through this crate expecting a pixel-for-pixel GR screen. Two divergences
+/// are known and deliberate, and both are left as they are:
+///
+/// * `SolidColor:` / `SolidColor4:` are parsed onto the same arm as `Color:` /
+///   `Color4:`, so a solid row ramps into its neighbour here where GR paints it
+///   as a flat band across its interval. The dialect's own reader carries a
+///   `solid` flag per row for exactly this.
+/// * `Step:` is taken as a request to quantise the display onto a grid. In GR
+///   it is the legend's tick spacing and does not touch the drawing at all.
+///
+/// Both are pinned by tests that say plainly what the crate does, so a later
+/// round that decides to close either gap will find the pin rather than a
+/// silent change of picture.
+fn hold_clear_gr_rows(stops: &mut [ColorStop]) {
+    for stop in stops {
+        if stop.end_color.is_none() && stop.color.a == 0 {
+            stop.end_color = Some(stop.color);
+        }
+    }
 }
 
 pub(crate) fn lerp_u8(left: u8, right: u8, amount: f32) -> u8 {
@@ -990,6 +1441,86 @@ fn quantize_value(value: f32, step: f32, origin: f32) -> f32 {
         return value;
     }
     ((value - origin) / step).round() * step + origin
+}
+
+/// The rendering suffix a name ends in, if it ends in one of the four this
+/// build appends.
+///
+/// [`ColorTable::rendered`] spells the two drawings of one palette by putting
+/// the sampling mode on the end of the name - "AWIPS Wilson REF (continuous)",
+/// "AWIPS Wilson REF (stepped)" - so that two rows of a picker can hold one
+/// palette twice and still be told apart. [`ColorTable::base_name`] is the
+/// other half of that arrangement and takes the suffix back off.
+///
+/// It is public because the arrangement has a consequence a *writer* has to
+/// know about: a name that already ends this way is not a name this build can
+/// carry. Whatever an analyst types there, the flip of the smooth/stepped
+/// switch rewrites it, and what is stored as the installed palette's identity
+/// is the half without the suffix - which is not what the file declares. The
+/// colour table editor asks this before it writes a file, and refuses the
+/// name rather than writing one that would come back as something else.
+pub fn rendering_suffix(name: &str) -> Option<&'static str> {
+    SampleMode::NAME_SUFFIXES
+        .into_iter()
+        .find(|suffix| name.ends_with(suffix))
+}
+
+/// [`ColorTable::base_name`] for a name that has no table behind it yet.
+///
+/// The same string operation, so a *writer* checking a name an analyst has
+/// typed and a *reader* asking what palette a table is cannot disagree about
+/// where a name ends and its rendering begins. `ColorTable::base_name` is one
+/// line over this.
+///
+/// This is the form every picker row reduces to, because a row's label is
+/// [`ColorTable::rendered`]'s output - a base name with one of the four
+/// suffixes on the end - and it is the form a stored palette choice is written
+/// in. Anything that has to answer "does this name belong to a shipped
+/// palette" therefore has to ask about this half of it and not the whole
+/// string.
+pub fn base_name_of(name: &str) -> &str {
+    match rendering_suffix(name) {
+        Some(suffix) => &name[..name.len() - suffix.len()],
+        None => name,
+    }
+}
+
+/// The name a `.pal` text declares in its `Name:` row, if it declares one.
+///
+/// [`ColorTable::parse`] has no `Name:` arm - it takes the name from its
+/// argument, because the shipped presets are parsed out of embedded text that
+/// has no such row and are named by the code that installs them. A file on
+/// disk is the other way round: the row inside it is the palette's identity,
+/// and the filename is a lossy handle that two different palettes can share.
+/// So anything that has to answer "which palette is in this file" asks here,
+/// through the same line normalisation, key normalisation and last-row-wins
+/// precedence the parser itself uses.
+///
+/// `None` for a text with no `Name:` row or an empty one - a plain GR2Analyst
+/// `.pal`, which never carries the row. The caller decides what to call such a
+/// file; the convention in this build is its file stem.
+pub fn declared_name(text: &str) -> Option<String> {
+    let mut name = None;
+    for original_line in text.lines() {
+        let line = normalize_line(original_line);
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with(';')
+            || line.starts_with('#')
+            || line.starts_with("$$")
+        {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = split_key_value(line) else {
+            continue;
+        };
+        if normalize_key(raw_key) == "name"
+            && let Some(value) = non_empty(raw_value)
+        {
+            name = Some(value);
+        }
+    }
+    name
 }
 
 fn normalize_line(line: &str) -> String {
@@ -1016,6 +1547,23 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+/// One `color:` / `color4:` row, including the GR two-colour ramp form.
+///
+/// The dialect is GR2Analyst's and RadarScope reads the same files: a row is
+/// `color: <value> <r> <g> <b>` or, for a ramp, `color: <value> <r> <g> <b>
+/// <r2> <g2> <b2>`, with `color4:` adding an alpha byte to each colour. Shared
+/// `.pal` files use the ramp form constantly, so trailing components are read
+/// as the segment's end colour rather than discarded.
+///
+/// The end colour's alpha is optional in both forms and independent of the
+/// row's own: a `color4:` row may declare `r2 g2 b2` and get an opaque end,
+/// which is how a table fades a transparent lead-in up into its first band.
+/// Numbers past a complete end colour are ignored, as they always were.
+///
+/// One or two trailing numbers are rejected rather than dropped. There is no
+/// reading under which they are a colour, and a palette that silently loses a
+/// mistyped ramp paints something the file does not say; the error carries the
+/// line number so the row can be found.
 fn parse_color_stop(
     value: &str,
     expects_alpha: bool,
@@ -1034,6 +1582,27 @@ fn parse_color_stop(
     } else {
         255
     };
+    let end_color = match numbers.len() - required {
+        0 => None,
+        1 | 2 => {
+            return Err(ColorTableError::InvalidColor {
+                line,
+                reason: "ramp end colour needs RGB or RGBA components",
+            });
+        }
+        3 => Some(Rgba8::new(
+            byte_component(numbers[required], line)?,
+            byte_component(numbers[required + 1], line)?,
+            byte_component(numbers[required + 2], line)?,
+            255,
+        )),
+        _ => Some(Rgba8::new(
+            byte_component(numbers[required], line)?,
+            byte_component(numbers[required + 1], line)?,
+            byte_component(numbers[required + 2], line)?,
+            byte_component(numbers[required + 3], line)?,
+        )),
+    };
     Ok(ColorStop {
         value: numbers[0],
         color: Rgba8::new(
@@ -1042,6 +1611,7 @@ fn parse_color_stop(
             byte_component(numbers[3], line)?,
             alpha,
         ),
+        end_color,
     })
 }
 
@@ -1166,6 +1736,859 @@ mod tests {
         assert_eq!(table.range_folded_rgba(), Rgba8::new(82, 21, 86, 245));
     }
 
+    /// The GR two-colour ramp row, in both spellings a `.pal` file uses.
+    ///
+    /// A `color:` row's end colour is three bytes and comes out opaque; a
+    /// `color4:` row's may be three or four, so a table can fade a clear row up
+    /// into an opaque one without giving every other row an alpha column.
+    #[test]
+    fn parses_two_colour_ramp_rows_with_rgb_and_rgba_end_colours() {
+        let table = ColorTable::parse(
+            "GR ramp pairs",
+            r#"
+            product: BR
+            units: dBZ
+            color4: 0 10 20 30 0 40 50 60 255
+            color: 10 70 80 90 100 110 120
+            color4: 20 130 140 150 200 160 170 180
+            color: 30 190 200 210
+            "#,
+        )
+        .expect("table parses");
+
+        let stops = table.stops();
+        assert_eq!(stops[0].color, Rgba8::new(10, 20, 30, 0));
+        assert_eq!(stops[0].end_color, Some(Rgba8::new(40, 50, 60, 255)));
+        // A `color:` row's end colour has no alpha column, so it is opaque.
+        assert_eq!(stops[1].color, Rgba8::opaque(70, 80, 90));
+        assert_eq!(stops[1].end_color, Some(Rgba8::opaque(100, 110, 120)));
+        // A `color4:` row may still give its end colour three components, and
+        // the missing alpha does not come from the row's own.
+        assert_eq!(stops[2].color, Rgba8::new(130, 140, 150, 200));
+        assert_eq!(stops[2].end_color, Some(Rgba8::opaque(160, 170, 180)));
+        // A single-colour row declares nothing and ramps to the next row.
+        assert_eq!(stops[3].end_color, None);
+
+        // Midway across the second segment: 70..100, 80..110, 90..120.
+        assert_eq!(table.sample(15.0), Rgba8::opaque(85, 95, 105));
+        // And the row boundary is a hard edge, because the ramp arrives at
+        // (100,110,120) and the next row opens at (130,140,150).
+        assert_eq!(table.sample(20.0), Rgba8::new(130, 140, 150, 200));
+    }
+
+    /// A ramp row that trails one or two loose numbers is an error, not a
+    /// colour. Dropping them would paint something the file does not say.
+    #[test]
+    fn a_truncated_ramp_end_colour_is_rejected_with_its_line_number() {
+        let error = ColorTable::parse(
+            "Truncated ramp",
+            "color: 0 10 20 30 40 50\ncolor: 10 60 70 80\n",
+        )
+        .expect_err("two trailing numbers cannot be a colour");
+
+        assert_eq!(
+            error,
+            ColorTableError::InvalidColor {
+                line: 1,
+                reason: "ramp end colour needs RGB or RGBA components",
+            }
+        );
+    }
+
+    /// Two palettes identical but for where their segments are heading must
+    /// not share a cached raster, so the ramp target has to reach the hash.
+    #[test]
+    fn the_signature_moves_when_only_a_ramp_target_does() {
+        let plain = ColorTable::parse("ramp", "color: 0 0 0 0\ncolor: 10 255 255 255\n")
+            .expect("table parses");
+        let ramped =
+            ColorTable::parse("ramp", "color: 0 0 0 0 200 100 50\ncolor: 10 255 255 255\n")
+                .expect("table parses");
+        let elsewhere =
+            ColorTable::parse("ramp", "color: 0 0 0 0 50 100 200\ncolor: 10 255 255 255\n")
+                .expect("table parses");
+
+        assert_eq!(plain.stops()[0].color, ramped.stops()[0].color);
+        assert_ne!(plain.signature(), ramped.signature());
+        assert_ne!(ramped.signature(), elsewhere.signature());
+    }
+
+    /// Hard bands have one colour, so the second colour of a ramp row is not
+    /// drawn at all when the palette is banded. The band keeps the colour its
+    /// own row opens with, from its own value up to the next one.
+    #[test]
+    fn a_banded_palette_paints_the_row_colour_and_never_the_ramp_target() {
+        let table = ColorTable::parse(
+            "Banded ramp pairs",
+            r#"
+            mode: stepped
+            color: 0 10 20 30 200 200 200
+            color: 10 40 50 60 100 100 100
+            "#,
+        )
+        .expect("table parses");
+
+        for value in [0.0_f32, 2.5, 5.0, 9.9] {
+            assert_eq!(
+                table.sample(value),
+                Rgba8::opaque(10, 20, 30),
+                "the band at {value} must be its own row's colour"
+            );
+        }
+        assert_eq!(table.sample(10.0), Rgba8::opaque(40, 50, 60));
+        // Above the last stop the table clamps, and the clamp is the row
+        // colour too - the trailing row has no segment to ramp across.
+        assert_eq!(table.sample(50.0), Rgba8::opaque(40, 50, 60));
+    }
+
+    /// A clear row with no second colour is a mask, not the bottom of a
+    /// gradient: it holds transparent right up to the next row.
+    ///
+    /// The same row *with* an opaque second colour is the other thing, and
+    /// fades. Both readings come straight from the GR `.pal` dialect, and the
+    /// difference between them is the whole reason a stop carries an optional
+    /// end colour rather than a flag.
+    #[test]
+    fn a_clear_row_holds_clear_unless_it_declares_where_it_is_going() {
+        let masked = ColorTable::parse(
+            "Clear lead-in",
+            "color4: 0 0 0 0 0\ncolor: 10 255 255 255\n",
+        )
+        .expect("table parses");
+        for value in [0.0_f32, 2.5, 5.0, 9.99] {
+            assert_eq!(
+                masked.sample(value),
+                Rgba8::TRANSPARENT,
+                "the mask leaks at {value}"
+            );
+        }
+        assert_eq!(masked.sample(10.0), Rgba8::opaque(255, 255, 255));
+        assert_eq!(masked.inked_value_span(), Some((10.0, 10.0)));
+
+        let faded = ColorTable::parse(
+            "Declared fade-in",
+            "color4: 0 0 0 0 0 255 255 255 255\ncolor: 10 255 255 255\ncolor: 20 255 0 0\n",
+        )
+        .expect("table parses");
+        assert_eq!(faded.sample(0.0), Rgba8::TRANSPARENT);
+        assert_eq!(faded.sample(5.0), Rgba8::new(128, 128, 128, 128));
+        assert_eq!(faded.sample(10.0), Rgba8::opaque(255, 255, 255));
+        // The fade inks inside its own segment and reaches the declared colour
+        // at the next stop, and it is the arrival that the span reports: below
+        // it the palette is a lead-in rather than itself, which is the same
+        // reading a clear lead-in gets. So the fade widens no bound here. The
+        // bound it can widen is the top one, on a table whose last segment
+        // arrives opaque at a stop that paints nothing - see
+        // `mirroring_a_preset_moves_its_transparent_stops_to_the_top_of_the_span`.
+        assert_eq!(faded.inked_value_span(), Some((10.0, 20.0)));
+    }
+
+    /// The hold belongs to the `.pal` dialect, not to every table with a clear
+    /// stop.
+    ///
+    /// Two tables with the same two stops, one parsed from GR text and one
+    /// built in Rust, paint their first segment differently on purpose: the row
+    /// is a mask and the stop is the bottom of a gradient. A resolver that
+    /// could not tell them apart would mask the floor of everything - the three
+    /// Smooth REF presets and every synthesised derived-product ramp are
+    /// exactly this shape, and each would lose the bottom of its range with
+    /// nothing in its own file changing.
+    ///
+    /// Provenance: BowEcho reads the same dialect and keeps the two apart the
+    /// same way, in a `SampleMode::GrPal` of its own - "GR holds a transparent
+    /// row's color across its interval; interpolated tables lerp through it".
+    ///
+    /// The parsed table carries the hold as a declared end colour rather than
+    /// as a rule the sampler applies behind `stops()`, so anything reading the
+    /// stops - a signature, an editor, a legend - sees the palette the sampler
+    /// sees.
+    #[test]
+    fn the_gr_clear_row_hold_is_a_property_of_parsed_text_and_not_of_a_stop_list() {
+        let parsed = ColorTable::parse(
+            "Parsed lead-in",
+            "color4: 0 0 0 0 0\ncolor: 10 255 255 255\n",
+        )
+        .expect("table parses");
+        let built = ColorTable::new(
+            "Built lead-in",
+            vec![clear_stop(0.0), stop(10.0, 255, 255, 255)],
+        )
+        .expect("two ascending stops are a table");
+
+        assert_eq!(parsed.stops()[0].color, built.stops()[0].color);
+        assert_eq!(parsed.stops()[1].color, built.stops()[1].color);
+
+        // The row holds; the stop ramps.
+        assert_eq!(parsed.sample(5.0), Rgba8::TRANSPARENT);
+        assert_eq!(built.sample(5.0), Rgba8::new(128, 128, 128, 128));
+
+        // And the hold is written down, not inferred.
+        assert_eq!(parsed.stops()[0].end_color, Some(Rgba8::TRANSPARENT));
+        assert_eq!(built.stops()[0].end_color, None);
+        assert_ne!(parsed.signature(), built.signature());
+    }
+
+    /// Only a row that both paints nothing *and* declares nothing picks the
+    /// hold up. A clear row that says where it is going keeps saying it, and an
+    /// opaque row is untouched however it was written.
+    #[test]
+    fn the_clear_row_hold_leaves_every_other_kind_of_row_alone() {
+        let table = ColorTable::parse(
+            "Mixed rows",
+            "color4: 0 0 0 0 0 255 255 255 255\n\
+             color4: 10 0 0 0 0\n\
+             color: 20 1 2 3\n\
+             color: 30 4 5 6 7 8 9\n",
+        )
+        .expect("table parses");
+
+        let stops = table.stops();
+        assert_eq!(stops[0].end_color, Some(Rgba8::opaque(255, 255, 255)));
+        assert_eq!(stops[1].end_color, Some(Rgba8::TRANSPARENT));
+        assert_eq!(stops[2].end_color, None);
+        assert_eq!(stops[3].end_color, Some(Rgba8::opaque(7, 8, 9)));
+    }
+
+    /// Mirroring turns every segment around, so a ramp still runs the way the
+    /// palette drew it when the field's sign convention is flipped.
+    #[test]
+    fn mirroring_reverses_each_ramp_instead_of_carrying_it_across() {
+        let table = ColorTable::parse(
+            "Ramped velocity",
+            "color: 0 10 20 30 40 50 60\ncolor: 10 70 80 90\n",
+        )
+        .expect("table parses");
+        let mirrored = table.mirrored_values("Mirrored");
+
+        // The segment that ran (10,20,30) -> (40,50,60) over 0..10 now runs
+        // (40,50,60) -> (10,20,30) over -10..0, opening one float above -10
+        // because -10 itself belongs to the reflected point value: the
+        // original reads (70,80,90) at 10 and the mirror owes that at -10.
+        assert_eq!(mirrored.stops()[0].value, -10.0);
+        assert_eq!(mirrored.stops()[0].color, Rgba8::opaque(70, 80, 90));
+        assert_eq!(mirrored.stops()[1].value, (-10.0_f32).next_up());
+        assert_eq!(mirrored.stops()[1].color, Rgba8::opaque(40, 50, 60));
+        assert_eq!(
+            mirrored.stops()[1].end_color,
+            Some(Rgba8::opaque(10, 20, 30))
+        );
+        assert_eq!(mirrored.sample(-5.0), table.sample(5.0));
+        assert_eq!(mirrored.sample(-10.0), table.sample(10.0));
+        assert_eq!(mirrored.sample(-40.0), table.sample(40.0));
+    }
+
+    /// Flipping a banded palette is a reflection: it must move every band to
+    /// the other side of zero and delete none of them.
+    ///
+    /// A band covers `[v_i, v_i+1)` and paints `c_i`, so its reflection covers
+    /// `(-v_i+1, -v_i]` and the mirror's stop at `-v_i+1` is the one that has
+    /// to carry `c_i`. Reversing the stop colours without that shift-down
+    /// leaves every band painted in its neighbour's colour, which is what this
+    /// test used to assert was correct: it checked that the mirror painted cyan
+    /// from 30 up to 40, where under `v -> -v` the cyan band `[-30, -20)`
+    /// lands on `(20, 30]` and `(30, 40]` is a transparent mask row. It passed
+    /// its other half - `flipped.sample(30.0) == table.sample(-30.0)` - only
+    /// because 30 is the one point where the two readings meet.
+    ///
+    /// Reversing the *segments*, which is right for a ramp, is the other wrong
+    /// answer here: a `.pal` lead-in row holds transparent across its interval,
+    /// so the stop that opens the first inked band would come out transparent
+    /// and the band would paint nothing at all.
+    ///
+    /// The table here is the shape a user's velocity `.pal` has - two clear
+    /// rows below the first band, two above the last - and is parsed with
+    /// `parse_stepped`, which is the entry point `parse_color_table_for_family`
+    /// uses for a velocity file.
+    #[test]
+    fn flipping_a_banded_palette_keeps_every_band_it_painted() {
+        let table = ColorTable::parse_stepped(
+            "User VEL",
+            "product: BV\n\
+             units: m/s\n\
+             color4: -60 0 0 0 0\n\
+             color4: -40 0 0 0 0\n\
+             color: -30 0 255 255\n\
+             color: -20 0 200 0\n\
+             color: 0 120 120 120\n\
+             color: 20 255 120 0\n\
+             color: 30 255 255 0\n\
+             color4: 40 0 0 0 0\n\
+             color4: 60 0 0 0 0\n",
+        )
+        .expect("table parses");
+        assert_eq!(table.sample_mode, SampleMode::Stepped);
+        let flipped = table.mirrored_values("User VEL (flipped)");
+
+        // The band the original paints cyan from -30 up to -20 is the band the
+        // mirror paints cyan from 20 up to 30, and the mask above it reflects
+        // onto the mask below it.
+        let cyan = Rgba8::opaque(0, 255, 255);
+        for value in [20.01_f32, 22.5, 25.0, 29.99] {
+            assert_eq!(
+                flipped.sample(value),
+                cyan,
+                "the mirror of the cyan band is wrong at {value}"
+            );
+        }
+        for value in [30.01_f32, 35.0, 39.99] {
+            assert_eq!(
+                flipped.sample(value),
+                Rgba8::TRANSPARENT,
+                "the mirror paints where the original masked, at {value}"
+            );
+        }
+
+        // Every colour the original painted is still painted, and no colour it
+        // never painted has appeared.
+        let painted = |drawn: &ColorTable| {
+            let mut seen = Vec::new();
+            for step in -12_000..=12_000 {
+                let colour = drawn.sample(step as f32 * 0.01);
+                if !seen.contains(&colour) {
+                    seen.push(colour);
+                }
+            }
+            seen.sort_by_key(|colour| colour.to_array());
+            seen
+        };
+        assert_eq!(painted(&table), painted(&flipped));
+
+        // And the reflection is exact everywhere, both signs, INCLUDING the
+        // stop values themselves. The sweep used to skip those, which is
+        // exactly where a banded mirror was wrong and where a velocity field
+        // puts most of its gates.
+        let mut checked_stops = 0_usize;
+        for step in -12_000..=12_000 {
+            // Divided rather than multiplied by a hundredth, which is not an
+            // `f32`: `6_000.0 * 0.01` misses 60 and would step around every
+            // stop this sweep is here to land on.
+            let value = step as f32 / 100.0;
+            if table.stops().iter().any(|stop| stop.value == value) {
+                checked_stops += 1;
+            }
+            assert_eq!(
+                flipped.sample(-value),
+                table.sample(value),
+                "the flip is not a reflection at {value}"
+            );
+        }
+        assert_eq!(
+            checked_stops,
+            table.stops().len(),
+            "the sweep missed a stop value it is here to cover"
+        );
+    }
+
+    /// The quantised mirror paints the ramp targets its `.pal` declared.
+    ///
+    /// `QuantizedInterpolated` rounds the value onto the grid and then hands it
+    /// to the interpolated sampler, so a row's second colour is live whenever a
+    /// grid point falls between two stops - which is the normal case, because a
+    /// `.pal` is under no obligation to put its rows on multiples of its own
+    /// `step:`. Treating the mode as banded here dropped every declared target
+    /// and repainted three quarters of the flipped scope: on the table below,
+    /// gates at -5 m/s came out `[30,100,30]` instead of the `[0,115,0]` the
+    /// palette gives +5 the other way round.
+    ///
+    /// The numbers are the ones measured on the shipped `GenericRadar VEL`
+    /// grid: `step: 5` with every row at a half-way value, so no grid point
+    /// ever lands on a stop and the reflection is exact at all of them.
+    #[test]
+    fn a_quantised_flip_paints_the_ramp_targets_the_palette_declared() {
+        let table = ColorTable::parse_stepped(
+            "Stepped user VEL",
+            "product: BV\n\
+             units: m/s\n\
+             Step: 5\n\
+             Color: -22.5 0 255 255 0 200 255\n\
+             Color: -17.5 0 100 255 0 60 200\n\
+             Color: -12.5 0 220 0 0 160 0\n\
+             Color: -7.5 0 140 0 0 90 0\n\
+             Color: -2.5 60 60 60 100 100 100\n\
+             Color: 2.5 150 150 150 190 190 190\n\
+             Color: 7.5 220 0 0 255 40 0\n\
+             Color: 12.5 255 120 0 255 170 0\n\
+             Color: 17.5 255 230 0 255 255 120\n\
+             Color: 22.5 255 255 255\n",
+        )
+        .expect("table parses");
+        assert!(matches!(
+            table.sample_mode,
+            SampleMode::QuantizedInterpolated { step: 5.0, .. }
+        ));
+        let flipped = table.mirrored_values("flipped");
+
+        // The verifier's table, as measured on the real KDVN velocity frame.
+        // The middle column is what a banded mirror produced.
+        for (value, expected) in [
+            (-20.0_f32, [0, 228, 255, 255]),
+            (-15.0, [0, 80, 228, 255]),
+            (-5.0, [0, 115, 0, 255]),
+            (0.0, [80, 80, 80, 255]),
+            (5.0, [170, 170, 170, 255]),
+            (15.0, [255, 145, 0, 255]),
+        ] {
+            assert_eq!(
+                table.sample(value).to_array(),
+                expected,
+                "the palette itself moved at {value}"
+            );
+            assert_eq!(
+                flipped.sample(-value).to_array(),
+                expected,
+                "the flip is not a reflection at {value}"
+            );
+        }
+
+        // Every grid point the palette reaches, not just the six above, and
+        // past both ends of it as well: the row above the top stop used to
+        // come out the ramp target the row below it was heading for, because
+        // the mirror's lowest stop stood for the original's clamp and its top
+        // segment at once.
+        for step in -8..=8 {
+            let value = step as f32 * 5.0;
+            assert_eq!(
+                flipped.sample(-value),
+                table.sample(value),
+                "the flip is not a reflection at grid point {value}"
+            );
+        }
+        assert_eq!(table.sample(25.0), Rgba8::opaque(255, 255, 255));
+        assert_eq!(flipped.sample(-25.0), Rgba8::opaque(255, 255, 255));
+    }
+
+    /// The same mirror on a built-in, where the grid does land on the stops.
+    ///
+    /// `GR2Analyst Classic REF` declares `step: 5` and opens with a clear
+    /// lead-in whose hard edge sits at 10 dBZ, exactly on the grid, so the one
+    /// grid cell the mirror used to lose is here: the cell centred on -10 came
+    /// out the mask's transparent instead of the first band's cyan. It is the
+    /// smallest visible case of a stop list being continuous from the right
+    /// while its reflection has to be continuous from the left, and the ULP
+    /// split in [`ColorTable::mirrored_values`] closes it. Every cell of the
+    /// palette now reflects exactly.
+    ///
+    /// Reflectivity is never flipped by the application - the polarity switch
+    /// is velocity-only - so this is here for the rule rather than for the
+    /// picture.
+    #[test]
+    fn a_quantised_mirror_is_exact_on_every_cell_its_grid_can_reach() {
+        let table = gr2_reflectivity_table();
+        let flipped = table.mirrored_values("Mirrored GR2");
+
+        let mut off_by_the_convention = Vec::new();
+        for step in -20..=20 {
+            let value = step as f32 * 5.0;
+            if flipped.sample(-value) != table.sample(value) {
+                off_by_the_convention.push(value);
+            }
+        }
+        assert_eq!(off_by_the_convention, Vec::<f32>::new());
+        // The cell that used to be lost, named rather than left to the sweep.
+        assert_eq!(table.sample(10.0), Rgba8::opaque(4, 233, 231));
+        assert_eq!(flipped.sample(-10.0), Rgba8::opaque(4, 233, 231));
+        // And the split cost the palette's own numbers nothing a legend reads.
+        assert_eq!(flipped.inked_value_span(), Some((-92.5, -10.0)));
+    }
+
+    /// Every velocity value a NEXRAD radar can put in front of a palette, on
+    /// every velocity palette the picker offers, drawn both ways.
+    ///
+    /// The sweep this replaces skipped values that were exactly a stop, which
+    /// is precisely where the banded mirror was wrong, so it stayed green while
+    /// a third of a real painted field came out the neighbouring band's colour.
+    /// Velocity is a discrete field and its words land on these palettes'
+    /// stops: measured on KDVN 2026-08-19 19:28Z cut 1, drawn banded and
+    /// flipped, `Smooth Couplet VEL` had 76,022 of 226,621 painted gates wrong
+    /// (33.5%), `Smooth Doppler VEL` 63,610, `Analyst Pro VEL` 38,953, and
+    /// `GenericRadar VEL` and `Sign Check VEL` 10,563 each, every one of them
+    /// at a value the encoding puts a whole population on. Drawn smooth,
+    /// `GenericRadar VEL` was wrong at 0.00 m/s, on 10,563 gates of the same
+    /// sweep. Nothing here may skip a value again.
+    ///
+    /// Five of the ten are drawn as `Stepped` when banded, because their `.pal`
+    /// text carries no `step:` row; the other five band on their `step:` grid.
+    /// Both shapes are covered, both renderings, at every stop, at every
+    /// encodable word, and across a dense sweep that runs past both ends of
+    /// each palette into its clamps.
+    ///
+    /// The only residual is a byte of rounding in the continuous renderings,
+    /// which [`ColorTable::mirrored_values`] explains: 3 samples of the
+    /// 800,460 swept here, each one byte in one channel, none of them a value
+    /// the radar can encode. It is counted rather than tolerated silently.
+    #[test]
+    fn a_flip_of_every_velocity_palette_is_exact_at_every_value_a_radar_sends() {
+        let palettes = builtin_tables_for_family(ColorTableFamily::Velocity);
+        assert_eq!(palettes.len(), 10);
+
+        let banded_at_their_own_stops = palettes
+            .iter()
+            .map(|palette| palette.rendered(TableRendering::Stepped))
+            .filter(|table| table.sample_mode == SampleMode::Stepped)
+            .map(|table| table.base_name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            banded_at_their_own_stops,
+            [
+                "GenericRadar VEL",
+                "Smooth Doppler VEL",
+                "Smooth Couplet VEL",
+                "Analyst Pro VEL",
+                "Sign Check VEL",
+            ]
+        );
+
+        let words = encodable_velocity_words();
+        let mut rounded_differently = 0_usize;
+        let mut swept = 0_usize;
+        for palette in palettes {
+            for rendering in TableRendering::ALL {
+                let table = palette.rendered(rendering);
+                let flipped = table.mirrored_values(format!("{} (flipped)", table.name()));
+                let stops = table.stops();
+                let low = stops.first().expect("has stops").value;
+                let high = stops.last().expect("has stops").value;
+
+                // Every stop, exactly. This is the population the old sweep
+                // stepped around: the palette's own hard edges, which are
+                // where the mirror used to hand out the neighbour's colour.
+                for stop in stops {
+                    assert_eq!(
+                        flipped.sample(-stop.value),
+                        table.sample(stop.value),
+                        "{} is not a reflection at its stop {}",
+                        table.name(),
+                        stop.value
+                    );
+                }
+
+                // Every word either velocity encoding can carry, exactly.
+                for &value in &words {
+                    assert_eq!(
+                        flipped.sample(-value),
+                        table.sample(value),
+                        "{} is not a reflection at the encodable {value}",
+                        table.name()
+                    );
+                }
+
+                // The stops read from the other side - a palette whose rows
+                // are not symmetric about zero has hard edges at values that
+                // are not stops of its own - and a dense sweep that runs
+                // 40 m/s past both ends, so the clamps are swept as well as
+                // the bands. Neither may be wrong; both may carry the byte of
+                // rounding a reversed ramp costs, and every one of those is
+                // counted.
+                let (from, to) = (low - 40.0, high + 40.0);
+                let dense = (0..=40_000).map(|step| from + (to - from) * step as f32 / 40_000.0);
+                for value in stops.iter().map(|stop| -stop.value).chain(dense) {
+                    swept += 1;
+                    if reflection_rounds_differently(&table, &flipped, value) {
+                        rounded_differently += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(swept, 800_460);
+        assert_eq!(
+            rounded_differently, 3,
+            "the reversed-ramp rounding residual moved"
+        );
+    }
+
+    /// Whether the mirror answers something other than the reflection at
+    /// `value`, refusing anything worse than one byte in one channel of a
+    /// continuously drawn table.
+    ///
+    /// A banded mirror is a permutation of the palette's own colours and has
+    /// no arithmetic to get wrong, so a difference there is a defect. A
+    /// continuous one reverses each ramp and its `t` differs in the last
+    /// place, so a channel whose exact mix lands on a half can round the other
+    /// way. The caller counts what this reports rather than ignoring it.
+    fn reflection_rounds_differently(table: &ColorTable, flipped: &ColorTable, value: f32) -> bool {
+        let want = table.sample(value);
+        let got = flipped.sample(-value);
+        if got == want {
+            return false;
+        }
+        assert!(
+            table.interpolates() && max_channel_delta(got, want) <= 1 && got.a == want.a,
+            "{} is wrong, not merely rounded, at {value}: {got:?} for {want:?}",
+            table.name()
+        );
+        true
+    }
+
+    /// Every velocity a Level II volume can put in front of a palette, in the
+    /// engine units the palettes are read in.
+    ///
+    /// Two encodings reach `sample`. The moment data carries a byte per gate
+    /// and every NEXRAD velocity moment ships `scale 2, offset 129`, so the
+    /// values are multiples of 0.5 m/s from -63.5 to 63. `render2d`'s
+    /// dealiased grid, which the workstation turns on by default, re-encodes
+    /// the unfolded field as `u16` at `scale 10`, so its values are multiples
+    /// of 0.1 m/s; this walks that grid out to +-120 m/s, past both the
+    /// widest palette (+-103) and any velocity a dealiaser will produce.
+    ///
+    /// These are the values a wrong reflection actually mis-paints, which is
+    /// why the flip is pinned over them rather than over a decimal grid that
+    /// steps between them.
+    fn encodable_velocity_words() -> Vec<f32> {
+        let raw = (2_u16..=255).map(|code| (code as f32 - 129.0) / 2.0);
+        let dealiased = (-1_200_i32..=1_200).map(|tenths| tenths as f32 / 10.0);
+        raw.chain(dealiased).collect()
+    }
+
+    /// The other end of a banded flip, on the smallest table that has one.
+    ///
+    /// A banded table's topmost row paints an open-ended stretch, and in the
+    /// mirror that stretch is the clamp under its lowest stop - the same place
+    /// the first mirrored band has to sit. One stop cannot be two colours, so
+    /// the mirror spends two: the clamp keeps `-10` and the band above it
+    /// opens one float higher. Before that split the top row's colour appeared
+    /// nowhere in the flip at all, and every gate at or past the top of the
+    /// palette was painted the band below.
+    #[test]
+    fn a_banded_flip_keeps_the_colour_of_the_top_row() {
+        let table = ColorTable::parse_stepped(
+            "Three bands",
+            "mode: stepped\n\
+             color: -10 10 10 10\n\
+             color: 0 20 20 20\n\
+             color: 10 30 30 30\n",
+        )
+        .expect("table parses");
+        let flipped = table.mirrored_values("flipped");
+
+        assert_eq!(flipped.sample(5.0), table.sample(-5.0));
+        assert_eq!(flipped.sample(-5.0), table.sample(5.0));
+        // Past the top row, and at it: the original paints (30,30,30) from 10
+        // up and the mirror paints it from -10 down.
+        assert_eq!(table.sample(40.0), Rgba8::opaque(30, 30, 30));
+        assert_eq!(flipped.sample(-40.0), Rgba8::opaque(30, 30, 30));
+        assert_eq!(flipped.sample(-10.0), Rgba8::opaque(30, 30, 30));
+        // Which is the whole reflection, at every float that separates the
+        // three bands and at every one between them.
+        assert_eq!(flipped.stops()[0].value, -10.0);
+        assert_eq!(flipped.stops()[1].value, (-10.0_f32).next_up());
+        for step in -4_000..=4_000 {
+            let value = step as f32 / 100.0;
+            assert_eq!(
+                flipped.sample(-value),
+                table.sample(value),
+                "the flip is not a reflection at {value}"
+            );
+        }
+    }
+
+    /// A hard edge at the *top* row: the clamp under the mirror's bottom and
+    /// the segment above it are two colours, and the mirror now spends two
+    /// stops on them.
+    ///
+    /// It used to spend one, and the segment won, so a table clamping to white
+    /// above 40 dBZ had a mirror painting the ramp target yellow below -40.
+    /// This is the continuous half of the same defect
+    /// `a_banded_flip_keeps_the_colour_of_the_top_row` covers, and it is here
+    /// because a continuous table can reach it through a declared ramp target
+    /// where a banded one reaches it through every top row there is.
+    #[test]
+    fn mirroring_keeps_the_top_rows_colour_below_the_bottom_of_a_two_colour_table() {
+        let table = ColorTable::parse(
+            "Hard top edge",
+            "color: -40 10 10 200\n\
+             color: 0 128 128 128\n\
+             color: 20 200 10 10 250 250 0\n\
+             color: 40 255 255 255\n",
+        )
+        .expect("table parses");
+        let mirrored = table.mirrored_values("Mirrored");
+
+        // 40 and up is white: the last row is a single colour and the table
+        // clamps to it.
+        let white = Rgba8::opaque(255, 255, 255);
+        assert_eq!(table.sample(40.0), white);
+        assert_eq!(table.sample(55.0), white);
+
+        // So -40 and down is white in the mirror, and the ramp target the
+        // original's top segment was heading for opens one float above it.
+        let ramp_target = Rgba8::opaque(250, 250, 0);
+        assert_eq!(mirrored.sample(-40.0), white);
+        assert_eq!(mirrored.sample(-55.0), white);
+        assert_eq!(mirrored.sample((-40.0_f32).next_up()), ramp_target);
+
+        // Everywhere else the flip is exact too, ends and stops included,
+        // except for the byte of rounding a reversed ramp carries: the
+        // mirrored segment opens one ULP later than the original's closed, so
+        // `t` differs in the last place and a channel whose exact mix lands on
+        // a half rounds the other way. Bounded and counted rather than skipped,
+        // because a sweep that steps around its own failures is how the last
+        // reflection defect stayed hidden.
+        let mut rounded_differently = 0_usize;
+        for step in 0..=5_000 {
+            let value = -50.0 + step as f32 / 50.0;
+            let want = table.sample(value);
+            let got = mirrored.sample(-value);
+            if got != want {
+                rounded_differently += 1;
+                assert!(
+                    max_channel_delta(got, want) <= 1 && got.a == want.a,
+                    "the flip is wrong, not merely rounded, at {value}: {got:?} for {want:?}"
+                );
+            }
+        }
+        assert_eq!(
+            rounded_differently, 9,
+            "the rounding residual moved: 9 of 5,001 samples, one byte each"
+        );
+        for stop in table.stops() {
+            assert_eq!(
+                mirrored.sample(-stop.value),
+                table.sample(stop.value),
+                "the flip is not exact at the stop {}",
+                stop.value
+            );
+        }
+    }
+
+    /// A table whose only ink is a fade reports the stretch the fade covers,
+    /// so a legend gets drawn for a palette an analyst can see.
+    ///
+    /// Two clear rows, the lower one declaring an opaque second colour: it
+    /// paints a thousand of the 2,501 values on a 0.01 grid from -5 to 20 and
+    /// declares no opaque stop anywhere. Reported strictly, its ink was the
+    /// single value 12.5 - the clear stop the fade arrives on, and the one
+    /// value in the whole interval it does *not* paint - which sent
+    /// `legend_span` through its zero-width guard and left the pane with no
+    /// bar at all. The fade rule reports (0.0, 12.5), which is what the two
+    /// rows say. `workstation_app`'s
+    /// `a_palette_whose_only_ink_is_a_declared_fade_gets_a_legend` pins the
+    /// caller's half.
+    #[test]
+    fn a_table_whose_only_ink_is_a_fade_reports_the_fade() {
+        let quantised = ColorTable::parse(
+            "q",
+            "product: BR\nstep: 5\ncolor4: 0 0 0 0 0 200 0 0 255\ncolor4: 12.5 0 0 0 0\n",
+        )
+        .expect("table parses");
+        assert!(matches!(
+            quantised.sample_mode,
+            SampleMode::QuantizedInterpolated { .. }
+        ));
+        assert_eq!(quantised.sample(2.5).to_array(), [80, 0, 0, 102]);
+        assert_eq!(quantised.sample(7.5).to_array(), [160, 0, 0, 204]);
+        // The value the strict reading called the whole span, which paints
+        // nothing at all.
+        assert_eq!(quantised.sample(12.5), Rgba8::TRANSPARENT);
+        assert_eq!(quantised.inked_value_span(), Some((0.0, 12.5)));
+
+        // The same rows without the `step:` row: the same fade, the same span.
+        let smooth = ColorTable::parse(
+            "q",
+            "product: BR\ncolor4: 0 0 0 0 0 200 0 0 255\ncolor4: 12.5 0 0 0 0\n",
+        )
+        .expect("table parses");
+        assert_eq!(smooth.inked_value_span(), quantised.inked_value_span());
+
+        // The rule fires only where the fade is all there is. A palette with
+        // an opaque stop still reports from that stop, so AWIPS Wilson keeps
+        // reporting its ink from the -20 dBZ its first band arrives at rather
+        // than from the -30 its lead-in fade opens at.
+        assert_eq!(
+            awips_wilson_reflectivity_table().inked_value_span(),
+            Some((-20.0, 95.0))
+        );
+        // And a lead-in that holds clear instead of fading still reports the
+        // single value it inks.
+        assert_eq!(
+            ColorTable::parse("held", "color4: -10 0 0 0 0\ncolor: 10 255 0 0\n")
+                .expect("table parses")
+                .inked_value_span(),
+            Some((10.0, 10.0))
+        );
+    }
+
+    /// A fade-out is a lead-out: the span ends where the palette stops being
+    /// itself, not where it finishes disappearing.
+    ///
+    /// The mirror image of the AWIPS Wilson rule, and the same reason - where
+    /// inside the fade the alpha crosses zero is arithmetic, not a number the
+    /// palette states. Drawn banded there is no fade to leave out, so the last
+    /// painted row holds flat to the clear stop and the span goes with it.
+    #[test]
+    fn a_fade_out_is_a_lead_out_and_not_part_of_the_span() {
+        let table = ColorTable::parse(
+            "Fades out",
+            "color: 0 200 0 0\ncolor: 10 0 200 0\ncolor4: 20 0 0 0 0\n",
+        )
+        .expect("table parses");
+
+        // The segment does ink most of its width...
+        assert_eq!(table.sample(19.0).to_array(), [0, 20, 0, 26]);
+        // ...and the span still stops at the value the palette last states.
+        assert_eq!(table.inked_value_span(), Some((0.0, 10.0)));
+
+        // Banded, the same rows paint green flat from 10 to 20, so the span
+        // reaches 20. Nothing fades, so nothing is left out.
+        let banded = table.rendered(TableRendering::Stepped);
+        assert_eq!(banded.sample(19.0), Rgba8::opaque(0, 200, 0));
+        assert_eq!(banded.inked_value_span(), Some((0.0, 20.0)));
+    }
+
+    /// Two rows at one value: the later one wins.
+    ///
+    /// `dedup_by` hands the later element first and removes it, so keeping the
+    /// later row means copying it over the one that survives. Written the other
+    /// way round the assignment is dead and the *first* row wins, which loses
+    /// the ramp target the second one declared and is the opposite of what a
+    /// person editing a palette expects from a later line.
+    #[test]
+    fn duplicate_rows_at_one_value_keep_the_last_one() {
+        let table = ColorTable::parse(
+            "d",
+            "color: 0 1 1 1\ncolor: 10 2 2 2\ncolor: 10 3 3 3 4 4 4\ncolor: 20 5 5 5\n",
+        )
+        .expect("table parses");
+
+        let stops = table.stops();
+        assert_eq!(stops.len(), 3);
+        assert_eq!(stops[1].value, 10.0);
+        assert_eq!(stops[1].color, Rgba8::opaque(3, 3, 3));
+        assert_eq!(stops[1].end_color, Some(Rgba8::opaque(4, 4, 4)));
+
+        // Three in a row, to prove the walk keeps chasing the latest.
+        let thrice = ColorTable::parse(
+            "d",
+            "color: 0 1 1 1\ncolor: 10 2 2 2\ncolor: 10 3 3 3\ncolor: 10 9 9 9\ncolor: 20 5 5 5\n",
+        )
+        .expect("table parses");
+        assert_eq!(thrice.stops()[1].color, Rgba8::opaque(9, 9, 9));
+    }
+
+    /// Two rules of the GR dialect this reader deliberately does not follow.
+    ///
+    /// Both are pre-existing and neither is changed here; they are pinned so
+    /// that "the clear-row hold is the file's rule" is never read as "a `.pal`
+    /// renders exactly as GR renders it". See [`hold_clear_gr_rows`].
+    #[test]
+    fn the_gr_reader_diverges_on_solid_rows_and_on_step() {
+        // GR paints `SolidColor:` as a flat band across its interval whatever
+        // else the file says. This parser maps it onto the same arm as
+        // `Color:`, so it ramps into its neighbour.
+        let solid = ColorTable::parse(
+            "s",
+            "mode: smooth\nSolidColor: 0 200 0 0\nColor: 10 0 0 200\n",
+        )
+        .expect("table parses");
+        assert_eq!(solid.sample(5.0).to_array(), [100, 0, 100, 255]);
+
+        // In a GR `.pal`, `Step:` is the legend's tick spacing and never
+        // quantises the display. Here it does.
+        let stepped = ColorTable::parse("t", "Step: 5\nColor: 0 0 0 0\nColor: 20 200 200 200\n")
+            .expect("table parses");
+        assert_eq!(stepped.sample_mode_label(), "quantized stepped");
+        assert_eq!(stepped.sample(7.0).to_array(), [50, 50, 50, 255]);
+    }
+
     #[test]
     fn parses_gr_scale_without_double_scaling_units() {
         let table = ColorTable::parse(
@@ -1275,22 +2698,22 @@ mod tests {
     }
 
     #[test]
-    fn default_reflectivity_preset_filters_low_dbz_and_stretches_high_end() {
+    fn the_default_reflectivity_is_the_wilson_awips_look() {
         let table = builtin_reflectivity_table();
 
-        assert_eq!(table.name(), "GR2Analyst Classic REF (continuous)");
+        assert_eq!(table.name(), "AWIPS Wilson REF (interpolated)");
         assert!(table.interpolates());
-        assert_eq!(table.sample_mode_label(), "continuous");
-        // Continuous rendering has no grid to report a step size for. The
-        // palette still has one - it is one flip away - and the flipped table
-        // reports it.
+        assert_eq!(table.sample_mode_label(), "interpolated");
         assert_eq!(table.step_size(), None);
-        assert_eq!(
-            table.rendered(TableRendering::Stepped).step_size(),
-            Some(5.0)
-        );
-        assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
-        assert_ne!(table.sample(10.0), Rgba8::TRANSPARENT);
+        // The noise floor stays off the scope; the first band fades in from
+        // -30 dBZ, which is deliberate - this palette shows clear-air return.
+        assert_eq!(table.sample(-31.0).to_array()[3], 0);
+        assert!(table.sample(-25.0).to_array()[3] > 90);
+        // Declared rows, read straight off the AWIPS table.
+        assert_eq!(table.sample(35.0), Rgba8::opaque(29, 104, 9));
+        assert_eq!(table.sample(50.0), Rgba8::opaque(255, 0, 0));
+        assert_eq!(table.sample(60.0), Rgba8::opaque(255, 255, 255));
+        assert_eq!(table.sample(75.0), Rgba8::opaque(5, 236, 240));
     }
 
     /// The shipped default for the two base moments is the continuous drawing
@@ -1332,20 +2755,16 @@ mod tests {
     /// The default is the same palette it always was, wearing a different
     /// sampling. Not a different colour scheme.
     #[test]
-    fn the_defaults_that_moved_moved_sampling_and_nothing_else() {
-        for (default, palette) in [
-            (builtin_reflectivity_table(), gr2_reflectivity_table()),
-            (builtin_velocity_table(), tornado_velocity_table()),
-        ] {
-            assert_eq!(default.base_name(), palette.base_name());
-            assert_eq!(default.stops(), palette.stops());
-            assert_eq!(default.product(), palette.product());
-            assert_eq!(default.units(), palette.units());
-            assert_eq!(default.range_folded_rgba(), palette.range_folded_rgba());
-            assert_eq!(default.inked_value_span(), palette.inked_value_span());
-            assert_eq!(default.rendered(TableRendering::Stepped), palette);
-            assert_eq!(palette.rendered(TableRendering::Smooth), default);
-        }
+    fn the_defaults_are_the_ported_palettes_exactly_as_authored() {
+        // The ported looks are authored as continuous sRGB ramps, so the
+        // smooth rendering the defaults ask for is the identity - the default
+        // IS the ported palette, byte for byte, and the old classics stay in
+        // the catalogue behind it.
+        assert_eq!(
+            builtin_reflectivity_table(),
+            awips_wilson_reflectivity_table()
+        );
+        assert_eq!(builtin_velocity_table(), generic_radar_velocity_table());
     }
 
     #[test]
@@ -1356,43 +2775,28 @@ mod tests {
     }
 
     #[test]
-    fn default_velocity_table_has_radarscope_style_velocity_contrast() {
+    fn the_default_velocity_is_the_radarscope_classic_look() {
         let table = builtin_velocity_table();
 
-        assert_eq!(table.name(), "Analyst Tornado VEL (continuous)");
+        assert_eq!(table.name(), "GenericRadar VEL (interpolated)");
         assert!(table.interpolates());
-        // Every probe below lands on a declared stop, so it reads the palette's
-        // own triple and returns the same answer in either rendering. That is
-        // the point: moving the default to continuous sampling did not move a
-        // single colour the palette declares.
-        let zero = table.sample(0.0);
-        let inbound = table.sample(-58.0);
-        let inbound_core = table.sample(-9.0);
-        let outbound = table.sample(14.0);
-        let outbound_high = table.sample(50.0);
-        let outbound_extreme = table.sample(64.0);
-        let [zero_r, zero_g, zero_b, zero_a] = zero.to_array();
-        assert_eq!(zero_a, 255);
-        assert!((zero_r as i16 - zero_g as i16).abs() <= 8);
-        assert!((zero_g as i16 - zero_b as i16).abs() <= 8);
-
-        let [in_r, in_g, in_b, _] = inbound.to_array();
-        assert!(in_b > 240 && in_g > 180 && in_r < 180);
-        let [core_r, core_g, core_b, _] = inbound_core.to_array();
-        assert!(core_g > 220 && core_r < 120 && core_b < 140);
-
-        let [out_r, out_g, out_b, _] = outbound.to_array();
-        assert!(out_r > 230 && out_g < 90 && out_b < 90);
-        let [high_r, high_g, high_b, _] = outbound_high.to_array();
-        assert!(high_r > 230 && high_g > 120 && high_b > 160);
-        let [extreme_r, extreme_g, extreme_b, _] = outbound_extreme.to_array();
-        assert!(extreme_r > 230 && extreme_g > 170 && extreme_b > 110);
+        // The table is authored in knots and scaled to m/s at parse time;
+        // probe at declared rows through the same conversion the parser used.
+        let kt = |value: f32| value * (1.0 / 1.9426);
+        assert_eq!(table.sample(kt(0.0)), Rgba8::opaque(130, 106, 120));
+        assert_eq!(table.sample(kt(10.0)), Rgba8::opaque(105, 0, 0));
+        assert_eq!(table.sample(kt(40.0)), Rgba8::opaque(249, 58, 84));
+        assert_eq!(table.sample(kt(-40.0)), Rgba8::opaque(10, 248, 35));
+        assert_eq!(table.sample(kt(-70.0)), Rgba8::opaque(55, 226, 229));
+        assert_eq!(table.sample(kt(-50.0)), Rgba8::opaque(180, 240, 243));
+        let range_folded = table.range_folded_rgba().to_array();
+        assert_eq!(&range_folded[..3], &[123, 0, 200]);
     }
 
     #[test]
     fn accepted_velocity_presets_whiten_strong_wind_cores() {
         for table in [
-            builtin_velocity_table(),
+            tornado_velocity_table().rendered(TableRendering::Smooth),
             analyst_velocity_table(),
             radarscope_contrast_velocity_table(),
         ] {
@@ -1438,7 +2842,8 @@ mod tests {
         assert_eq!(
             reflectivity,
             vec![
-                "GR2Analyst Classic REF (continuous)",
+                "AWIPS Wilson REF (interpolated)",
+                "GR2Analyst Classic REF (quantized stepped)",
                 "Smooth Classic REF (interpolated)",
                 "Smooth Sequential REF (interpolated)",
                 "Smooth Storm Core REF (interpolated)",
@@ -1454,7 +2859,8 @@ mod tests {
         assert_eq!(
             velocity,
             vec![
-                "Analyst Tornado VEL (continuous)",
+                "GenericRadar VEL (interpolated)",
+                "Analyst Tornado VEL (quantized stepped)",
                 "Smooth Doppler VEL (interpolated)",
                 "Smooth Couplet VEL (interpolated)",
                 "Analyst Pro VEL (stepped)",
@@ -1577,6 +2983,21 @@ mod tests {
         assert_eq!(table.range_folded_rgba(), Rgba8::opaque(180, 80, 255));
     }
 
+    /// The palette that exists to show which way the velocities run, flipped.
+    ///
+    /// Inbound and outbound swap, which is the whole point, and the
+    /// range-folded colour is a category rather than a value so it does not.
+    ///
+    /// Zero is the value that made the whole reflection worth writing down.
+    /// Sign Check marks the zero isodop with a band 0.01 m/s wide running
+    /// *upward* from zero, so its reflection runs downward from zero and 0.00
+    /// itself is the edge. Under a plain `v -> -v` mirror the edge fell on the
+    /// wrong side and a gate at exactly 0.00 m/s - 10,563 of them on the real
+    /// KDVN sweep this was measured against, 4.7% of the painted field - read
+    /// as the first inbound blue instead of the marker's grey, on the one
+    /// shipped palette whose entire job is showing which way the wind is
+    /// going. The mirror keeps the point value now, so the marker survives the
+    /// flip.
     #[test]
     fn mirrored_velocity_table_samples_opposite_polarity_colors() {
         let table = sign_check_velocity_table();
@@ -1584,8 +3005,17 @@ mod tests {
 
         assert_eq!(mirrored.sample(1.0), table.sample(-1.0));
         assert_eq!(mirrored.sample(-1.0), table.sample(1.0));
-        assert_eq!(mirrored.sample(0.0), table.sample(0.0));
         assert_eq!(mirrored.range_folded_rgba(), table.range_folded_rgba());
+
+        // The marker band is [0, 0.01) going up; its mirror is (-0.01, 0]
+        // going down, and 0.00 belongs to it at both signs of zero.
+        assert_eq!(table.sample(0.0), Rgba8::opaque(120, 120, 120));
+        assert_eq!(mirrored.sample(-0.005), Rgba8::opaque(120, 120, 120));
+        assert_eq!(mirrored.sample(0.0), Rgba8::opaque(120, 120, 120));
+        assert_eq!(mirrored.sample(-0.0), Rgba8::opaque(120, 120, 120));
+        // And the band the marker replaced is where it was: the mirror's first
+        // inbound blue starts one float below the marker, not on it.
+        assert_eq!(mirrored.sample(0.011), Rgba8::opaque(0, 0, 255));
     }
 
     #[test]
@@ -1604,7 +3034,7 @@ mod tests {
 
     #[test]
     fn the_reflectivity_preset_inks_from_ten_dbz_not_from_its_transparent_first_stop() {
-        let table = builtin_reflectivity_table();
+        let table = gr2_reflectivity_table();
 
         // The GR2 preset declares stops at -10 and 7.5 dBZ with alpha 0, so a
         // legend drawn across the declared domain would label empty scope.
@@ -2072,12 +3502,27 @@ mod tests {
         let mirrored = gr2_reflectivity_table().mirrored_values("Mirrored GR2");
 
         // mirrored_values negates every stop and from_parts re-sorts, so the
-        // two alpha-0 stops that led the table now trail it. This is the only
+        // transparency that led the table now trails it. Three stops and not
+        // two: this palette is quantised, so its mirror turns each segment
+        // around, and the segment that held the lead-in's transparent colour
+        // hands that colour to the stop above it as well. This is the only
         // trailing-transparent shape reachable from a built-in, and it proves
-        // the scan tracks the last inked stop instead of assuming the final
-        // stop is inked.
+        // the scan tracks the last inked *segment* instead of assuming the
+        // final stop is inked.
+        assert_eq!(
+            mirrored
+                .stops()
+                .iter()
+                .filter(|stop| stop.color.a == 0)
+                .count(),
+            3
+        );
         assert_eq!(mirrored.stops().last().expect("has stops").value, 10.0);
         assert_eq!(mirrored.stops().last().expect("has stops").color.a, 0);
+        // -10 and not -7.5: the mirror's last inked segment runs up to -10 and
+        // the hold takes over there, which is the reflection of the original
+        // holding transparent from 7.5 up to the 10 dBZ its first band opens
+        // at.
         assert_eq!(mirrored.inked_value_span(), Some((-92.5, -10.0)));
     }
 
@@ -3009,7 +4454,7 @@ mod tests {
     #[test]
     fn renaming_the_built_ins_did_not_touch_their_stops() {
         // Read off GR2_REFLECTIVITY_TABLE: 17 rows, the first two transparent.
-        let table = builtin_reflectivity_table();
+        let table = gr2_reflectivity_table();
         assert_eq!(table.stops().len(), 17);
         assert_eq!(table.stops()[0].value, -10.0);
         assert_eq!(table.stops()[0].color, Rgba8::TRANSPARENT);
@@ -3059,7 +4504,7 @@ mod tests {
         );
         assert_eq!(
             builtin_reflectivity_table().name(),
-            "GR2Analyst Classic REF (continuous)"
+            "AWIPS Wilson REF (interpolated)"
         );
         assert_eq!(
             smooth_classic_reflectivity_table().name(),
@@ -3108,6 +4553,116 @@ mod tests {
                 .base_name(),
             "My Palette"
         );
+    }
+
+    /// `rendering_suffix` and `base_name` are two views of one rule, and a
+    /// name that ends in a suffix is exactly the name a writer must refuse:
+    /// the identity the application stores for it is not the name it declares.
+    #[test]
+    fn a_name_that_ends_in_a_rendering_suffix_loses_that_half_of_itself() {
+        for suffix in SampleMode::NAME_SUFFIXES {
+            let name = format!("Storm{suffix}");
+            assert_eq!(rendering_suffix(&name), Some(suffix));
+            let table = ColorTable::parse(
+                name.clone(),
+                "color: 0 0 0 0
+color: 10 255 255 255",
+            )
+            .expect("table parses");
+            assert_eq!(table.name(), name);
+            assert_eq!(
+                table.base_name(),
+                "Storm",
+                "the stored identity drops the suffix the file declares"
+            );
+        }
+        // Only at the end, and only these four. A name that merely contains
+        // one is an ordinary name and must stay one.
+        assert_eq!(rendering_suffix("Storm (stepped) v2"), None);
+        assert_eq!(rendering_suffix("Storm (banded)"), None);
+        // The leading space belongs to the suffix, so a name that IS the
+        // parenthesis alone is not one of them.
+        assert_eq!(rendering_suffix("(continuous)"), None);
+        assert_eq!(
+            ColorTable::parse(
+                "Storm (stepped) v2",
+                "color: 0 0 0 0
+color: 10 255 255 255"
+            )
+            .expect("table parses")
+            .base_name(),
+            "Storm (stepped) v2"
+        );
+    }
+
+    /// Every shipped palette answers to its own name, in every form the
+    /// application ever writes that name in, and nothing else does.
+    ///
+    /// This is what a *writer* has to ask before it puts a name in a file. The
+    /// restore path searches this catalogue BEFORE the analyst's own
+    /// directory, so a file declaring a shipped name is never the table that
+    /// gets installed, and the picker row for that name offers Edit on the
+    /// preset - so the analyst's own table cannot be reopened either. A save
+    /// under such a name writes a perfect file and loses the palette.
+    ///
+    /// Both forms have to answer, because both are written down: a picker row
+    /// is labelled `"AWIPS Wilson REF (interpolated)"` and a stored choice is
+    /// written `"AWIPS Wilson REF"`, and they are the same palette.
+    #[test]
+    fn every_shipped_palette_answers_to_its_own_name_in_every_form_it_is_written_in() {
+        for family in ColorTableFamily::ALL {
+            let installed = builtin_tables_for_family(family)
+                .into_iter()
+                .next()
+                .expect("every family ships at least one palette");
+            for table in builtin_tables_for_family(family) {
+                let base = table.base_name().to_owned();
+                assert_eq!(
+                    builtin_family_for_name(&base),
+                    Some(family),
+                    "{base:?} is shipped under {family:?} and did not answer to its own name"
+                );
+                // Every row label a picker can print for it: both renderings,
+                // and the extra "drawn the other way" row.
+                for rendering in [TableRendering::Smooth, TableRendering::Stepped] {
+                    let label = table.rendered(rendering).name().to_owned();
+                    assert_eq!(
+                        base_name_of(&label),
+                        base,
+                        "the row label {label:?} does not reduce to the palette's name"
+                    );
+                    assert_eq!(
+                        builtin_family_for_name(&label),
+                        Some(family),
+                        "the row label {label:?} did not answer as a shipped name"
+                    );
+                }
+            }
+            // And the labels the picker actually builds, taken from the picker's
+            // own function rather than reconstructed here.
+            for offer in palette_offers_for_family(family, &installed) {
+                assert!(
+                    builtin_family_for_name(offer.name()).is_some(),
+                    "the picker offers {:?} and a writer would not know it is taken",
+                    offer.name()
+                );
+            }
+        }
+        // A name of the analyst's own is not taken, including one that merely
+        // starts with a shipped one.
+        for free in [
+            "AWIPS Wilson REF, mine",
+            "My AWIPS Wilson REF",
+            "AWIPS Wilson",
+            "Storm",
+            "",
+        ] {
+            assert_eq!(
+                builtin_family_for_name(free),
+                None,
+                "{free:?} is not a name this build ships"
+            );
+        }
     }
 
     /// Sorted, finite, and never silently collapsed.
@@ -3405,6 +4960,14 @@ mod tests {
     /// `SampleMode::QuantizedInterpolated` short-circuits to transparent below
     /// its first opaque stop. The visible consequence is one half-dBZ of extra
     /// softness at the outer edge of the echo, and nothing at all inside it.
+    ///
+    /// These three are built in Rust from a stop list, not parsed from `.pal`
+    /// text, so their clear stop is the bottom of a gradient and ramps. The GR
+    /// dialect's clear-row hold, which would flatten the fringe away, is a
+    /// property of the text and is written in at parse time; applying it here
+    /// as well would repaint three shipped palettes that nobody complained
+    /// about, which is what `SampleMode::Interpolated`'s own doc promises will
+    /// not happen.
     #[test]
     fn the_interpolated_reflectivity_presets_ink_the_same_gates_as_the_stepped_ones() {
         for table in [
@@ -3426,8 +4989,10 @@ mod tests {
             assert_eq!(table.sample(9.75).a, 128);
 
             // Every value the encoding can actually produce agrees with the
-            // stepped default, gate for gate, in both directions.
-            let stepped = builtin_reflectivity_table();
+            // GR2 classic they were built against, gate for gate, in both
+            // directions. (The default slot moved to AWIPS Wilson, which
+            // paints low dBZ on purpose, so the classic is named directly.)
+            let stepped = gr2_reflectivity_table();
             for raw in 0_u16..=255 {
                 let dbz = (raw as f32 - 66.0) / 2.0;
                 assert_eq!(
@@ -3446,12 +5011,10 @@ mod tests {
             smooth_classic_reflectivity_table().sample(9.75),
             Rgba8::new(8, 44, 70, 128)
         );
-        // And the stepped default at the same off-grid value is fully clear,
-        // which is the whole of the difference between the two.
-        assert_eq!(
-            builtin_reflectivity_table().sample(9.75),
-            Rgba8::TRANSPARENT
-        );
+        // And the stepped classic at the same off-grid value is fully clear -
+        // it is parsed from `.pal` text, so its clear row holds - which is the
+        // whole of the difference between the two.
+        assert_eq!(gr2_reflectivity_table().sample(9.75), Rgba8::TRANSPARENT);
     }
 
     /// Hand-read off the three stop lists. Break anchors first, then one
@@ -3780,18 +5343,37 @@ mod tests {
     /// For every palette that was authored banded, the flip is a pure
     /// recolouring: exactly the same gates paint, at exactly the same alpha.
     ///
-    /// The five palettes authored on the legacy sRGB interpolation are excluded
-    /// and cannot be included: they carry a deliberate half-dBZ alpha ramp
-    /// below their first opaque stop, which a banded drawing has no way to
-    /// express. Flipping one of those to stepped loses a one-Level-II-step
-    /// fringe at the very edge of the echo, which is what asking for hard bands
-    /// means. The default palettes are not among them.
+    /// It holds for the parsed palettes that are drawn on the legacy sRGB
+    /// interpolation too. It did not use to: every interpolated palette was
+    /// excluded here, because its clear lead-in stop ramped up into the first
+    /// opaque one and a band has no way to express a half-dBZ fringe. A clear
+    /// `.pal` *row* now carries the dialect's hold, so the parsed ones have no
+    /// fringe left to lose.
+    ///
+    /// Four palettes still cannot be included, and they are exactly the four
+    /// whose lowest clear stop ramps up into an opaque colour rather than
+    /// holding: AWIPS Wilson, which declares the fade because its `.pal` text
+    /// does, and the three Rust-built Smooth REF presets, whose clear stop
+    /// resolves to the first inked one because a stop list has no dialect. Hard
+    /// bands have one colour per band and keep that stretch clear instead.
+    ///
+    /// The exclusion is written as the condition rather than as four names, so
+    /// a palette that acquires a fade-in is excluded with it and one that loses
+    /// it is caught. It reads the *resolved* segment end and not the declared
+    /// one, because whether a clear stop fades is a fact about what the table
+    /// paints, not about how the fact got written down.
     #[test]
     fn a_banded_palette_flipped_to_continuous_paints_exactly_the_same_gates() {
+        let mut fade_ins = 0;
         for (family, table) in every_registered_palette() {
-            if table.rendering() == TableRendering::Smooth
-                && table.sample_mode_label() == "interpolated"
-            {
+            let stops = table.stops();
+            let fades_in = stops.iter().enumerate().any(|(index, stop)| {
+                stop.color.a == 0
+                    && index + 1 < stops.len()
+                    && segment_end_color(stops, index).a > 0
+            });
+            if fades_in {
+                fade_ins += 1;
                 continue;
             }
             let banded = table.rendered(TableRendering::Stepped);
@@ -3805,6 +5387,11 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            fade_ins, 4,
+            "AWIPS Wilson and the three Smooth REF presets are the built-ins \
+             whose clear stop fades up rather than holding"
+        );
     }
 
     /// Transparency leads or it does not exist, in either rendering.
@@ -3909,12 +5496,12 @@ mod tests {
             distinct(&tornado_velocity_table(), ColorTableFamily::Velocity),
             61
         );
-        // 240 and not 241: one pair of adjacent half-metre-per-second readings
-        // still rounds to the same byte triple, out near the pale end of the
-        // outbound ramp where the palette itself barely moves.
+        // The ported WDT/RadarScope default resolves 241 of the encodable
+        // readings; the remainder collapse inside its deliberately flat
+        // segments, which is the original behaviour.
         assert_eq!(
             distinct(&builtin_velocity_table(), ColorTableFamily::Velocity),
-            240
+            241
         );
     }
 
@@ -3936,8 +5523,23 @@ mod tests {
             // 1. Zero is neutral, so the zero isodop reads as a line.
             let zero = table.sample(0.0);
             assert_eq!(zero.a, 255, "{} fades zero out", table.name());
-            assert_eq!(zero.r, zero.g, "{} zero is not neutral", table.name());
-            assert_eq!(zero.g, zero.b, "{} zero is not neutral", table.name());
+            if table.base_name() == "GenericRadar VEL" {
+                // The ported WDT/RadarScope classic declares its zero as a
+                // muted mauve rather than a strict grey; that declaration IS
+                // the ported look, pinned byte-for-byte in
+                // `presets::port_fidelity`. It still has to be muted enough
+                // to read as the isodop.
+                let high = zero.r.max(zero.g).max(zero.b);
+                let low = zero.r.min(zero.g).min(zero.b);
+                assert!(
+                    high - low <= 32,
+                    "{} zero is not muted: {zero:?}",
+                    table.name()
+                );
+            } else {
+                assert_eq!(zero.r, zero.g, "{} zero is not neutral", table.name());
+                assert_eq!(zero.g, zero.b, "{} zero is not neutral", table.name());
+            }
 
             // 2. The isodop is findable, which means the zero colour is
             // local to zero: nothing beyond three metres per second of it may
@@ -4200,7 +5802,13 @@ mod tests {
     /// whose weakest asymmetric pair in the same band is far above it.
     #[test]
     fn an_asymmetric_couplet_is_no_harder_to_see_continuous_than_it_was_banded() {
-        let default = builtin_velocity_table();
+        // The ratio clauses below compare a palette against its own banded
+        // drawing, which only means something for the palette that USED to
+        // ship banded - Analyst Tornado VEL, whose smooth migration this test
+        // was written to guard. The shipped default is authored continuous,
+        // so there is no banded original to regress against; it takes the
+        // absolute floor at the end instead.
+        let default = tornado_velocity_table();
         let banded = default.rendered(TableRendering::Stepped);
         let continuous = default.rendered(TableRendering::Smooth);
 
@@ -4264,6 +5872,32 @@ mod tests {
              {worst_ratio:.4} as far as the banded one did",
             worst_ratio_at.0,
             worst_ratio_at.1
+        );
+
+        // And the palette actually shipping as the default: every asymmetric
+        // couplet in the mesocyclone band must clear the just-noticeable
+        // difference on its own terms.
+        let shipped = builtin_velocity_table();
+        let mut shipped_weakest = f32::INFINITY;
+        let mut shipped_weakest_at = (0.0_f32, 0.0_f32);
+        for inbound_half in -70..=-20 {
+            let inbound = inbound_half as f32 / 2.0;
+            for outbound_half in 20..=70 {
+                let outbound = outbound_half as f32 / 2.0;
+                let separation =
+                    oklab::difference(shipped.sample(inbound), shipped.sample(outbound));
+                if separation < shipped_weakest {
+                    shipped_weakest = separation;
+                    shipped_weakest_at = (inbound, outbound);
+                }
+            }
+        }
+        assert!(
+            shipped_weakest > 0.02,
+            "the shipped default's weakest asymmetric couplet, at ({:.1}, {:.1}) m/s, \
+             separates only {shipped_weakest:.4}",
+            shipped_weakest_at.0,
+            shipped_weakest_at.1
         );
     }
 
@@ -4441,6 +6075,13 @@ mod tests {
             let perceptual = continuous.sample_mode_label() == "continuous";
             if !perceptual {
                 legacy_palettes += 1;
+                if matches!(table.base_name(), "AWIPS Wilson REF" | "GenericRadar VEL") {
+                    // The ported looks are pinned byte-for-byte to their
+                    // originals in `presets::port_fidelity`; their mid-ramp
+                    // sag is the look itself, not a defect the perceptual
+                    // mixer is allowed to fix.
+                    continue;
+                }
             }
             let stops = table.stops().to_vec();
             for (index, window) in stops.windows(2).enumerate() {

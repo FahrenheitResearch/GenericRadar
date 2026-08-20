@@ -305,6 +305,7 @@ pub struct WorkstationApp {
     product_availability: ProductAvailabilityIndex,
     product_picker: ProductPickerState,
     product_picker_open: bool,
+    palette_editor: crate::palette_editor::PaletteEditorState,
     load_service: LoadService,
     render_service: RenderService,
     session_clock: GenerationClock,
@@ -315,6 +316,20 @@ pub struct WorkstationApp {
     palette_clock: GenerationClock,
     panes: [PaneRuntime; analyst_runtime::MAX_PANES],
     color_tables: Arc<ColorTableSet>,
+    /// Colour tables the analyst supplied, and the folder they came from.
+    /// Read at startup, when the window regains focus, and after a drop; see
+    /// `crate::user_tables`.
+    user_tables: crate::user_tables::UserTables,
+    /// The colour table editor wrote a file and the folder has not been read
+    /// since. Set by [`WorkstationApp::palette_editor_window`] and acted on at
+    /// the top of the NEXT frame - see the rescan in `update`, which explains
+    /// why it cannot be done where it is noticed.
+    user_tables_rescan_pending: bool,
+    /// The toolbar palette combo's rows, held between frames. Building them
+    /// parses every built-in for the family and clones every user table, and
+    /// an open combo popup asks for them once a frame; see
+    /// `settings_ui::PaletteOfferCache`.
+    palette_offers: crate::settings_ui::PaletteOfferCache,
     source_path_text: String,
     status: String,
     load_ms: Option<f32>,
@@ -399,6 +414,7 @@ impl WorkstationApp {
             product_availability: ProductAvailabilityIndex::unrestricted(),
             product_picker: ProductPickerState::default(),
             product_picker_open: false,
+            palette_editor: crate::palette_editor::PaletteEditorState::default(),
             load_service: LoadService::new(context.clone()),
             render_service: RenderService::new(context.clone()),
             live_service: LiveService::new(context.clone()),
@@ -414,6 +430,12 @@ impl WorkstationApp {
             palette_clock: GenerationClock::default(),
             panes: array::from_fn(|_| PaneRuntime::default()),
             color_tables: Arc::new(ColorTableSet::default()),
+            // The folder is scanned here, so it is already read by the time
+            // `apply_settings_on_start` resolves stored palette names
+            // against it.
+            user_tables: crate::user_tables::UserTables::default(),
+            user_tables_rescan_pending: false,
+            palette_offers: crate::settings_ui::PaletteOfferCache::default(),
             source_path_text,
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
@@ -476,10 +498,13 @@ impl WorkstationApp {
     fn apply_settings_on_start(&mut self) {
         use crate::settings_ui::catalog::keys;
 
-        // Palettes before anything renders. An unknown stored name falls back
-        // to its family's default inside `apply_palettes` - never a blank.
-        self.color_tables = Arc::new(crate::settings_ui::palettes::apply_palettes(
+        // Palettes before anything renders, resolved against the shipped
+        // catalogue AND the analyst's own colour table folder. A stored name
+        // neither can supply falls back to its family's default inside
+        // `apply_palettes_with_user` - never to a blank.
+        self.color_tables = Arc::new(crate::settings_ui::palettes::apply_palettes_with_user(
             &self.settings_store.workspace().palettes,
+            self.user_tables.library(),
         ));
 
         // The workspace: layout, active pane, per-pane product, tilt, camera
@@ -857,13 +882,25 @@ impl WorkstationApp {
                 registry: &self.settings_registry,
                 store: &mut self.settings_store,
                 color_tables: Some(&mut self.color_tables),
+                user_tables: Some(self.user_tables.library()),
             },
         );
+        if outcome.user_tables_rescan {
+            self.rescan_user_tables();
+        }
         if outcome.palette_changed {
             // Exactly what the toolbar's palette picker does: new colours,
             // same data.
             self.palette_clock.bump();
             self.invalidate_view_panes(self.workspace.visible_panes());
+        }
+        if let Some((family, table)) = outcome.palette_edit {
+            // The settings page names nothing from this crate, so the
+            // shipped-preset question is asked here - of the same function the
+            // picker asks, so the two rows cannot answer it differently.
+            let duplicate = color_tables::is_builtin_table(family, table.base_name());
+            self.palette_editor
+                .edit_or_duplicate(family, &table, duplicate);
         }
         for (category, id) in &outcome.changed {
             self.apply_changed_setting(category, id);
@@ -895,7 +932,14 @@ impl WorkstationApp {
         // what lets the toolbar's own pickers persist with zero per-widget
         // code.
         let mut workspace = crate::settings_ui::sync::capture_workspace(&self.workspace);
-        workspace.palettes = crate::settings_ui::palettes::capture_palettes(&self.color_tables);
+        // Preserving, not unconditional: a stored palette name whose file is
+        // missing right now resolves to the family default on screen, and
+        // this mirror must not write that default over the analyst's choice.
+        workspace.palettes = crate::settings_ui::palettes::capture_palettes_preserving(
+            &self.color_tables,
+            &self.settings_store.workspace().palettes,
+            self.user_tables.library(),
+        );
         workspace.last_site = self.live_site.clone();
         workspace.show_warnings = Some(self.show_warnings);
         workspace.window = context.input(|input| {
@@ -1564,11 +1608,60 @@ impl WorkstationApp {
         // so playback gating is unchanged by the stale pixels.
     }
 
+    /// A drop is either colour tables or a radar volume, decided per path by
+    /// its extension.
+    ///
+    /// One drop can carry several files, and a folder of palettes is exactly
+    /// the kind of thing an analyst drags in one go, so every colour table in
+    /// the drop is imported rather than only the first. A volume is still one
+    /// at a time - a pane draws one - so the first non-palette path wins.
     fn handle_dropped_files(&mut self, context: &egui::Context) {
         let dropped = context.input(|input| input.raw.dropped_files.clone());
-        if let Some(path) = dropped.into_iter().find_map(|file| file.path) {
+        if dropped.is_empty() {
+            return;
+        }
+        let (tables, volume) =
+            crate::user_tables::split_drop(dropped.into_iter().filter_map(|file| file.path));
+        if !tables.is_empty() && self.user_tables.import_all(&tables) {
+            self.reresolve_palettes_from_user_tables();
+        }
+        if let Some(path) = volume {
             self.begin_load(path);
         }
+    }
+
+    /// Re-read the colour table folder and re-resolve the installed palettes
+    /// against it.
+    ///
+    /// Two callers: the settings window's *Rescan colour table folder* button
+    /// (`SettingsOutcome::user_tables_rescan`), and a save made in the colour
+    /// table editor, one frame later. Both are explicit instructions rather
+    /// than guesses, so both get an actual read of every file rather than the
+    /// listing short circuit.
+    fn rescan_user_tables(&mut self) {
+        self.user_tables.rescan();
+        self.reresolve_palettes_from_user_tables();
+    }
+
+    /// Put the stored palette choices back through resolution now that the
+    /// folder's contents have changed.
+    ///
+    /// Re-resolving rather than merely refreshing the offer lists is what
+    /// makes a returning file bring its palette back with it: the stored
+    /// choice survived the file's absence (see
+    /// `settings_ui::palettes::capture_palettes_preserving`), so the moment
+    /// the file is readable again the pane can be drawing it.
+    fn reresolve_palettes_from_user_tables(&mut self) {
+        let resolved = crate::settings_ui::palettes::apply_palettes_with_user(
+            &self.settings_store.workspace().palettes,
+            self.user_tables.library(),
+        );
+        if *self.color_tables == resolved {
+            return;
+        }
+        self.color_tables = Arc::new(resolved);
+        self.palette_clock.bump();
+        self.invalidate_view_panes(self.workspace.visible_panes());
     }
 
     fn advance_playback(&mut self, context: &egui::Context) {
@@ -1828,6 +1921,7 @@ impl WorkstationApp {
                                         current: current_product,
                                         availability: &self.product_availability,
                                         tables: &self.color_tables,
+                                        user_tables: Some(self.user_tables.library()),
                                         show_experimental: false,
                                     },
                                 )
@@ -1847,6 +1941,19 @@ impl WorkstationApp {
                             .set_family(selection.family, selection.table);
                         self.palette_clock.bump();
                         palette_changed = true;
+                    }
+                    if let Some(request) = outcome.edit_palette {
+                        // The picker already knows whether this is a shipped
+                        // preset, and says so on the request. Passed straight
+                        // through: the editor must not re-derive it, because
+                        // the only thing it could re-derive it from is a
+                        // filename, and filenames are many-to-one.
+                        self.palette_editor.edit_or_duplicate(
+                            request.family,
+                            &request.table,
+                            request.duplicate,
+                        );
+                        self.product_picker_open = false;
                     }
                     // `crate::popup` rather than `clicked_elsewhere()`. That method
                     // answered yes for the click that OPENED this popup - the click
@@ -1871,17 +1978,23 @@ impl WorkstationApp {
                 let palette_family = crate::product_picker::palette_family(current_product);
                 if let Some(family) = palette_family {
                     let installed = self.color_tables.for_family(family).clone();
+                    // Taken out of the popup rather than installed inside it:
+                    // the rows are borrowed from the offer cache for the
+                    // length of the loop, and installing writes the set that
+                    // cache is keyed on.
+                    let mut picked = None;
                     egui::ComboBox::from_id_salt("workstation-palette")
                         .selected_text(installed.name())
                         .width(210.0)
                         .show_ui(ui, |ui| {
-                            for table in color_tables::palette_offers_for_family(family, &installed)
-                            {
+                            for table in self.palette_offers.offers(
+                                family,
+                                &installed,
+                                Some(self.user_tables.library()),
+                            ) {
                                 let chosen = table.name() == installed.name();
                                 if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
-                                    Arc::make_mut(&mut self.color_tables).set_family(family, table);
-                                    self.palette_clock.bump();
-                                    palette_changed = true;
+                                    picked = Some(table.clone());
                                 }
                             }
                         })
@@ -1890,6 +2003,11 @@ impl WorkstationApp {
                             "Colour table for this product's family. The last row is the \
                          selected palette redrawn the other way: smooth or stepped.",
                         );
+                    if let Some(table) = picked {
+                        Arc::make_mut(&mut self.color_tables).set_family(family, table);
+                        self.palette_clock.bump();
+                        palette_changed = true;
+                    }
                 }
 
                 // A stepper: two keys with the measurement inset between them.
@@ -2164,6 +2282,7 @@ impl WorkstationApp {
                                     current: current_product,
                                     availability: &self.product_availability,
                                     tables: &self.color_tables,
+                                    user_tables: Some(self.user_tables.library()),
                                     show_experimental: false,
                                 },
                             )
@@ -2183,6 +2302,14 @@ impl WorkstationApp {
                         .set_family(selection.family, selection.table);
                     self.palette_clock.bump();
                     palette_changed = true;
+                }
+                if let Some(request) = outcome.edit_palette {
+                    self.palette_editor.edit_or_duplicate(
+                        request.family,
+                        &request.table,
+                        request.duplicate,
+                    );
+                    self.product_picker_open = false;
                 }
                 // `crate::popup` rather than `clicked_elsewhere()`. That method
                 // answered yes for the click that OPENED this popup - the click
@@ -2208,16 +2335,21 @@ impl WorkstationApp {
             let palette_family = crate::product_picker::palette_family(current_product);
             if let Some(family) = palette_family {
                 let installed = self.color_tables.for_family(family).clone();
+                // Taken out of the popup rather than installed inside it, for
+                // the reason the wide bar above gives.
+                let mut picked = None;
                 egui::ComboBox::from_id_salt("workstation-palette")
                     .selected_text(installed.name())
                     .width(210.0)
                     .show_ui(ui, |ui| {
-                        for table in color_tables::palette_offers_for_family(family, &installed) {
+                        for table in self.palette_offers.offers(
+                            family,
+                            &installed,
+                            Some(self.user_tables.library()),
+                        ) {
                             let chosen = table.name() == installed.name();
                             if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
-                                Arc::make_mut(&mut self.color_tables).set_family(family, table);
-                                self.palette_clock.bump();
-                                palette_changed = true;
+                                picked = Some(table.clone());
                             }
                         }
                     })
@@ -2226,6 +2358,11 @@ impl WorkstationApp {
                         "Colour table for this product's family. The last row is the \
                          selected palette redrawn the other way: smooth or stepped.",
                     );
+                if let Some(table) = picked {
+                    Arc::make_mut(&mut self.color_tables).set_family(family, table);
+                    self.palette_clock.bump();
+                    palette_changed = true;
+                }
             }
 
             crate::app_support::basemap_picker(ui, &mut self.map_scene, &mut self.settings_store);
@@ -2430,6 +2567,42 @@ impl WorkstationApp {
                 crate::vol3d::pane::draw_vol3d_pane(&mut self.vol3d, ui, &input);
             });
         self.vol3d.open = open;
+    }
+
+    /// The colour table editor, in its own window.
+    ///
+    /// The volume it previews on is the one the timeline has selected - the
+    /// frame on screen - so a palette is judged against the storm the analyst
+    /// is looking at rather than against a gradient.
+    fn palette_editor_window(&mut self, context: &egui::Context) {
+        if !self.palette_editor.open {
+            return;
+        }
+        let volume = self.history.current().map(|frame| frame.volume.clone());
+        let outcome = crate::palette_editor::draw_palette_editor(
+            context,
+            crate::palette_editor::PaletteEditorInput {
+                state: &mut self.palette_editor,
+                volume: volume.as_deref(),
+            },
+        );
+        if let Some((family, table)) = outcome.install {
+            // Same reach as every other palette install: a family, not a
+            // product, because all four velocity products draw from one table.
+            Arc::make_mut(&mut self.color_tables).set_family(family, table);
+            self.palette_clock.bump();
+            self.invalidate_view_panes(self.workspace.visible_panes());
+        }
+        if let Some(path) = outcome.saved {
+            self.status = format!("Colour table saved to {}", path.display());
+            // The folder has a file in it that nothing has read yet, and the
+            // focus rescan will never notice: focus was never lost - the save
+            // happened inside this window. So the picker, the settings page
+            // and the toolbar combo would all keep offering the list they
+            // built before the save, and a table an analyst has just written
+            // would be missing from every one of them until they alt-tabbed.
+            self.user_tables_rescan_pending = true;
+        }
     }
 
     /// The cross-section window, following the active pane's product.
@@ -3588,6 +3761,25 @@ impl eframe::App for WorkstationApp {
         crate::theme::paint_root_ground(ui);
         let context = ui.ctx().clone();
         self.handle_dropped_files(&context);
+        // A save made in the colour table editor, one frame ago.
+        //
+        // Deferred by a frame rather than done where it is noticed, because
+        // the editor's window is drawn BEFORE the store mirror below: an
+        // Apply in the same press installs a table that the store has not
+        // been told about yet, and re-resolving the stored choices there
+        // would put the previous palette straight back on the pane. By the
+        // top of the next frame the mirror has run, the stored name is the
+        // installed table's, and re-resolving finds the file that was just
+        // written.
+        if std::mem::take(&mut self.user_tables_rescan_pending) {
+            self.rescan_user_tables();
+        }
+        // The analyst edits a palette by alt-tabbing to a text editor and
+        // coming back; the way back is when the folder is worth reading
+        // again. No polling, no watcher thread.
+        if self.user_tables.poll_focus(&context) {
+            self.reresolve_palettes_from_user_tables();
+        }
         self.poll_live_results();
         self.poll_load_results();
         self.poll_site_directory();
@@ -3607,6 +3799,7 @@ impl eframe::App for WorkstationApp {
 
         self.vol3d_window(&context);
         self.xsection_window(&context);
+        self.palette_editor_window(&context);
         self.toolbar(ui);
         // No separator under the bar: the band paints its own raised bevel,
         // and a stock hairline immediately below it reads as a second, weaker
@@ -3624,6 +3817,11 @@ impl eframe::App for WorkstationApp {
         ui.separator();
         self.timeline(ui, &context);
         self.settings_frame(&context);
+        // Last, over everything: what the analyst's last colour table drop
+        // did. It floats rather than joining the timeline's status line
+        // because that line is only shown when no volume is loaded, which is
+        // never the moment somebody drops a palette.
+        self.user_tables.draw_notice(&context);
 
         // A reveal that has caught up with the data is not animating: it is
         // waiting for a chunk, and the load service wakes the UI when one

@@ -1892,6 +1892,7 @@ mod tests {
                             current: DisplayProduct::Reflectivity,
                             availability: &availability,
                             tables: &tables,
+                            user_tables: None,
                             show_experimental: false,
                         },
                     );

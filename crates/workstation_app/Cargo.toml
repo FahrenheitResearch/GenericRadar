@@ -32,3 +32,16 @@ naga = "29.0.3"
 [[bin]]
 name = "GenericRadar"
 path = "src/main.rs"
+
+# The save-apply-restart pin runs against the REAL settings paths, and the
+# config root they resolve through is a process-global `OnceLock`: the first
+# lookup wins. Under the ordinary harness the included modules' own tests would
+# run in parallel with it and one of them would decide the root first.
+# `harness = false` makes it a plain binary - rustc gets no `--test`, so those
+# `#[test]` functions are never collected, and one `main` decides the order -
+# which is the same reason `settings/tests/paths_override.rs` is a binary of
+# its own.
+[[test]]
+name = "palette_restart"
+path = "tests/palette_restart.rs"
+harness = false

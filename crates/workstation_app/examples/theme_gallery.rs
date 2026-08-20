@@ -53,6 +53,7 @@ mod source {
     pub mod live_service;
     pub mod load_service;
     pub mod nearest_site;
+    pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
     pub mod popup;
@@ -65,6 +66,7 @@ mod source {
     pub mod sites_service;
     pub mod sweep;
     pub mod theme;
+    pub mod user_tables;
     pub mod vol3d;
     pub mod vrot;
     pub mod warnings_service;
@@ -72,9 +74,10 @@ mod source {
 }
 
 pub(crate) use source::{
-    app, app_support, hazards, legend, live_service, load_service, nearest_site, palettes,
-    pane_canvas, popup, probe, product, product_availability, product_picker, render_service,
-    settings_ui, sites_service, sweep, theme, vol3d, vrot, warnings_service, xsection,
+    app, app_support, hazards, legend, live_service, load_service, nearest_site, palette_editor,
+    palettes, pane_canvas, popup, probe, product, product_availability, product_picker,
+    render_service, settings_ui, sites_service, sweep, theme, user_tables, vol3d, vrot,
+    warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};
@@ -757,6 +760,23 @@ mod toolbar {
         let settings_file = out_dir.join("toolbar-proof-settings.json");
         let _ = std::fs::remove_file(&settings_file);
         let store = settings::SettingsStore::open(settings_file);
+        // And a config root of this run's own, for the same reason and one
+        // more. `WorkstationApp::new` builds `user_tables::UserTables` from
+        // `settings::app_config_root()/colortables`, so without this the
+        // palette combo on the captured bar - and the contrast audit that
+        // reads its text - would vary with whatever `.pal` files happen to
+        // be in the folder of whoever ran the capture. The injection point
+        // is the one a mobile shell uses; it is set-once, which is why the
+        // assertion below is here rather than a bare call.
+        let config_root = out_dir.join("toolbar-proof-config");
+        let _ = std::fs::remove_dir_all(&config_root);
+        std::fs::create_dir_all(&config_root).expect("create the capture's config root");
+        settings::set_app_config_root(&config_root);
+        assert_eq!(
+            settings::app_config_root(),
+            config_root,
+            "the capture must not read a real colour table folder"
+        );
         let creation = eframe::CreationContext::_new_kittest(ctx.clone());
         app::WorkstationApp::new(
             &creation,

@@ -56,6 +56,20 @@ pub fn default_settings_file() -> PathBuf {
     app_config_root().join("settings.json")
 }
 
+/// The directory an analyst's own `.pal` colour tables live in.
+///
+/// Under the **config** root, not the cache root: a palette someone spent an
+/// evening on is not re-downloadable, and the cache root is documented as
+/// something the OS may empty.
+///
+/// Declared here rather than in the colour table editor because two unrelated
+/// modules need it - the editor writes into it and the palette restore path
+/// reads it - and those two are compiled into different crates, so a constant
+/// spelled out in one of them would be a constant the other could not see.
+pub fn user_colortables_dir() -> PathBuf {
+    app_config_root().join("colortables")
+}
+
 fn default_config_root() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

@@ -19,10 +19,14 @@
 //!   values to the live application and mirrors live state back into the
 //!   store.
 //!
-//! The one non-generic section is the colour-table picker on the Radar page:
-//! palettes are structured state (name + rendering per family), not scalar
-//! knobs, so they edit the live [`ColorTableSet`] directly and persist
-//! through the workspace snapshot - see [`palettes`].
+//! The non-generic sections are both on the Radar page, and both are there
+//! because colour tables are not scalar knobs. The picker edits the live
+//! [`ColorTableSet`] directly and persists through the workspace snapshot
+//! (name + rendering per family - see [`palettes`]); under it,
+//! [`draw_user_tables_section`] reports what the analyst's own colour table
+//! folder holds and, more importantly, which files in it could not be read
+//! and why. A palette that is in the folder and not in the picker has no
+//! other way of being diagnosed from inside the application.
 //!
 //! Mobile is a standing requirement: every affordance here is visible and
 //! tappable (help is inline text, never hover), and interactive rows enforce
@@ -46,7 +50,8 @@ pub mod sync;
 
 use std::sync::Arc;
 
-use color_tables::{ColorTableFamily, ColorTableSet};
+use color_tables::user::UserTableLibrary;
+use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 use eframe::egui;
 use settings::{
     LoadStatus, SettingKind, SettingSpec, SettingValue, SettingsRegistry, SettingsStore,
@@ -62,6 +67,10 @@ pub struct SettingsUi {
     pub open: bool,
     selected_category: Option<String>,
     search: String,
+    /// The Radar page's palette rows, held between frames. See
+    /// [`PaletteOfferCache`]: the list is rebuilt from parsed text and
+    /// cloned tables, and a combo popup asks for it every frame it is open.
+    palette_offers: PaletteOfferCache,
 }
 
 impl SettingsUi {
@@ -89,6 +98,11 @@ pub struct SettingsWindowInput<'a> {
     /// The live colour tables, edited by the Radar page's palette section.
     /// `None` hides that section (a caller that does not own tables).
     pub color_tables: Option<&'a mut Arc<ColorTableSet>>,
+    /// What the analyst's own colour table folder currently holds. The
+    /// palette lists offer these after the built-ins, and the folder's
+    /// parse faults are reported under them. `None` for a caller that keeps
+    /// no folder - the palette section then offers the built-ins alone.
+    pub user_tables: Option<&'a UserTableLibrary>,
 }
 
 /// What changed this frame, for the caller to apply to live state.
@@ -101,6 +115,18 @@ pub struct SettingsOutcome {
     /// The palette section installed a different colour table. The caller
     /// bumps its palette clock and re-renders.
     pub palette_changed: bool,
+    /// The user colour table section asked for the folder to be read again.
+    /// The caller owns the library, so it does the scan.
+    ///
+    /// Also set by the colour table editor's Save and Apply, through the
+    /// application: a file written from inside this process is a change the
+    /// focus-regain rescan will never see, because focus was never lost.
+    pub user_tables_rescan: bool,
+    /// The palette section asked for a table to be opened in the colour table
+    /// editor. Plain `color_tables` values rather than an editor type: this
+    /// module is compiled in a second home that does not have the
+    /// application's crate, so it names nothing from it.
+    pub palette_edit: Option<(ColorTableFamily, ColorTable)>,
 }
 
 /// Draw the window. Call every frame; cheap when closed.
@@ -117,6 +143,7 @@ pub fn draw_settings_window(
         registry,
         store,
         color_tables,
+        user_tables,
     } = input;
     let mut open = state.open;
     // The window must never outgrow the display - either axis: long pages
@@ -205,7 +232,11 @@ pub fn draw_settings_window(
                                     registry,
                                     store,
                                     &category_id,
-                                    color_tables,
+                                    PaletteContext {
+                                        color_tables,
+                                        user_tables,
+                                        offers: &mut state.palette_offers,
+                                    },
                                     &mut outcome,
                                 );
                             }
@@ -217,6 +248,18 @@ pub fn draw_settings_window(
     outcome
 }
 
+/// The colour-table half of a page, which the generic registry rendering
+/// knows nothing about: the live set the picker edits, the analyst's own
+/// folder, and the rows the combos draw from. Carried as one value because
+/// only the Radar page uses any of it, and because three more parameters on
+/// a page-drawing function is three more chances to pass them in the wrong
+/// order.
+struct PaletteContext<'a> {
+    color_tables: Option<&'a mut Arc<ColorTableSet>>,
+    user_tables: Option<&'a UserTableLibrary>,
+    offers: &'a mut PaletteOfferCache,
+}
+
 /// One category page: its rows, its palette section if it is the Radar page,
 /// and its restore-defaults footer.
 fn draw_category_page(
@@ -224,7 +267,7 @@ fn draw_category_page(
     registry: &SettingsRegistry,
     store: &mut SettingsStore,
     category_id: &str,
-    color_tables: Option<&mut Arc<ColorTableSet>>,
+    palettes: PaletteContext<'_>,
     outcome: &mut SettingsOutcome,
 ) {
     let Some(category) = registry.category(category_id) else {
@@ -235,11 +278,19 @@ fn draw_category_page(
     for spec in &category.settings {
         draw_setting_row(ui, store, category_id, spec, outcome);
     }
+    let PaletteContext {
+        color_tables,
+        user_tables,
+        offers,
+    } = palettes;
     let mut color_tables = color_tables;
     if category_id == catalog::keys::radar::CATEGORY
         && let Some(tables) = color_tables.as_deref_mut()
     {
-        draw_palette_section(ui, store, tables, outcome);
+        draw_palette_section(ui, store, tables, user_tables, offers, outcome);
+        if let Some(library) = user_tables {
+            draw_user_tables_section(ui, library, outcome);
+        }
     }
     ui.add_space(8.0);
     if ui
@@ -451,13 +502,16 @@ fn draw_setting_row(
 }
 
 /// The Radar page's colour-table pickers: one row per family, offering the
-/// same list the toolbar picker offers (`palette_offers_for_family`, which
-/// includes the smooth/stepped flip as its last row). Changes install into
-/// the live set immediately and persist through the workspace snapshot.
+/// same list the toolbar picker offers - the shipped catalogue, then the
+/// analyst's own tables for that family, then the smooth/stepped flip as the
+/// last row. Changes install into the live set immediately and persist
+/// through the workspace snapshot.
 fn draw_palette_section(
     ui: &mut egui::Ui,
     store: &mut SettingsStore,
     tables: &mut Arc<ColorTableSet>,
+    user_tables: Option<&UserTableLibrary>,
+    palette_offers: &mut PaletteOfferCache,
     outcome: &mut SettingsOutcome,
 ) {
     ui.add_space(6.0);
@@ -465,7 +519,8 @@ fn draw_palette_section(
     ui.label(
         egui::RichText::new(
             "Per measurement family; installing a velocity table moves VEL, DVEL, SRV \
-             and DSRV together. The last row of each list is the selected palette \
+             and DSRV together. Tables from your own colour table folder follow the \
+             built-in ones. The last row of each list is the selected palette \
              redrawn the other way: smooth or stepped.",
         )
         .small()
@@ -475,27 +530,236 @@ fn draw_palette_section(
     let mut changed = false;
     for family in ColorTableFamily::ALL {
         let installed = tables.for_family(family).clone();
+        // Taken out of the popup rather than installed inside it: the rows
+        // are borrowed from the cache for the length of the loop, and
+        // installing writes the set the cache's key is read from.
+        let mut picked = None;
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt(("settings-palette", palettes::family_id(family)))
                 .selected_text(installed.name().to_owned())
                 .width(230.0)
                 .show_ui(ui, |ui| {
-                    for table in color_tables::palette_offers_for_family(family, &installed) {
+                    for table in palette_offers.offers(family, &installed, user_tables) {
                         let chosen = table.name() == installed.name();
                         if ui.selectable_label(chosen, table.name()).clicked() && !chosen {
-                            Arc::make_mut(tables).set_family(family, table);
-                            changed = true;
+                            picked = Some(table.clone());
                         }
                     }
                 });
             ui.label(family.label());
+            // The editor opens on whatever is installed for the family. It
+            // decides for itself whether that is a table it may write over: a
+            // shipped preset is duplicated, so this button is never a way to
+            // lose one.
+            if ui
+                .button("Edit…")
+                .on_hover_text(
+                    "Open this table in the colour table editor. Shipped presets open as a \
+                     copy - they are never overwritten.",
+                )
+                .clicked()
+            {
+                outcome.palette_edit = Some((family, installed.clone()));
+            }
         });
+        if let Some(table) = picked {
+            Arc::make_mut(tables).set_family(family, table);
+            changed = true;
+        }
     }
     if changed {
         let mut workspace = store.workspace().clone();
-        workspace.palettes = palettes::capture_palettes(tables);
+        workspace.palettes = match user_tables {
+            // Preserving, not unconditional: a stored name whose file is
+            // temporarily missing must survive an unrelated palette change
+            // in another family.
+            Some(library) => {
+                palettes::capture_palettes_preserving(tables, &workspace.palettes, library)
+            }
+            None => palettes::capture_palettes(tables),
+        };
         store.set_workspace(workspace);
         outcome.palette_changed = true;
+    }
+}
+
+/// The rows one family's picker offers, with or without a user folder behind
+/// it. One function so the settings window and the toolbar cannot drift into
+/// offering different lists.
+pub fn palette_offers(
+    family: ColorTableFamily,
+    installed: &color_tables::ColorTable,
+    user_tables: Option<&UserTableLibrary>,
+) -> Vec<color_tables::ColorTable> {
+    match user_tables {
+        Some(library) => {
+            color_tables::user::palette_offers_with_user_tables(family, installed, library)
+        }
+        None => color_tables::palette_offers_for_family(family, installed),
+    }
+}
+
+/// One family's picker rows, held until something they are built from moves.
+///
+/// [`palette_offers`] is not cheap and every caller is inside a combo box's
+/// popup, which means it runs once per frame for as long as that popup is
+/// open: each built-in for the family is parsed out of its text, and each
+/// table the analyst supplied is cloned whole - its stops and the per-stop
+/// Oklab beside them. For a list whose contents change only when the analyst
+/// installs a different palette or the colour table folder is rescanned,
+/// paying that at the frame rate is pure waste, and with a large user table
+/// in the folder it was a measurable slice of a 60 fps budget.
+///
+/// The key is exactly what the list is built from:
+///
+/// * the family, which decides which built-ins and which user tables;
+/// * the installed table's full `name()`, which carries both the palette and
+///   the rendering the whole list is drawn in, and which the flip row at the
+///   bottom is derived from;
+/// * the folder's scan generation, so a table dropped, edited or rescanned
+///   while the popup is open appears on the next frame instead of being
+///   served stale.
+///
+/// One cache holds one family's list, which is all any caller needs: a combo
+/// popup is open one at a time.
+#[derive(Debug, Default)]
+pub struct PaletteOfferCache {
+    held: Option<HeldOffers>,
+}
+
+#[derive(Debug)]
+struct HeldOffers {
+    family: ColorTableFamily,
+    installed: String,
+    user_generation: u64,
+    tables: Vec<color_tables::ColorTable>,
+    /// The base names this build *ships* in that family. Held beside the
+    /// offers because the offers list cannot be asked: a table an analyst
+    /// loaded from a file is appended to it and looks exactly like a preset
+    /// from the outside. It is what decides whether a picker row's edit
+    /// affordance opens the table or duplicates it, and recomputing it per
+    /// frame would re-parse the whole catalogue at the frame rate.
+    builtin: std::collections::BTreeSet<String>,
+}
+
+impl PaletteOfferCache {
+    /// The rows for this family, rebuilt only if the key moved.
+    pub fn offers(
+        &mut self,
+        family: ColorTableFamily,
+        installed: &color_tables::ColorTable,
+        user_tables: Option<&UserTableLibrary>,
+    ) -> &[color_tables::ColorTable] {
+        self.refresh(family, installed, user_tables);
+        self.held
+            .as_ref()
+            .map_or(&[][..], |held| held.tables.as_slice())
+    }
+
+    /// Whether `base_name` is a palette this build ships in the family the
+    /// held rows belong to - the question the colour table editor's Edit and
+    /// Copy affordances turn on.
+    ///
+    /// Answered from the same cache entry [`Self::offers`] handed out, so a
+    /// row and its affordance can never disagree about what that row is. A
+    /// cache that has not been filled yet answers `false`: nothing has been
+    /// offered, so nothing can be pressed.
+    pub fn is_builtin(&self, base_name: &str) -> bool {
+        self.held
+            .as_ref()
+            .is_some_and(|held| held.builtin.contains(base_name))
+    }
+
+    fn refresh(
+        &mut self,
+        family: ColorTableFamily,
+        installed: &color_tables::ColorTable,
+        user_tables: Option<&UserTableLibrary>,
+    ) {
+        let user_generation = user_tables.map_or(0, UserTableLibrary::generation);
+        if self.held.as_ref().is_none_or(|held| {
+            held.family != family
+                || held.installed != installed.name()
+                || held.user_generation != user_generation
+        }) {
+            self.held = Some(HeldOffers {
+                family,
+                installed: installed.name().to_owned(),
+                user_generation,
+                tables: palette_offers(family, installed, user_tables),
+                builtin: color_tables::builtin_tables_for_family(family)
+                    .iter()
+                    .map(|table| table.base_name().to_owned())
+                    .collect(),
+            });
+        }
+    }
+}
+
+/// What the analyst's own colour table folder holds, and what it could not
+/// read.
+///
+/// A palette that is in the folder and not in the picker is otherwise
+/// undiagnosable from inside the application: the file is there, the name is
+/// right, and nothing anywhere says which line the parser stopped on. This
+/// is that answer, in the one window an analyst already opens to look for
+/// colour tables.
+fn draw_user_tables_section(
+    ui: &mut egui::Ui,
+    library: &UserTableLibrary,
+    outcome: &mut SettingsOutcome,
+) {
+    ui.add_space(10.0);
+    ui.strong("Your colour tables");
+    ui.label(
+        egui::RichText::new(format!(
+            "Folder: {}. Drop a .pal file on the window to add one; \
+             GR2Analyst and RadarScope palettes are read as they are.",
+            library.directory().display()
+        ))
+        .small()
+        .weak(),
+    );
+    ui.add_space(2.0);
+    if library.tables().is_empty() {
+        ui.label(egui::RichText::new("No tables loaded from that folder.").small());
+    } else {
+        for entry in library.tables() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {} · {}",
+                    entry.display_name(),
+                    entry.family().label(),
+                    entry.file_name()
+                ))
+                .small(),
+            );
+        }
+    }
+    for fault in library.faults() {
+        // The one place in this window that is allowed to shout. A file the
+        // analyst put in the folder deliberately, that is being skipped
+        // everywhere else, has to be visible or the feature looks broken.
+        ui.label(
+            egui::RichText::new(match fault.line() {
+                Some(line) => format!(
+                    "Skipped {} - {} (line {line})",
+                    fault.file_name(),
+                    fault.reason()
+                ),
+                None => format!("Skipped {} - {}", fault.file_name(), fault.reason()),
+            })
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+    }
+    ui.add_space(4.0);
+    // The folder is normally re-read when the window regains focus, which
+    // covers editing a palette in another application. This is for the case
+    // that does not move focus at all - a file synced in, or an editor
+    // inside this same window saving one.
+    if ui.button("Rescan colour table folder").clicked() {
+        outcome.user_tables_rescan = true;
     }
 }
 
@@ -537,6 +801,112 @@ fn store_status_line(store: &SettingsStore) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch directory, unique per test, removed at the end.
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("settings-ui-scratch")
+            .join(format!(
+                "{test}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after 1970")
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Every text run a section drew, flattened - `Shape::Vec` nests.
+    ///
+    /// The section is drawn into a bare `Ui` rather than inside the settings
+    /// window, because the window's page scrolls: what an assertion about
+    /// scrolled-away rows would measure is the window's default height, not
+    /// whether the section says what it must.
+    fn section_texts(draw: impl FnOnce(&mut egui::Ui)) -> Vec<String> {
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let text = text.galley.text().trim();
+                    if !text.is_empty() {
+                        found.push(text.to_owned());
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let context = egui::Context::default();
+        let mut draw = Some(draw);
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1400.0, 1400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                if let Some(draw) = draw.take() {
+                    draw(ui);
+                }
+            },
+        );
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// The diagnosis a palette that will not load has to produce. Without
+    /// this the analyst sees a file in their folder, no row in the picker,
+    /// and nothing anywhere saying why - which is indistinguishable from the
+    /// feature being broken.
+    #[test]
+    fn a_folder_fault_is_reported_with_its_file_and_line() {
+        let dir = scratch_dir("fault-on-screen");
+        std::fs::write(
+            dir.join("Ramp Velocity.pal"),
+            "Product: BV\nColor: -30 0 200 0\nColor: 30 200 0 0\n",
+        )
+        .expect("write palette");
+        // Line 3 asks for a colour component of 900.
+        std::fs::write(
+            dir.join("wrong.pal"),
+            "Product: BR\nColor: 0 0 0 0\nColor: 10 900 0 0\n",
+        )
+        .expect("write palette");
+        let library = UserTableLibrary::open(&dir);
+
+        let mut outcome = SettingsOutcome::default();
+        let texts = section_texts(|ui| draw_user_tables_section(ui, &library, &mut outcome));
+        let joined = texts.join(" | ");
+
+        assert!(joined.contains("Your colour tables"), "{joined}");
+        assert!(
+            joined.contains("Ramp Velocity") && joined.contains("Velocity / SRV"),
+            "the loaded table and its family must be on the page: {joined}"
+        );
+        assert!(
+            joined.contains("wrong.pal") && joined.contains("line 3"),
+            "the skipped file and its line must be on the page: {joined}"
+        );
+        assert!(
+            joined.contains(&dir.display().to_string()),
+            "the folder path must be on the page: {joined}"
+        );
+        assert!(
+            !outcome.user_tables_rescan,
+            "nothing was clicked, so nothing may have been asked for"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn search_matches_labels_help_and_ids_case_insensitively() {
@@ -587,6 +957,64 @@ mod tests {
         assert_eq!(restored, ColorTableSet::default());
         // Already default: no spurious re-render.
         assert!(!restore_default_palettes(&mut store, &mut tables));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The picker contract, at the one function both pickers call: the
+    /// analyst's own tables are offered, after the built-ins, in the family
+    /// their header put them in.
+    #[test]
+    fn a_user_table_is_offered_in_its_family_after_the_built_ins() {
+        let dir = std::env::temp_dir().join(format!(
+            "settings-ui-user-offers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::write(
+            dir.join("Ramp Velocity.pal"),
+            "Product: BV\nUnits: KTS\nColor: -60 200 0 200 60 220 220\nColor: 60 220 60 60 \
+             255 255 255\n",
+        )
+        .expect("write palette");
+        let library = UserTableLibrary::open(&dir);
+        let tables = ColorTableSet::default();
+
+        let velocity = palette_offers(
+            ColorTableFamily::Velocity,
+            tables.for_family(ColorTableFamily::Velocity),
+            Some(&library),
+        );
+        let builtin_count =
+            color_tables::builtin_tables_for_family(ColorTableFamily::Velocity).len();
+        assert_eq!(velocity[builtin_count].base_name(), "Ramp Velocity");
+
+        // And nowhere else: a velocity palette offered under reflectivity
+        // would install silently and change nothing on screen.
+        assert!(
+            palette_offers(
+                ColorTableFamily::Reflectivity,
+                tables.for_family(ColorTableFamily::Reflectivity),
+                Some(&library),
+            )
+            .iter()
+            .all(|table| table.base_name() != "Ramp Velocity")
+        );
+
+        // With no folder at all the list is exactly what it always was.
+        assert_eq!(
+            palette_offers(
+                ColorTableFamily::Velocity,
+                tables.for_family(ColorTableFamily::Velocity),
+                None,
+            )
+            .len(),
+            builtin_count + 1,
+            "the built-in list plus its flip row"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

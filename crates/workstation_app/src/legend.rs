@@ -910,6 +910,7 @@ mod tests {
         ColorStop {
             value,
             color: Rgba8::opaque(200, 200, 200),
+            end_color: None,
         }
     }
 
@@ -917,6 +918,7 @@ mod tests {
         ColorStop {
             value,
             color: Rgba8::TRANSPARENT,
+            end_color: None,
         }
     }
 
@@ -979,14 +981,20 @@ mod tests {
         let layout = legend_layout(&domain, &builtin_table_for("REF"))
             .expect("reflectivity has a drawable legend");
 
+        // AWIPS Wilson fades in from -30 dBZ and turns fully opaque at -20;
+        // the bar starts where the paint is solid, not at -32.
+        //
+        // -20.01 until the parser learned to read GR two-colour ramp rows.
+        // The palette's -30 row declares its fade in one row, so the shipped
+        // text no longer carries a hand-expanded second stop parked 0.01 dBZ
+        // below the -20 row, and the first solid value is the declared one.
         assert_eq!(
             layout.span,
-            ValueRange::new(10.0, 92.5),
-            "the built-in reflectivity palette is transparent below 10 dBZ, so a bar drawn \
-             from -32 dBZ would advertise 42 dBZ that is never painted"
+            ValueRange::new(-20.0, 94.5),
+            "the bar must start at the palette's first opaque stop"
         );
         assert_eq!(layout.unit_label, "dBZ");
-        assert_eq!(labels(&layout), vec!["20", "40", "60", "80"]);
+        assert_eq!(labels(&layout), vec!["-20", "0", "20", "40", "60", "80"]);
     }
 
     #[test]
@@ -1121,6 +1129,38 @@ mod tests {
         let wrong_family = test_table(vec![opaque_stop(-32.0), opaque_stop(-10.0)]);
         assert_eq!(legend_span(&domain, &wrong_family), None);
         assert_eq!(legend_layout(&domain, &wrong_family), None);
+    }
+
+    /// The other half of the fix in `ColorTable::inked_value_span`: a `.pal`
+    /// whose only ink is a declared fade gets a bar, because it paints.
+    ///
+    /// The palette is two clear rows, the lower one declaring an opaque second
+    /// colour, and a `step: 5` row on top. It paints a thousand of the 2,501
+    /// values on a 0.01 grid from -5 to 20 - `sample(2.5)` is `[80,0,0,102]`
+    /// and `sample(7.5)` is `[160,0,0,204]` - and it used to report its ink as
+    /// the single value 12.5, the clear stop the fade arrives on and the one
+    /// value in the interval it does not paint. That went straight through
+    /// `legend_span`'s zero-width guard, so the pane drew a palette an analyst
+    /// could see with no bar to read it by.
+    #[test]
+    fn a_palette_whose_only_ink_is_a_declared_fade_gets_a_legend() {
+        let domain = builtin_domain("REF");
+        let fading = ColorTable::parse(
+            "fade only",
+            "product: BR\nstep: 5\ncolor4: 0 0 0 0 0 200 0 0 255\ncolor4: 12.5 0 0 0 0\n",
+        )
+        .expect("palette parses");
+        assert_eq!(fading.sample(2.5).to_array(), [80, 0, 0, 102]);
+        assert_eq!(fading.inked_value_span(), Some((0.0, 12.5)));
+
+        let span = legend_span(&domain, &fading).expect("the palette paints, so it gets a bar");
+        assert_eq!((span.min, span.max), (0.0, 12.5));
+        let layout = legend_layout(&domain, &fading).expect("and a ladder to read it by");
+        assert!(
+            layout.ticks.len() >= MIN_LEGEND_TICKS,
+            "a bar over 12.5 dBZ should carry a readable ladder, got {:?}",
+            labels(&layout)
+        );
     }
 
     #[test]
