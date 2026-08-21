@@ -67,11 +67,12 @@ pub struct RenderRequest {
 ///
 /// One constant rather than two literals because two indicators quote it: the
 /// engine's [`GateFilterReport::badge`], via
-/// [`GateFilterReport::not_applicable`] in [`render_derived`], and the pane's
-/// own band, via `crate::gate_filter_ui::pane_banner_text_for`. A pane that
-/// described its own state differently from the report it was handed would be
-/// the exact failure the gate filter's safety rule is written against, and a
-/// shared constant makes the two unable to drift.
+/// [`GateFilterReport::not_applicable`] in [`render_derived`], and the pane
+/// header's own statement for the frames before that report arrives, via
+/// `crate::gate_filter_ui::pane_status_line`. A pane that described its own
+/// state differently from the report it was handed would be the exact failure
+/// the gate filter's safety rule is written against, and a shared constant
+/// makes the two unable to drift.
 pub const DERIVED_PRODUCT_NOT_FILTERED: &str =
     "this product is integrated from the whole volume, not rastered from one sweep";
 
@@ -221,6 +222,11 @@ fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderFailure>
         radar_y_px: raster_view.radar_y_px,
         km_per_px_x: raster_view.km_per_px,
         km_per_px_y: raster_view.km_per_px,
+        // `radar_raster_view` has always computed this and this call site has
+        // always dropped it, which made "everything on the pane rotates
+        // together" false: the basemap would have turned and the echo would
+        // not. Nothing depended on that while every stored rotation was zero.
+        rotation_rad: raster_view.rotation_rad,
     };
     let mut rgba = vec![0_u8; viewport_rgba_buffer_len(options)];
 
@@ -320,6 +326,8 @@ fn render_derived(
         radar_y_px: raster_view.radar_y_px,
         km_per_px_x: raster_view.km_per_px,
         km_per_px_y: raster_view.km_per_px,
+        // Same omission as the polar path above, same fix.
+        rotation_rad: raster_view.rotation_rad,
     };
 
     let field = compute_volume_field(

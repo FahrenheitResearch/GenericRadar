@@ -1431,8 +1431,34 @@ mod real_data_tests {
         PathBuf::from("level2-live")
     }
 
-    /// Every cached archive file, sorted so runs are reproducible.
+    /// One Archive II file named by `NEXRAD_LEVEL2_SAMPLE` -- the workspace's
+    /// existing convention for pointing a test at real data, used the same way
+    /// by `nexrad_io`, `load_service` and `product_picker`.
+    fn pinned_sample() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os("NEXRAD_LEVEL2_SAMPLE")?);
+        assert!(
+            path.is_file(),
+            "NEXRAD_LEVEL2_SAMPLE names {}, which is not a file",
+            path.display()
+        );
+        Some(path)
+    }
+
+    /// The volumes these tests run on, most deterministic source first: the
+    /// pinned `NEXRAD_LEVEL2_SAMPLE`, else every archive file in
+    /// `level2_cache_dir()`, sorted.
+    ///
+    /// The default source is the LIVE cache the running app fills, so which
+    /// volumes are there is a record of which radars were last looked at, and
+    /// it changes while the app runs. No test below may therefore FAIL because
+    /// of what it found: each states its precondition, and when the volumes on
+    /// hand do not meet it, says out loud that it skipped. Pin
+    /// `NEXRAD_LEVEL2_SAMPLE` at one volume to make a run repeatable, which is
+    /// what a gate needs.
     fn cached_volumes() -> Vec<PathBuf> {
+        if let Some(path) = pinned_sample() {
+            return vec![path];
+        }
         let dir = level2_cache_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
@@ -1492,6 +1518,38 @@ mod real_data_tests {
             (native_row + 1) % rows
         };
         (row, out_gate / factors.range)
+    }
+
+    /// The four native cells the interpolator blends for one output cell, as
+    /// (rows, gates) pairs. Mirrors `RowPlan`/`GatePlan`, which are locals of
+    /// `upsample_moment_grid` and cannot be borrowed from a test: the beam
+    /// below the sub-row and the beam above it (the same beam when the sub-row
+    /// IS a native beam, where the plan sets lo == hi), crossed with the native
+    /// gates either side of the sub-gate center, clamped at both ends of the
+    /// ray.
+    fn parent_cells(
+        out_row: usize,
+        out_gate: usize,
+        rows: usize,
+        gates: usize,
+        factors: UpsampleFactors,
+    ) -> ([usize; 2], [usize; 2]) {
+        let native_row = out_row / factors.azimuth;
+        let row_hi = if out_row.is_multiple_of(factors.azimuth) {
+            native_row
+        } else {
+            (native_row + 1) % rows
+        };
+        let x = (out_gate as f32 + 0.5) / factors.range as f32 - 0.5;
+        let gate_pair = if x <= 0.0 {
+            [0, 0]
+        } else if x >= (gates - 1) as f32 {
+            [gates - 1, gates - 1]
+        } else {
+            let lo = x.floor() as usize;
+            [lo, lo + 1]
+        };
+        ([native_row, row_hi], gate_pair)
     }
 
     fn nominal_azimuth_deg(cut: &ElevationCut, grid: &MomentGrid) -> f32 {
@@ -1719,6 +1777,18 @@ mod real_data_tests {
     /// four bilinear parents span more than the 30 m/s guard the sub-cell
     /// must keep its containing native cell's value -- an unguarded blend
     /// would fabricate intermediate speeds inside the fold.
+    ///
+    /// The precondition is a FOUR-PARENT fold window: a sub-cell whose whole
+    /// 2x2 parent window carries data and spans the guard, in which the
+    /// unguarded control does fabricate a value. Folded neighbouring gates in
+    /// the native grid are NOT that precondition, and asserting on them was
+    /// wrong: where a fold sits at the edge of an echo one of the four parents
+    /// is missing, and the interpolator's echo-edge rule holds the sub-cell at
+    /// its nearest parent before the guard is ever consulted. The output is
+    /// right; the guard simply was not what made it right. KAKQ 2026-08-20
+    /// 18:22 UTC 12.36 deg is exactly that sweep -- both of its folded gate
+    /// pairs sit in one radial with no echo on the beams either side, so the
+    /// guard could not fire and did not need to.
     #[test]
     fn real_velocity_fold_is_never_blended_through() {
         let volumes = cached_volumes();
@@ -1726,6 +1796,7 @@ mod real_data_tests {
             eprintln!("no cached Level II volumes; skipping");
             return;
         }
+        let mut fabricated_total = 0usize;
         let mut examined = 0;
         for path in volumes.iter().take(4) {
             let volume = decode(path);
@@ -1751,9 +1822,10 @@ mod real_data_tests {
                     // arithmetic below does not apply to this sweep.
                     continue;
                 }
-                // Count real fold-scale jumps between adjacent native
-                // gates along range -- proof the file contains what the
-                // guard exists for.
+                // A cheap screen, not the precondition: adjacent native
+                // gates along range that straddle a fold. A sweep with none
+                // cannot hold a four-parent fold window either, and skipping
+                // it here saves the cell-for-cell pass below.
                 let gates = grid.gate_range.gate_count;
                 let mut fold_pairs = 0usize;
                 for row in 0..rows {
@@ -1772,18 +1844,67 @@ mod real_data_tests {
                 if fold_pairs == 0 {
                     continue;
                 }
-                // Compare against the same field interpolated with no
-                // guard (moment relabeled): the guard must actually change
-                // the picture, and every changed cell must land exactly on
-                // its containing native cell's value.
+                // The same field interpolated with no guard (moment
+                // relabeled) is the control: it shows what a blend would
+                // have painted where the guard fired.
                 let mut unguarded = grid.clone();
                 unguarded.moment = MomentType::Unknown("TEST".to_owned());
                 let plain = upsample_moment_grid(cut, &unguarded).expect("same geometry upsamples");
+                let mut fold_windows = 0usize;
+                let mut fabricated = 0usize;
                 let mut guarded_cells = 0usize;
                 for out_row in 0..up.grid.radial_count() {
                     for out_gate in 0..up.grid.gate_range.gate_count {
                         let guarded = up.grid.scaled_value(out_row, out_gate).unwrap();
                         let linear = plain.grid.scaled_value(out_row, out_gate).unwrap();
+                        let (native_row, native_gate) =
+                            containing_native_cell(out_row, out_gate, rows, factors);
+                        // NaN where the containing gate carries no echo; both
+                        // uses below are reached only where it does, and the
+                        // containing cell is always one of the four parents.
+                        let native = grid
+                            .scaled_value(native_row, native_gate)
+                            .unwrap_or(f32::NAN);
+
+                        // The guard's contract, measured against the native
+                        // field rather than against the guard's own output:
+                        // a sub-cell whose whole parent window carries data
+                        // and spans the guard IS its containing gate.
+                        let (parent_rows, parent_gates) =
+                            parent_cells(out_row, out_gate, rows, gates, factors);
+                        let mut lowest = f32::INFINITY;
+                        let mut highest = f32::NEG_INFINITY;
+                        let mut complete = true;
+                        for parent_row in parent_rows {
+                            for parent_gate in parent_gates {
+                                match grid.scaled_value(parent_row, parent_gate) {
+                                    Some(value) if value.is_finite() => {
+                                        lowest = lowest.min(value);
+                                        highest = highest.max(value);
+                                    }
+                                    _ => complete = false,
+                                }
+                            }
+                        }
+                        if complete && highest - lowest > VELOCITY_GUARD_SPREAD_MPS {
+                            fold_windows += 1;
+                            assert!(
+                                (guarded - native).abs() <= 1e-4,
+                                "{} {:.2} deg VEL row {out_row} gate {out_gate}: the four \
+                                 parents span {:.1} m/s and the sub-cell is {guarded}, not \
+                                 its containing gate {native}",
+                                volume.site.id,
+                                cut.elevation_deg,
+                                highest - lowest
+                            );
+                            if (linear - native).abs() > 1e-4 {
+                                // Without the guard this cell carries a
+                                // speed no beam measured: this is a window
+                                // where the guard is what saved the picture.
+                                fabricated += 1;
+                            }
+                        }
+
                         if !guarded.is_finite() {
                             assert!(!linear.is_finite(), "guard changed coverage");
                             continue;
@@ -1791,10 +1912,10 @@ mod real_data_tests {
                         if (guarded - linear).abs() <= 1e-4 {
                             continue;
                         }
+                        // Wherever the guard moved a cell off the blend, it
+                        // moved it onto the containing native value -- never
+                        // onto some third number.
                         guarded_cells += 1;
-                        let (native_row, native_gate) =
-                            containing_native_cell(out_row, out_gate, rows, factors);
-                        let native = grid.scaled_value(native_row, native_gate).unwrap();
                         assert!(
                             (guarded - native).abs() <= 1e-4,
                             "{} {:.2} deg VEL row {out_row} gate {out_gate}: guarded {guarded} \
@@ -1806,24 +1927,33 @@ mod real_data_tests {
                 }
                 println!(
                     "{} {:.2} deg VEL: {fold_pairs} native fold-scale gate pairs, \
-                     {guarded_cells} sub-cells held at their native value by the 30 m/s guard",
+                     {fold_windows} four-parent fold windows ({fabricated} the unguarded \
+                     control fabricated a speed inside), {guarded_cells} sub-cells held at \
+                     their native value by the 30 m/s guard",
                     volume.site.id, cut.elevation_deg
                 );
-                assert!(
-                    guarded_cells > 0,
-                    "{} {:.2} deg VEL: folds present but the guard never fired",
-                    volume.site.id,
-                    cut.elevation_deg
-                );
+                fabricated_total += fabricated;
                 examined += 1;
             }
-            if examined > 0 {
+            if fabricated_total > 0 {
                 break;
             }
         }
-        assert!(
-            examined > 0,
-            "no cached volume offered a foldable velocity sweep to check"
+        if fabricated_total == 0 {
+            // Every sweep still had its contract checked above; there was
+            // just no window in which the guard was the difference, so this
+            // run proves nothing about the guard and says so.
+            eprintln!(
+                "{examined} real velocity sweeps carried no fold window with all four parents \
+                 present, so an unguarded blend would have fabricated nothing and the guard had \
+                 nothing to do; skipping. Point NEXRAD_LEVEL2_SAMPLE at a volume with folded \
+                 velocity to gate on this."
+            );
+            return;
+        }
+        println!(
+            "{fabricated_total} sub-cells across {examined} real velocity sweeps would carry a \
+             fabricated speed without the 30 m/s guard; every one of them is its native gate"
         );
     }
 
@@ -1971,10 +2101,13 @@ mod real_data_tests {
                 break;
             }
         }
-        assert!(
-            examined > 0,
-            "no cached volume offered a rho_hv sweep with a sub-floor population"
-        );
+        if examined == 0 {
+            eprintln!(
+                "no cached volume offered a rho_hv sweep with a sub-floor population -- clear \
+                 air is a real state of the cache, not a fault in this crate; skipping. Point \
+                 NEXRAD_LEVEL2_SAMPLE at a volume with a melting layer to gate on this."
+            );
+        }
     }
 
     /// The no-growth contract checked CELL FOR CELL on real sweeps, not in
@@ -2362,10 +2495,13 @@ mod real_data_tests {
                 break;
             }
         }
-        assert!(
-            examined > 0,
-            "no cached volume offered a foldable velocity sweep to measure"
-        );
+        if examined == 0 {
+            eprintln!(
+                "no cached volume offered a foldable velocity sweep to measure -- nothing folded \
+                 anywhere is a real state of the cache; skipping. Point NEXRAD_LEVEL2_SAMPLE at a \
+                 volume with folded velocity to gate on this."
+            );
+        }
     }
 
     /// Softening on real data must stay inside the measurements: every

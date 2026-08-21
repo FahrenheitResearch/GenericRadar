@@ -1762,7 +1762,14 @@ mod tests {
     #[test]
     fn the_default_cache_directory_is_under_a_platform_cache_root() {
         let Some(directory) = default_cache_dir() else {
-            return; // A bare environment with no HOME; the caller must choose.
+            // A bare environment with no HOME; the caller must choose. Said
+            // out loud: a skip nobody can see is indistinguishable from a
+            // check that ran.
+            println!(
+                "SKIPPED the_default_cache_directory_is_under_a_platform_cache_root: this \
+                 environment names no cache root, so there is no default to check"
+            );
+            return;
         };
         assert!(directory.ends_with("radar-workstation/basemap-tiles"));
         assert!(directory.is_absolute(), "{directory:?}");

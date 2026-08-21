@@ -1,20 +1,14 @@
 //! Compile-and-test harness for the workstation's settings window.
 //!
-//! `workstation_app/src/settings_ui.rs` is a new module whose `mod` wiring
-//! into the binary is human-owned (`main.rs` is outside this workflow's
-//! files). An unreferenced source file is not compiled at all, and shipping
-//! an unverified UI module would be worthless - so until the wiring lands,
-//! this integration test includes the real file by path and compiles it,
-//! with all of its `#[cfg(test)]` modules, against the same crates the
-//! workstation links. The module deliberately references nothing from the
-//! `workstation_app` crate itself (only `settings`, `eframe`,
-//! `color_tables`, `map_scene`, `analyst_runtime`, `render2d`,
-//! `radar_core`), which is what makes this include valid in both homes.
-//!
-//! Once `mod settings_ui;` lands in `workstation_app/src/main.rs`, this
-//! harness becomes a duplicate compile of the same source and SHOULD BE
-//! DELETED together with the dev-dependencies it needs - the integration
-//! notes say so too.
+//! `workstation_app/src/settings_ui.rs` is linked into the binary by
+//! `mod settings_ui;` in `workstation_app/src/main.rs`. This integration test
+//! includes that same file by path and compiles it a second time, with all of
+//! its `#[cfg(test)]` modules, against the `settings` crate's own public API.
+//! The module deliberately references nothing from the `workstation_app`
+//! crate itself (only `settings`, `eframe`, `color_tables`, `map_scene`,
+//! `analyst_runtime`, `render2d`, `radar_core`), which is what makes the
+//! include valid in both homes and what this harness pins: a settings-window
+//! change that reaches back into the application would fail here first.
 //!
 //! `dead_code` is allowed on the include because the harness exercises the
 //! module's tests, not every public item; in its real home the application

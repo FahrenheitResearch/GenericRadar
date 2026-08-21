@@ -62,6 +62,7 @@ mod source {
     pub mod load_service;
     pub mod nearest_site;
     pub mod net_tuning;
+    pub mod north_up;
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
@@ -88,9 +89,9 @@ mod source {
 #[allow(unused_imports)]
 pub(crate) use source::{
     annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, palette_editor, palettes, pane_canvas, popup, probe, product,
-    product_availability, product_picker, render_service, settings_ui, sites_service, sweep, theme,
-    units, user_tables, vol3d, vrot, warnings_service, xsection,
+    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
+    product, product_availability, product_picker, render_service, settings_ui, sites_service,
+    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};

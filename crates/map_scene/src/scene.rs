@@ -11,7 +11,7 @@ use std::thread;
 
 use analyst_runtime::{
     Camera2D, Generation, GenerationClock, GeometryCacheKey, LatestLaneSender, LodBucket,
-    LodSelector, MAX_PANES, ViewportMetrics, latest_lane_channel,
+    LodSelector, MAX_PANES, SubmitOutcome, ViewportMetrics, latest_lane_channel,
 };
 use basemap_tiles::TileProvider;
 
@@ -236,8 +236,22 @@ impl MapSceneController {
             projection,
             style: self.style,
         };
-        if self.requests.submit(key.lod.0, request).is_err() {
-            return false;
+        // The lane is the LOD bucket, and `LatestLaneSender` REPLACES a
+        // pending request on the same lane rather than queueing behind it.
+        // Discarding the outcome left the replaced key in `self.pending` for
+        // ever, and `request` refuses to resubmit anything that is pending -
+        // so that bucket could become permanently unbuildable, showing up as
+        // "the map stopped updating at one zoom level" with nothing in the
+        // logs. Nothing in the shipped application reaches it today, because
+        // one projection and one style mean a second request for the same LOD
+        // carries the same key and is refused a line earlier. It is one line
+        // to make that an accident we do not depend on.
+        match self.requests.submit(key.lod.0, request) {
+            Ok(SubmitOutcome::Enqueued) => {}
+            Ok(SubmitOutcome::Replaced(replaced)) => {
+                self.pending.remove(&replaced.key);
+            }
+            Err(_) => return false,
         }
         self.pending.insert(key);
         self.metrics.build_requests += 1;
@@ -621,6 +635,55 @@ mod tests {
         assert_eq!(controller.metrics().stale_results, 1);
         assert!(controller.geometry(&stale).is_none());
         assert_eq!(controller.metrics().geometry_builds, 0);
+    }
+
+    /// A build request that another request REPLACED must not be left marked
+    /// as pending, or that LOD can never be asked for again.
+    ///
+    /// The build lane is the LOD bucket and `LatestLaneSender` replaces rather
+    /// than queues, so several requests for the same bucket in one frame leave
+    /// at most one in the queue. Every other one is handed back to the caller
+    /// as `SubmitOutcome::Replaced` and produces no result - so nothing ever
+    /// arrives to clear it from `pending`, and `request` refuses any key that
+    /// is pending. The symptom would be a zoom level that quietly stops
+    /// updating.
+    #[test]
+    fn a_replaced_build_request_is_not_left_pending_for_ever() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.3333, -97.2778);
+        let base = controller.key_for_pane(0, 0.35).expect("key");
+        // Same LOD - therefore the same lane - and distinct keys, so each is
+        // accepted and each replaces the last one still queued.
+        let keys: Vec<GeometryCacheKey> = (1..=20)
+            .map(|generation| GeometryCacheKey {
+                style: Generation::new(generation),
+                ..base
+            })
+            .collect();
+        for key in &keys {
+            assert!(controller.request(*key), "{key:?} should be accepted");
+        }
+        // Drain until the worker has nothing left to say.
+        for _ in 0..200 {
+            controller.poll();
+            if controller.pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            controller.pending.is_empty(),
+            "{} keys were left pending with no build in flight",
+            controller.pending.len()
+        );
+        // And the strongest form of the same claim: every one of them can be
+        // asked for again, which is what a pane does on the next frame.
+        for key in &keys {
+            assert!(
+                controller.geometry(key).is_some() || controller.request(*key),
+                "{key:?} became unbuildable"
+            );
+        }
     }
 
     fn settle_request(controller: &mut MapSceneController, key: GeometryCacheKey) {

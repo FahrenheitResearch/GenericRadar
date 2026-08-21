@@ -1580,7 +1580,7 @@ mod tests {
     /// air, and about 16 MB of transfer. Run it with:
     ///
     /// ```text
-    /// cargo test --release -p workstation_app --bin radar-workstation -- \
+    /// cargo test --release -p workstation_app --bin GenericRadar -- \
     ///     --ignored --nocapture the_backfilled_volume_has_the_tilts_the_live_one_lacks
     /// ```
     ///

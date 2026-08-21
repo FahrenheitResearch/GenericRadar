@@ -1648,9 +1648,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Adversarial pass. Everything below drives the real registry, the real
-    // palettes and real `egui` font metrics, and several of these tests fail
-    // against the version of this file they were written for.
+    // Everything below drives the real registry, the real palettes and real
+    // `egui` font metrics rather than stand-ins, because the failures this
+    // section exists to catch are ones only real metrics produce.
     // ---------------------------------------------------------------------
 
     /// A column is worth exactly what is in it, for all seventeen products,

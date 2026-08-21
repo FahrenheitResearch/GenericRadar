@@ -12,6 +12,7 @@ mod live_service;
 mod load_service;
 mod nearest_site;
 mod net_tuning;
+mod north_up;
 mod palette_editor;
 mod palettes;
 mod pane_canvas;

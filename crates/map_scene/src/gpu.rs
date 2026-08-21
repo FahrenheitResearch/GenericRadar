@@ -268,10 +268,32 @@ impl MapPaintCallback {
         let cx = camera.center_east_km as f32;
         let cy = camera.center_north_km as f32;
 
-        // Column-major for WGSL: columns are the images of the basis vectors.
+        // Column-major for WGSL: columns are the images of the basis vectors,
+        // so `m<row><col>` below is packed transposed into the array literal.
+        //
+        // ROW 0 carries `sx` and ROW 1 carries `sy`, because the scale that
+        // normalises a clip coordinate belongs to the axis it is normalised
+        // along, not to the world axis it came from. Writing it the other way
+        // round put `sx` on the north term and `sy` on the east term, which is
+        // invisible on a square pane and wrong on every other one, AND it
+        // rotated the opposite way to [`Camera2D::world_to_screen`]: that
+        // function sends a world bearing `b` to screen bearing `b + rotation`,
+        // and the transposed form sent it to `b - rotation`. Every egui-drawn
+        // overlay - labels, hazards, site markers, the radar quad, range
+        // rings, the cursor readout and tile visibility - goes through
+        // `world_to_screen`, so the CPU path is the authority and this matrix
+        // is the thing that has to match it. It does, and
+        // `the_gpu_camera_is_the_same_transform_the_cpu_overlays_use` is the
+        // test that says so.
+        //
+        // At zero rotation the two forms differ only by the SIGN OF ZERO on
+        // the two off-diagonal terms, which is why nothing on screen has ever
+        // shown this: `x + (-0.0) == x + 0.0` for every finite x, so the
+        // shipped picture is bit-identical either way. The bug only had teeth
+        // once something set `rotation_rad`.
         let m00 = cos * sx;
-        let m10 = sin * sx;
-        let m01 = -sin * sy;
+        let m01 = sin * sx;
+        let m10 = -sin * sy;
         let m11 = cos * sy;
         let tx = -(m00 * cx + m01 * cy);
         let ty = -(m10 * cx + m11 * cy);
@@ -350,7 +372,7 @@ impl CallbackTrait for MapPaintCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use analyst_runtime::{Generation, LodBucket};
+    use analyst_runtime::{Generation, LodBucket, ScreenPoint, WorldPoint};
 
     use crate::geometry::GeometryStats;
 
@@ -470,5 +492,81 @@ mod tests {
         let east = project(&uniform, [10.0, 0.0]);
         assert!(east[0].abs() < 1e-5, "east kept an x component: {east:?}");
         assert!(east[1].abs() > 0.0);
+    }
+
+    /// The claim the whole picture rests on: the GPU layers and the egui
+    /// overlays are ONE camera.
+    ///
+    /// Everything the analyst measures with is drawn on the CPU through
+    /// [`Camera2D::world_to_screen`] - the labels, the warning polygons, the
+    /// site markers, the radar raster quad, the range rings, the cursor
+    /// readout, the section line and the tile visibility walk - while the
+    /// vector basemap and the imagery are drawn by this matrix. So the CPU
+    /// path is the authority and the matrix is the thing that has to match it,
+    /// at every rotation and on a pane that is not square.
+    ///
+    /// This is the test that was missing.
+    /// `the_tile_camera_matches_the_vector_map_camera_exactly` pins the two
+    /// GPU layers to EACH OTHER, so a transform wrong in both was wrong in
+    /// agreement and nothing complained; every other test here runs at zero
+    /// rotation, where the error is the sign of a zero.
+    #[test]
+    fn the_gpu_camera_is_the_same_transform_the_cpu_overlays_use() {
+        for (width_points, height_points) in [(800.0_f32, 800.0_f32), (1600.0, 900.0)] {
+            for rotation_rad in [0.0_f32, 0.3, std::f32::consts::FRAC_PI_2, -0.8, 3.0] {
+                for (center_east_km, center_north_km) in [(0.0_f64, 0.0_f64), (31.0, -12.5)] {
+                    let camera = Camera2D {
+                        center_east_km,
+                        center_north_km,
+                        km_per_point: 0.42,
+                        rotation_rad,
+                    };
+                    let viewport = ViewportMetrics {
+                        width_points,
+                        height_points,
+                        pixels_per_point: 1.0,
+                    };
+                    let uniform = MapPaintCallback {
+                        pane_index: 0,
+                        geometry: geometry(),
+                        camera,
+                        viewport,
+                        rect_px: [0.0, 0.0, width_points, height_points],
+                    }
+                    .uniform();
+                    for world in [
+                        [0.0_f32, 0.0_f32],
+                        [100.0, 0.0],
+                        [0.0, 100.0],
+                        [-73.5, 41.25],
+                        [220.0, -160.0],
+                    ] {
+                        let clip = project(&uniform, world);
+                        // Clip back to pane points. The cube spans 2 units
+                        // across the pane and clip y grows UP while screen y
+                        // grows down, which is the only asymmetry here.
+                        let from_gpu = ScreenPoint::new(
+                            (1.0 + clip[0]) * 0.5 * width_points,
+                            (1.0 - clip[1]) * 0.5 * height_points,
+                        );
+                        let from_cpu = camera.world_to_screen(
+                            WorldPoint::new(f64::from(world[0]), f64::from(world[1])),
+                            viewport,
+                        );
+                        let dx = from_gpu.x - from_cpu.x;
+                        let dy = from_gpu.y - from_cpu.y;
+                        assert!(
+                            dx.abs() < 1e-3 && dy.abs() < 1e-3,
+                            "{width_points}x{height_points} pane at {rotation_rad} rad, world \
+                             {world:?}: GPU put it at ({}, {}) and world_to_screen at ({}, {})",
+                            from_gpu.x,
+                            from_gpu.y,
+                            from_cpu.x,
+                            from_cpu.y
+                        );
+                    }
+                }
+            }
+        }
     }
 }

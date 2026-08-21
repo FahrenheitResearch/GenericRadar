@@ -243,7 +243,7 @@ struct ProfileSample {
     v: f32,
 }
 
-/// Interpolation policy per moment family (docs/xsection-3d-spec.md):
+/// Interpolation policy per moment family:
 /// reflectivity/ZDR blend linearly; CC must not blend through the melting
 /// layer (Giangrande, Krause & Ryzhkov 2008: the rho_hv minimum is the
 /// signature — blending fabricates intermediate values), so any bracket
@@ -598,8 +598,8 @@ pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
 /// are roughly 3200 m / 6400 m).
 /// MESH calibration: which SHI->size fit to apply.
 ///
-/// References (constants adversarially verified against the corrigendum and
-/// the pyhail reference implementation — see docs/hail-wind-algo-spec.md):
+/// References (constants checked against the published corrigendum and the
+/// pyhail reference implementation):
 /// - Witt et al. 1998, Wea. Forecasting 13, 286-303
 ///   (doi:10.1175/1520-0434(1998)013<0286:AEHDAF>2.0.CO;2): MESH = 2.54*SHI^0.5.
 ///   Still what operational MRMS ships (Smith et al. 2016, BAMS 97).

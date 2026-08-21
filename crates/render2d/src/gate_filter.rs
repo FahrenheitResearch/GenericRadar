@@ -196,7 +196,7 @@ impl GateFilter {
     /// `REF below 5 dBZ, RhoHV below 0.80`.
     ///
     /// Empty when [`GateFilter::is_active`] is false. This is the text every
-    /// indicator in the application is built from - the pane band, the
+    /// indicator in the application is built from - the pane header, the
     /// toolbar chip's hover, the control panel's own live line, and the
     /// engine's [`GateFilterReport::badge`] - so it names moments the way the
     /// product picker does and never abbreviates past recognition.
@@ -215,14 +215,14 @@ impl GateFilter {
     /// `Hide REF below 20.0 dBZ`.
     ///
     /// So there is ONE phrase table and it is written from the hidden side,
-    /// rather than a second inverse-phrased builder for the band. Two tables
+    /// rather than a second inverse-phrased builder for the pane. Two tables
     /// describing five criteria from opposite sides is the same drift that
     /// produced the bug, with twice the surface to drift on: with one table
     /// any caller may put any verb of hiding in front of this and be telling
     /// the truth, and a caller that wants the keep side has to say so in its
     /// own words rather than getting it by accident. The phrases are
     /// deliberately the ones the control panel already prints on its own
-    /// sliders, so the band and the control that set it read as one sentence.
+    /// sliders, so the pane and the control that set it read as one sentence.
     ///
     /// `hidden_summary` in the name, not `summary`: the sense is the thing a
     /// future edit must not quietly flip, so it is stated at every call site.

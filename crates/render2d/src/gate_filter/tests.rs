@@ -172,7 +172,7 @@ fn a_threshold_that_cannot_hide_anything_is_not_active() {
 ///
 /// The expected strings are written as an analyst would say them out loud
 /// after the fact - "it hid REF below 5 dBZ" - because that is the sentence
-/// the pane band puts a verb in front of. Writing them any other way is how
+/// the pane header puts a verb in front of. Writing them any other way is how
 /// the inversion got in: the phrases used to be `REF > 5 dBZ`, which is a
 /// true description of what SURVIVED and a false one of what went, and no
 /// test could tell the difference because no test said which side it meant.
@@ -1367,7 +1367,7 @@ fn an_out_of_range_correlation_threshold_censors_as_the_clamped_one() {
 /// zero - all used to answer `GateFilterReport::INACTIVE`, whose filter is
 /// `GateFilter::OFF`. So `is_inactive()` was true, `badge()` was `None`, and
 /// the pane header dropped its filter line for that frame while the chip, the
-/// band and the legend badge all still said FILTERED.
+/// header and the legend badge all still said FILTERED.
 ///
 /// An empty pane is exactly when this matters. The analyst is looking at
 /// nothing, and "nothing" has two explanations - clear sky, or a censor that

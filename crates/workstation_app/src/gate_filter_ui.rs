@@ -30,19 +30,44 @@
 //! # The safety rule
 //!
 //! A filter must never quietly remove weather. Three things say so, and they
-//! are deliberately redundant because the pane's furniture is configurable and
-//! the toolbar's is not:
+//! are deliberately redundant because one of them is configurable and the
+//! other two are not:
 //!
 //! * the toolbar chip latches - sunken and tinted - whenever any criterion is
-//!   on, and names the preset;
-//! * every pane draws [`pane_banner_text`] under its header, in the theme's
-//!   error ink on its own opaque band, whether or not the colour legend is
-//!   switched on. Clicking that band clears every criterion, which is the one
-//!   obvious action out;
-//! * the legend badge stack carries [`pane_badge_text`] as well, directly
-//!   under the stall badge.
+//!   on, and names the preset. Beside it, and only while something is being
+//!   hidden, sits the clear key: one click on it is [`FilterValues::OFF`], and
+//!   its hover text names the gates it will bring back. That is the one
+//!   obvious action out, and it is on the one bar no setting can remove;
+//! * every pane's HEADER carries a filter statement for as long as any
+//!   criterion is on. When the engine has answered for the frame on screen the
+//!   header quotes the engine's own line, counts and all
+//!   (`GateFilterReport::badge`); until then - a render in flight, a product
+//!   that failed, a pane with no frame yet - it carries [`pane_status_line`],
+//!   which is that same line without the counts nobody has yet. The header is
+//!   drawn unconditionally by `crate::pane_canvas`: it is not the colour
+//!   legend and there is no setting that switches it off;
+//! * the legend badge stack carries [`pane_badge_text`], directly under the
+//!   stall badge, for the eye that is already reading the colour ladder.
 //!
 //! None of the three infers anything from the absence of echo.
+//!
+//! # Why there is no pane band
+//!
+//! There used to be a fourth, and it was the loudest: a full-width bar in deep
+//! red across the top of every filtered pane, carrying the whole sentence and
+//! clearing every criterion when it was clicked. It is gone. A band that size
+//! spends the pane's most valuable strip on a state the analyst set
+//! deliberately and can already see, and a red one reads as an alarm about
+//! the weather rather than a note about the view.
+//!
+//! That is a reduction in LOUDNESS and it was not allowed to become a
+//! reduction in HONESTY, so two things moved rather than disappearing. The
+//! statement moved to the pane header, which is the only piece of pane
+//! furniture that is always drawn - the band had been unconditional precisely
+//! because the legend can be switched off, and the header inherits that
+//! property intact. The one obvious action out moved to the toolbar, beside
+//! the chip that turned the filter on, which is where an analyst looks for the
+//! control they used.
 
 use eframe::egui;
 use render2d::GateFilter;
@@ -279,13 +304,13 @@ pub fn chip_text(values: FilterValues) -> String {
 }
 
 /// The chip's hover text. Hover is a bonus here, never the only affordance -
-/// the pane banner carries the same facts where there is no pointer.
+/// the pane header carries the same facts where there is no pointer.
 pub fn chip_hover(values: FilterValues) -> String {
     let filter = values.to_filter();
     if filter.is_active() {
         format!(
-            "Gates are being hidden: {}. Every pane says so, and clicking a pane's \
-             FILTERED band shows everything again.",
+            "Gates are being hidden: {}. Every pane's header says so, and the {CLEAR_GLYPH} \
+             beside this chip shows everything again.",
             filter.hidden_summary()
         )
     } else {
@@ -295,26 +320,32 @@ pub fn chip_hover(values: FilterValues) -> String {
     }
 }
 
-/// The band every pane draws under its header while filtering is on.
+/// The glyph on the clear key that sits beside the chip while a filter is on.
 ///
-/// It names the criteria rather than summarising them as "filtered", because
-/// "filtered" alone does not tell an analyst whether the missing echo was
-/// weak, decorrelated, folded or close in.
+/// U+00D7, the same character `palette_editor` already puts on its remove key,
+/// rather than one of the heavy ballot crosses: it is in the base font at
+/// every size this bar is drawn at, and a clear key that renders as a missing
+/// glyph is not an escape an analyst can find.
+pub const CLEAR_GLYPH: &str = "×";
+
+/// The clear key's hover text: what one click on it brings back, in the words
+/// every other indicator uses.
 ///
-/// The verb here is `hiding` and the phrase after it comes from
-/// [`GateFilter::hidden_summary`], which is written from the hidden side for
-/// all five criteria. The two have to agree in sense or this sentence states
-/// the inverse of what the pane did - which is what it did state, for three
-/// of the five criteria, until the summary was rewritten. `the_band_says_what
-/// _was_removed_for_every_criterion` reads the built string rather than the
-/// pieces, so the pair cannot drift apart again without a test failing.
-pub fn pane_banner_text(filter: &GateFilter) -> Option<String> {
-    filter.is_active().then(|| {
+/// Named, not "clears the filter". "Show everything again" is the outcome; the
+/// summary after it is the evidence that this key is the way out of THIS
+/// state and not some other reset. `values` is expected to be a filtering
+/// set, because the key is not drawn otherwise, but an off set is answered
+/// honestly rather than with a sentence promising to restore nothing.
+pub fn clear_hover(values: FilterValues) -> String {
+    let filter = values.to_filter();
+    if filter.is_active() {
         format!(
-            "{FILTERED_WORD} · hiding {} · click here to show everything",
+            "Show everything again. Brings back the gates now hidden: {}.",
             filter.hidden_summary()
         )
-    })
+    } else {
+        "Show everything again. Nothing is hidden right now.".to_owned()
+    }
 }
 
 /// What a pane says when a filter is on and this pane's product could not obey
@@ -323,43 +354,61 @@ pub fn pane_banner_text(filter: &GateFilter) -> Option<String> {
 /// Deliberately NOT a substring of [`FILTERED_WORD`], and deliberately not
 /// built out of it: an analyst scanning four panes has to be able to tell the
 /// pane that is hiding gates from the pane that is showing everything, and two
-/// bands that start with the same word do not let them.
-pub const NOT_APPLIED_WORDS: &str = "FILTER NOT APPLIED HERE";
+/// statements that start with the same word do not let them.
+///
+/// Verbatim the prefix `render2d::GateFilterReport::badge` uses, because the
+/// pane header carries whichever of the two is available and an analyst must
+/// not be able to tell "the engine has not answered yet" from "the engine
+/// answered" by a change of wording.
+pub const NOT_APPLIED_WORDS: &str = "FILTER NOT APPLIED";
 
-/// The band THIS pane draws, given what its product can do with the filter.
+/// The filter statement a pane's header carries until the engine answers with
+/// its own.
+///
+/// The finished line comes from the engine - `GateFilterReport::badge`, with
+/// the counts it actually measured - and `app.rs` puts that on the pane header
+/// the moment a render lands. But a render is not always landed: it is in
+/// flight for as long as the worker takes, the product may be unavailable on
+/// this volume, the worker may be gone, and a pane that has never rendered has
+/// no report at all. The band used to cover every one of those, because it was
+/// built from the settings rather than from a result. This is that same
+/// coverage, on the row that replaced it.
+///
+/// It is deliberately the engine's line MINUS the counts, rather than a
+/// differently-worded stand-in: `pane_status_line` is a strict prefix of
+/// `badge()` for the same filter, so the header does not change its wording
+/// when the render lands - it only gains the numbers. A test pins the prefix
+/// relation across every criterion.
+///
+/// No counts are invented while none are known. `0 of 0 gates hidden` is the
+/// engine's phrase for a filter that ran against an empty sweep, which is a
+/// different and true statement; borrowing it here for a render that has not
+/// happened would be a false one.
 ///
 /// `not_applied_reason` is `None` for every pane that rasters from a sweep's
 /// gates - which is every radar moment, and the only case an ordinary session
 /// ever sees. It is `Some` for a product the filter cannot run against, and
-/// then the band says so in the engine's own words rather than claiming gates
-/// are hidden here when none are.
-///
-/// The alternative was one string for the whole canvas, which is what this
-/// started as. It cannot survive contact with the engine: `render_service`
-/// answers a volume-derived product with
-/// `GateFilterReport::not_applicable`, so that pane's status line reads
-/// `FILTER NOT APPLIED` while a canvas-wide band over the same pane would read
-/// `FILTERED`. Two indicators on one pane disagreeing about whether weather is
-/// being hidden is worse than either of them alone, and the fix is for both to
-/// come from the same fact.
-///
-/// Silent in neither direction: a pane that cannot filter still carries a
-/// band, because an analyst who has switched a censor on and sees no band at
-/// all will read the pane as obeying it.
-pub fn pane_banner_text_for(
-    filter: &GateFilter,
-    not_applied_reason: Option<&str>,
-) -> Option<String> {
+/// then the header says so in the engine's own words rather than claiming
+/// gates are hidden here when none are. Silent in neither direction: a pane
+/// that cannot filter still carries a statement, because an analyst who has
+/// switched a censor on and sees nothing at all on the pane will read the pane
+/// as obeying it.
+pub fn pane_status_line(filter: &GateFilter, not_applied_reason: Option<&str>) -> Option<String> {
     if !filter.is_active() {
         return None;
     }
-    match not_applied_reason {
-        None => pane_banner_text(filter),
-        Some(reason) => Some(format!(
-            "{NOT_APPLIED_WORDS} · {} · {reason} · click here to show everything",
-            filter.hidden_summary()
-        )),
-    }
+    // The engine's own fallback for a filter that is active but names nothing,
+    // mirrored here so the prefix relation holds for that case too.
+    let summary = filter.hidden_summary();
+    let summary = if summary.is_empty() {
+        "gate filter".to_owned()
+    } else {
+        summary
+    };
+    Some(match not_applied_reason {
+        None => format!("{FILTERED_WORD}: {summary}"),
+        Some(reason) => format!("{NOT_APPLIED_WORDS}: {summary} - {reason}"),
+    })
 }
 
 /// The legend's copy of the same statement: one word, and only one word.
@@ -369,10 +418,10 @@ pub fn pane_banner_text_for(
 /// points wide, so "FILTERED · REF below 20 dBZ, VEL where REF below 20 dBZ, inside
 /// 5 km" wrapped to four rows of two or three characters, spent the badge
 /// stack's whole row budget, pushed the colour bar down by sixty points and
-/// was unreadable at every step. The full statement belongs on the band, which
-/// has the whole width of the pane; the badge's job beside the colour bar is
-/// to catch the eye that is already reading the ladder, and one word does that
-/// better than four unreadable rows.
+/// was unreadable at every step. The full statement belongs on the pane
+/// header, which has most of the width of the pane; the badge's job beside the
+/// colour bar is to catch the eye that is already reading the ladder, and one
+/// word does that better than four unreadable rows.
 ///
 /// Kept as a `Option<String>` rather than a `&'static str` so the caller's
 /// "exists exactly when something is hidden" rule is the same shape for both
@@ -410,7 +459,7 @@ pub struct GateFilterControl<'a> {
 /// separately by the settings store (two seconds of quiet), so a drag is one
 /// write, not sixty.
 pub fn draw_gate_filter_control(ui: &mut egui::Ui, control: GateFilterControl<'_>) -> bool {
-    let values = values_from_settings(control.registry, control.store);
+    let mut values = values_from_settings(control.registry, control.store);
     let filter = values.to_filter();
 
     // Latched on the FILTER, not on the popup. A control that is only tinted
@@ -425,13 +474,57 @@ pub fn draw_gate_filter_control(ui: &mut egui::Ui, control: GateFilterControl<'_
     }
 
     let mut changed = false;
+
+    // THE ONE OBVIOUS ACTION OUT, immediately beside the control that turned
+    // the filter on.
+    //
+    // A separate key rather than the chip's own click, and that is the whole
+    // design question here. The chip opens the panel, and the panel is where
+    // the five criteria are read and adjusted; a chip that cleared everything
+    // instead would put an analyst who wants to loosen one threshold in the
+    // position of having to throw all five away first and set them again.
+    // So the escape is its own key, drawn only while there is something to
+    // escape from - the bar an analyst sees with nothing hidden is exactly the
+    // bar this application has always drawn - and it says what it will restore
+    // on hover rather than only what it will do.
+    //
+    // Drawn FLUSH against the chip - the row's item spacing suppressed for
+    // exactly one widget - and latched, like the chip, so the two read as ONE
+    // control with a clear on the end of it. That is not decoration. The other
+    // keys on this bar are flat until hovered, which is this theme's grammar
+    // and is fine for a key with a word on it; a lone glyph drawn that way is
+    // an unexplained mark sitting next to a chip, and an analyst looking for
+    // the way out would have to hover over the bar to find it. Latched and
+    // flush, it is visibly the right-hand end of the thing that is hiding
+    // gates. The latch is also true: this key exists only while the filter it
+    // belongs to is on. The spacing is put back immediately, so the control
+    // after this keeps the gap every other pair on the row has.
+    let cleared = filter.is_active() && {
+        let spacing = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let key = bevel::toolbar_toggle(ui, true, CLEAR_GLYPH).on_hover_text(clear_hover(values));
+        ui.spacing_mut().item_spacing.x = spacing;
+        key.clicked()
+    };
+    if cleared {
+        changed |= write_values(control.store, FilterValues::OFF);
+        // The numbers in hand, not the snapshot this frame opened with: the
+        // panel below is drawn in the same pass, and a panel still printing
+        // Storm mode's thresholds under a bar that has just cleared them is
+        // the control disagreeing with itself about what is hidden - the same
+        // one-frame lie `draw_panel` already refuses to tell when a preset row
+        // is clicked.
+        values = FilterValues::OFF;
+        ui.ctx().request_repaint();
+    }
+
     if control.state.open {
         let area = egui::Area::new(egui::Id::new("workstation-gate-filter"))
             .order(egui::Order::Foreground)
             // Ten points clear of the button, like the product picker: the
-            // band carries six points of margin and a two-point bevel below
-            // this control, and a popup that starts four points down slices
-            // through both.
+            // toolbar band carries six points of margin and a two-point bevel
+            // below this control, and a popup that starts four points down
+            // slices through both.
             .fixed_pos(button.rect.left_bottom() + egui::vec2(0.0, 10.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| draw_panel(ui, control.store, values))
@@ -611,9 +704,10 @@ fn draw_panel(ui: &mut egui::Ui, store: &mut SettingsStore, values: FilterValues
             [PANEL_WIDTH, bevel::MIN_TOUCH_POINTS],
             egui::Button::new("Show everything"),
         )
-        .on_hover_text(
-            "Turn every criterion off. Also reachable by clicking a pane's FILTERED band.",
-        )
+        .on_hover_text(format!(
+            "Turn every criterion off. Also on the bar: the {CLEAR_GLYPH} beside the \
+             filter chip, without opening this panel."
+        ))
         .clicked()
     {
         changed |= write_values(store, FilterValues::OFF);
@@ -800,8 +894,8 @@ mod tests {
         assert_eq!(selection_label(nudged), CUSTOM_LABEL);
         assert!(nudged.to_filter().is_active());
         assert!(
-            pane_banner_text(&nudged.to_filter())
-                .expect("an active filter has a banner")
+            pane_status_line(&nudged.to_filter(), None)
+                .expect("an active filter has a pane statement")
                 .contains("20.5 dBZ")
         );
     }
@@ -835,31 +929,35 @@ mod tests {
 
     /// The safety rule at the level this module owns: active means the words
     /// exist, off means they do not.
+    ///
+    /// Re-pointed from the pane band to the pane HEADER when the band was
+    /// removed. The claim is unchanged - a filtering pane says so in words
+    /// that name what went - and the subject moved to the indicator that now
+    /// carries it. The "one obvious action out" half of the claim moved with
+    /// the action itself, to `the_clear_key_names_what_it_will_bring_back`
+    /// here and to `app.rs`'s
+    /// `clicking_the_toolbars_clear_key_shows_everything_again`, because the
+    /// escape is no longer a phrase inside the pane's own sentence.
     #[test]
     fn the_pane_words_exist_exactly_when_something_is_hidden() {
-        assert_eq!(pane_banner_text(&GateFilter::OFF), None);
+        assert_eq!(pane_status_line(&GateFilter::OFF, None), None);
         assert_eq!(pane_badge_text(&GateFilter::OFF), None);
         for preset in PRESETS {
             let filter = preset.values.to_filter();
-            let banner = pane_banner_text(&filter);
+            let statement = pane_status_line(&filter, None);
             let badge = pane_badge_text(&filter);
             assert_eq!(
                 filter.is_active(),
-                banner.is_some(),
+                statement.is_some(),
                 "{} disagrees about whether to warn",
                 preset.id
             );
             assert_eq!(filter.is_active(), badge.is_some());
-            if let Some(banner) = banner {
-                assert!(banner.starts_with(FILTERED_WORD));
+            if let Some(statement) = statement {
+                assert!(statement.starts_with(FILTERED_WORD));
                 assert!(
-                    banner.contains(&filter.hidden_summary()),
+                    statement.contains(&filter.hidden_summary()),
                     "{} does not name what it hides",
-                    preset.id
-                );
-                assert!(
-                    banner.contains("show everything"),
-                    "{} offers no way out",
                     preset.id
                 );
                 assert_eq!(badge.expect("badge"), FILTERED_WORD);
@@ -867,15 +965,48 @@ mod tests {
         }
     }
 
-    /// The band's WHOLE SENTENCE, for every criterion alone and for all five
-    /// together, pinned as an analyst would read it aloud.
+    /// The escape's own words. A clear key that says only "clear" is a key an
+    /// analyst has to guess the effect of; this one names the gates it brings
+    /// back, which is the same sentence the header and the panel print.
+    #[test]
+    fn the_clear_key_names_what_it_will_bring_back() {
+        for preset in PRESETS {
+            let filter = preset.values.to_filter();
+            let hover = clear_hover(preset.values);
+            assert!(
+                hover.contains("Show everything"),
+                "{}: the clear key does not say what it does: {hover:?}",
+                preset.id
+            );
+            if filter.is_active() {
+                assert!(
+                    hover.contains(&filter.hidden_summary()),
+                    "{}: the clear key does not name what it restores: {hover:?}",
+                    preset.id
+                );
+            }
+        }
+        // And the chip beside it points at the key, so the escape is
+        // discoverable from the control that turned the filter on.
+        let storm = PRESETS
+            .iter()
+            .find(|preset| preset.id == "storm")
+            .expect("storm mode is declared");
+        assert!(
+            chip_hover(storm.values).contains(CLEAR_GLYPH),
+            "the latched chip does not point at the way out"
+        );
+    }
+
+    /// The pane statement's WHOLE SENTENCE, for every criterion alone and for
+    /// all five together, pinned as an analyst would read it aloud.
     ///
     /// This reads the built string rather than the pieces, because the defect
-    /// this guards lived in neither piece. `pane_banner_text` supplies the
-    /// verb - "hiding" - and `GateFilter::hidden_summary` supplied a phrase
-    /// written from the SURVIVING side for three of the five criteria, so the
-    /// sentence they made together announced the opposite of what the pane had
-    /// done. What shipped, on a real KDVN volume in Storm mode, was:
+    /// it guards lived in neither piece. `pane_status_line` supplies the verb
+    /// of hiding and `GateFilter::hidden_summary` supplied a phrase written
+    /// from the SURVIVING side for three of the five criteria, so the sentence
+    /// they made together announced the opposite of what the pane had done.
+    /// What shipped, on a real KDVN volume in Storm mode, was:
     ///
     /// ```text
     /// FILTERED · hiding REF > 20 dBZ, VEL needs REF > 20 dBZ, beyond 5 km · …
@@ -890,45 +1021,50 @@ mod tests {
     /// them out loud - "it's hiding REF below 20 dBZ" - so re-inverting one
     /// cannot be done quietly: the diff would have to replace plain English
     /// with its opposite in this file, in words, where a reviewer reads it.
+    ///
+    /// The subject was the full-width band until that band was removed; the
+    /// sentence moved to the pane header and the pin moved with it, minus the
+    /// band's own "click here to show everything" clause, which is now a key
+    /// on the toolbar rather than a phrase.
     #[test]
-    fn the_band_says_what_was_removed_for_every_criterion() {
+    fn the_pane_statement_says_what_was_removed_for_every_criterion() {
         let cases: [(GateFilter, &str); 6] = [
             (
                 GateFilter {
                     min_reflectivity_dbz: Some(20.0),
                     ..GateFilter::OFF
                 },
-                "FILTERED · hiding REF below 20 dBZ · click here to show everything",
+                "FILTERED: REF below 20 dBZ",
             ),
             (
                 GateFilter {
                     velocity_requires_reflectivity_dbz: Some(20.0),
                     ..GateFilter::OFF
                 },
-                "FILTERED · hiding VEL where REF below 20 dBZ · click here to show everything",
+                "FILTERED: VEL where REF below 20 dBZ",
             ),
             (
                 GateFilter {
                     min_correlation: Some(0.80),
                     ..GateFilter::OFF
                 },
-                "FILTERED · hiding RhoHV below 0.80 · click here to show everything",
+                "FILTERED: RhoHV below 0.80",
             ),
             (
                 GateFilter {
                     hide_range_folded: true,
                     ..GateFilter::OFF
                 },
-                "FILTERED · hiding range-folded gates · click here to show everything",
+                "FILTERED: range-folded gates",
             ),
             (
                 GateFilter {
                     min_range_km: Some(5.0),
                     ..GateFilter::OFF
                 },
-                "FILTERED · hiding everything inside 5 km · click here to show everything",
+                "FILTERED: everything inside 5 km",
             ),
-            // All five at once, which is also the widest the band ever gets.
+            // All five at once, which is also the widest this ever gets.
             (
                 GateFilter {
                     min_reflectivity_dbz: Some(20.0),
@@ -937,17 +1073,16 @@ mod tests {
                     hide_range_folded: true,
                     min_range_km: Some(5.0),
                 },
-                "FILTERED · hiding REF below 20 dBZ, VEL where REF below 20 dBZ, \
-                 RhoHV below 0.95, range-folded gates, everything inside 5 km · \
-                 click here to show everything",
+                "FILTERED: REF below 20 dBZ, VEL where REF below 20 dBZ, \
+                 RhoHV below 0.95, range-folded gates, everything inside 5 km",
             ),
         ];
         for (filter, expected) in cases {
             assert_eq!(
-                pane_banner_text(&filter).as_deref(),
+                pane_status_line(&filter, None).as_deref(),
                 Some(expected),
-                "{filter:?}: the band is the one place an analyst goes to find out \
-                 what is missing. Every word after \"hiding\" has to name what WENT"
+                "{filter:?}: the pane header is the one place an analyst goes to find \
+                 out what is missing. Every word after the colon has to name what WENT"
             );
         }
     }
@@ -956,30 +1091,89 @@ mod tests {
     /// exact shipped sentence is pinned on its own.
     ///
     /// The panel that sets these numbers prints "Hide REF below 20.0 dBZ" and
-    /// "Hide inside 5.0 km" on its own sliders, inches from this band. The two
+    /// "Hide inside 5.0 km" on its own sliders, inches from this line. The two
     /// used to disagree on the same screen; this asserts the agreement in the
     /// only way that survives an edit to either - by quoting both.
     #[test]
-    fn storm_mode_band_and_the_panel_that_set_it_say_the_same_thing() {
+    fn storm_modes_pane_statement_and_the_panel_that_set_it_say_the_same_thing() {
         let storm = PRESETS
             .iter()
             .find(|preset| preset.id == "storm")
             .expect("storm mode is declared");
-        let band = pane_banner_text(&storm.values.to_filter()).expect("storm mode filters");
+        let line = pane_status_line(&storm.values.to_filter(), None).expect("storm mode filters");
         assert_eq!(
-            band,
-            "FILTERED · hiding REF below 20 dBZ, VEL where REF below 20 dBZ, \
-             everything inside 5 km · click here to show everything"
+            line,
+            "FILTERED: REF below 20 dBZ, VEL where REF below 20 dBZ, \
+             everything inside 5 km"
         );
-        // The panel's own slider labels, verbatim from `draw_panel`. A band
+        // The panel's own slider labels, verbatim from `draw_panel`. A header
         // that says "below" while the control says "below" is one sentence; a
-        // band that says "REF > 20 dBZ" over a slider reading "Hide REF below
-        // 20.0 dBZ" is two indicators contradicting each other in one window.
+        // header that says "REF > 20 dBZ" over a slider reading "Hide REF
+        // below 20.0 dBZ" is two indicators contradicting each other in one
+        // window.
         for label in ["Hide REF below", "Hide VEL where REF below", "Hide inside"] {
             let stem = label.trim_start_matches("Hide ");
             assert!(
-                band.contains(stem),
-                "the band does not use the panel's own words for {label:?}: {band:?}"
+                line.contains(stem),
+                "the header does not use the panel's own words for {label:?}: {line:?}"
+            );
+        }
+    }
+
+    /// The header does not change its wording when the render lands.
+    ///
+    /// `app.rs` puts the ENGINE's line on the pane header the moment a report
+    /// arrives and [`pane_status_line`] there until it does, so the two are
+    /// read one after the other by the same analyst on the same pane. If they
+    /// were worded differently the swap would read as the pane changing its
+    /// mind about what it is doing. They are not: the fallback is a strict
+    /// PREFIX of the engine's line, so the header only ever gains the counts.
+    ///
+    /// Asserted against `render2d`'s own `badge()` rather than against a
+    /// remembered format string, so an edit to either side fails here.
+    #[test]
+    fn the_pane_statement_is_a_prefix_of_the_engine_line_it_is_replaced_by() {
+        use render2d::GateFilterReport;
+        const REASON: &str = "this product is integrated from the whole volume";
+        for preset in PRESETS {
+            let filter = preset.values.to_filter();
+            let Some(waiting) = pane_status_line(&filter, None) else {
+                assert!(!filter.is_active(), "{}: no statement", preset.id);
+                continue;
+            };
+            let landed = GateFilterReport {
+                filter,
+                gates_visible: 298_195,
+                gates_hidden: 269_740,
+                ..GateFilterReport::INACTIVE
+            }
+            .badge()
+            .unwrap_or_else(|| panic!("{}: the engine reported nothing", preset.id));
+            assert!(
+                landed.starts_with(&waiting),
+                "{}: the header reads {waiting:?} while the render is in flight and \
+                 {landed:?} once it lands - the same pane, changing its story",
+                preset.id
+            );
+
+            // And the same for the pane the filter could not run against,
+            // where the two lines are identical: the engine has no counts to
+            // add there either.
+            let waiting = pane_status_line(&filter, Some(REASON))
+                .unwrap_or_else(|| panic!("{}: no not-applied statement", preset.id));
+            let landed = GateFilterReport::not_applicable(filter, REASON)
+                .badge()
+                .unwrap_or_else(|| panic!("{}: the engine reported nothing", preset.id));
+            assert_eq!(
+                waiting, landed,
+                "{}: the not-applied line is worded two ways",
+                preset.id
+            );
+            assert!(
+                waiting.starts_with(NOT_APPLIED_WORDS) && !waiting.starts_with(FILTERED_WORD),
+                "{}: a pane the filter did not run on reads as one that hid gates: \
+                 {waiting:?}",
+                preset.id
             );
         }
     }
@@ -1169,6 +1363,122 @@ mod tests {
             clicked_frame.contains(&expected_line),
             "the panel's own FILTERED line is a frame behind the row above it: wanted \
              {expected_line:?} in {clicked_frame:?}"
+        );
+    }
+
+    /// The escape, driven through the real control: the clear key exists
+    /// exactly while something is hidden, and clicking it is
+    /// [`GateFilter::OFF`].
+    ///
+    /// Through real egui passes rather than by calling `write_values`, because
+    /// the claim is about a key an analyst can hit. The band this replaced was
+    /// pinned the same way, on the pane; the subject moved to the bar with the
+    /// action.
+    #[test]
+    fn the_toolbar_clear_key_appears_with_the_filter_and_clicking_it_is_off() {
+        fn texts(shapes: &[egui::Shape]) -> Vec<String> {
+            fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(text) => found.push(text.galley.text().trim().to_owned()),
+                    egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, found)),
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            shapes.iter().for_each(|shape| walk(shape, &mut found));
+            found
+        }
+        fn position(shapes: &[egui::Shape], wanted: &str) -> Option<egui::Pos2> {
+            fn walk(shape: &egui::Shape, wanted: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text().trim() == wanted => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    }
+                    egui::Shape::Vec(nested) => nested.iter().find_map(|s| walk(s, wanted)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|shape| walk(shape, wanted))
+        }
+
+        let registry = crate::settings_ui::catalog::registry();
+        let mut store = scratch_store();
+        let mut state = GateFilterUi::default();
+        let context = egui::Context::default();
+        let frame =
+            |store: &mut SettingsStore, state: &mut GateFilterUi, events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let output = context.run_ui(input, |ui| {
+                    draw_gate_filter_control(
+                        ui,
+                        GateFilterControl {
+                            state,
+                            registry: &registry,
+                            store,
+                        },
+                    );
+                });
+                output
+                    .shapes
+                    .into_iter()
+                    .map(|clipped| clipped.shape)
+                    .collect::<Vec<_>>()
+            };
+        let press = |at: egui::Pos2, pressed: bool| {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        // Nothing hidden: no escape is offered, because there is nothing to
+        // escape from and a dead key beside the chip is furniture.
+        let quiet = texts(&frame(&mut store, &mut state, Vec::new()));
+        assert!(
+            !quiet.iter().any(|text| text == CLEAR_GLYPH),
+            "an unfiltered bar drew a clear key: {quiet:?}"
+        );
+
+        let storm = PRESETS
+            .iter()
+            .find(|preset| preset.id == "storm")
+            .expect("storm mode is declared");
+        write_values(&mut store, storm.values);
+        assert!(
+            values_from_settings(&registry, &store)
+                .to_filter()
+                .is_active()
+        );
+
+        let filtered = frame(&mut store, &mut state, Vec::new());
+        let key = position(&filtered, CLEAR_GLYPH).unwrap_or_else(|| {
+            panic!(
+                "a filtered bar drew no way out at all: {:?}",
+                texts(&filtered)
+            )
+        });
+        frame(&mut store, &mut state, press(key, true));
+        frame(&mut store, &mut state, press(key, false));
+
+        let values = values_from_settings(&registry, &store);
+        assert_eq!(
+            values.to_filter(),
+            GateFilter::OFF,
+            "the clear key did not clear every criterion: {values:?}"
+        );
+        // And it takes itself away with the filter it cleared.
+        let cleared = texts(&frame(&mut store, &mut state, Vec::new()));
+        assert!(
+            !cleared.iter().any(|text| text == CLEAR_GLYPH),
+            "the clear key outlived the filter it cleared: {cleared:?}"
         );
     }
 

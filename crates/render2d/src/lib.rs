@@ -8,6 +8,11 @@ pub mod derived;
 pub mod gate_filter;
 pub mod interpolate;
 pub mod quality;
+/// Test-only: the camera rotation checked against real Level II sweeps. A
+/// module of its own because it reaches into this file's private raster
+/// internals, which a `tests/` integration target cannot.
+#[cfg(test)]
+mod rotation_proof;
 pub mod smooth;
 pub mod sweep_blend;
 pub mod volumetric;
@@ -176,6 +181,25 @@ pub struct ViewportRasterOptions {
     pub radar_y_px: f32,
     pub km_per_px_x: f32,
     pub km_per_px_y: f32,
+    /// Clockwise screen rotation of the camera this raster is drawn under, in
+    /// radians, matching `analyst_runtime::Camera2D::rotation_rad`. Zero is
+    /// north-up, which is what every caller passed before the map learned to
+    /// straighten itself, and at zero this raster is bit-identical to the one
+    /// that shipped.
+    ///
+    /// A camera rotation about the ANTENNA'S OWN SCREEN POSITION is an
+    /// isometry of the raster, so inside the pixel loop it is exactly a
+    /// constant offset on the compass azimuth and nothing else: the range is
+    /// unchanged, the gate index is unchanged, and the row's circular span is
+    /// unchanged because a circle is rotation-invariant. That is the whole
+    /// reason the echo can be turned without being resampled.
+    ///
+    /// CONTRACT: the azimuth shortcut above is only an isometry while
+    /// `km_per_px_x == km_per_px_y`. Every caller in this workspace sets both
+    /// from one camera scale. An anisotropic caller with a non-zero rotation
+    /// would get a sheared picture rather than a compile error, so
+    /// `viewport_geometry` asserts it in debug builds.
+    pub rotation_rad: f32,
 }
 
 pub fn viewport_rgba_buffer_len(options: ViewportRasterOptions) -> usize {
@@ -2168,6 +2192,10 @@ struct ViewportGeometry {
     km_per_px_x: f32,
     km_per_px_y: f32,
     max_range_km_sq: f32,
+    /// The camera rotation carried in DEGREES, because that is the unit the
+    /// azimuth is in by the time it is used, and converting once per raster
+    /// beats converting once per pixel.
+    rotation_deg: f32,
 }
 
 fn viewport_dimensions(options: ViewportRasterOptions) -> (u32, u32) {
@@ -2177,13 +2205,29 @@ fn viewport_dimensions(options: ViewportRasterOptions) -> (u32, u32) {
 fn viewport_geometry(grid: &MomentGrid, options: ViewportRasterOptions) -> ViewportGeometry {
     let (width, _) = viewport_dimensions(options);
     let max_range_km = max_range_m(grid).max(1.0) / 1000.0;
+    let km_per_px_x = options.km_per_px_x.max(f32::EPSILON);
+    let km_per_px_y = options.km_per_px_y.max(f32::EPSILON);
+    // See the contract on `ViewportRasterOptions::rotation_rad`: a rotation is
+    // only an isometry of this raster while the two pixel scales agree. Every
+    // caller in this workspace drives both from one camera, so this cannot
+    // fire today; it is here so that the day one does not, it fires loudly
+    // instead of drawing a sheared echo over a correct basemap.
+    debug_assert!(
+        options.rotation_rad == 0.0 || (km_per_px_x - km_per_px_y).abs() <= f32::EPSILON,
+        "a rotated viewport raster needs square pixels: {km_per_px_x} vs {km_per_px_y} km/px"
+    );
     ViewportGeometry {
         width,
         radar_x_px: options.radar_x_px,
         radar_y_px: options.radar_y_px,
-        km_per_px_x: options.km_per_px_x.max(f32::EPSILON),
-        km_per_px_y: options.km_per_px_y.max(f32::EPSILON),
+        km_per_px_x,
+        km_per_px_y,
         max_range_km_sq: max_range_km * max_range_km,
+        rotation_deg: if options.rotation_rad.is_finite() {
+            options.rotation_rad.to_degrees()
+        } else {
+            0.0
+        },
     }
 }
 
@@ -2313,6 +2357,7 @@ impl ViewportLookupTable {
             max_range_km_sq: self.geometry.max_range_km_sq,
             radar_x_px: self.geometry.radar_x_px,
             km_per_px_x: self.geometry.km_per_px_x,
+            rotation_deg: self.geometry.rotation_deg,
             first_gate_m: self.first_gate_m,
             gate_spacing_m: self.gate_spacing_m,
             gate_count: self.gate_count,
@@ -2328,6 +2373,7 @@ struct ViewportLookupRow {
     max_range_km_sq: f32,
     radar_x_px: f32,
     km_per_px_x: f32,
+    rotation_deg: f32,
     first_gate_m: f32,
     gate_spacing_m: f32,
     gate_count: usize,
@@ -2347,7 +2393,14 @@ impl ViewportLookupRow {
             return None;
         }
 
-        let azimuth_deg = azimuth_from_xy(dx_km, self.dy_km);
+        // `dx_km` and `dy_km` are SCREEN offsets from the antenna, so their
+        // bearing is a screen bearing; the camera sends a compass bearing `b`
+        // to screen bearing `b + rotation`, and this is that read backwards.
+        // Nothing above this line moves: the range is `hypot` of the same two
+        // offsets and a rotation about the antenna leaves it alone.
+        // `azimuth_bin` already applies `rem_euclid(360)`, so a negative
+        // azimuth wraps at no cost.
+        let azimuth_deg = azimuth_from_xy(dx_km, self.dy_km) - self.rotation_deg;
         let azimuth_bin = row_lookup.filled_bin_for_azimuth(azimuth_deg)?;
         Some(SampleLookup {
             azimuth_bin,
@@ -3668,7 +3721,10 @@ fn viewport_lookup(
         return None;
     }
 
-    let azimuth_deg = azimuth_from_xy(dx_km, dy_km);
+    // Screen bearing minus the camera rotation is the compass azimuth; see
+    // `ViewportLookupRow::lookup`, which this function has to agree with pixel
+    // for pixel.
+    let azimuth_deg = azimuth_from_xy(dx_km, dy_km) - geometry.rotation_deg;
     let azimuth_bin = row_lookup.filled_bin_for_azimuth(azimuth_deg)?;
     Some(SampleLookup {
         azimuth_bin,
@@ -4821,6 +4877,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
 
         assert_eq!(
@@ -4844,6 +4901,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let full_viewport = viewport_sample_cache_storage_upper_bound(options);
@@ -4870,6 +4928,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_deg: 0.0,
             max_range_km_sq: max_range_km * max_range_km,
         };
 
@@ -4899,6 +4958,7 @@ mod tests {
                 radar_y_px: 108.5,
                 km_per_px_x: 0.5,
                 km_per_px_y: 0.5,
+                rotation_rad: 0.0,
             },
         );
         let lookup_table = ViewportLookupTable::new(grid, geometry);
@@ -4937,6 +4997,7 @@ mod tests {
             radar_y_px: 48.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_deg: 0.0,
             max_range_km_sq: max_range_km * max_range_km,
         };
 
@@ -5099,6 +5160,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let reflectivity =
@@ -5188,6 +5250,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport reflectivity cache");
@@ -5231,6 +5294,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let reflectivity_cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("reflectivity cache");
@@ -5274,6 +5338,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let storm_motion = StormMotion {
             direction_deg: 45.0,
@@ -5343,6 +5408,7 @@ mod tests {
             radar_y_px: 32.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let reflectivity_cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("reflectivity cache");
@@ -5376,6 +5442,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let mut pixels = vec![0; viewport_rgba_buffer_len(options) - 4];
@@ -5402,6 +5469,7 @@ mod tests {
             radar_y_px: 32.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport reflectivity cache");
@@ -5424,6 +5492,7 @@ mod tests {
             radar_y_px: 48.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport u16 reflectivity cache");
@@ -5514,6 +5583,7 @@ mod tests {
             radar_y_px: 64.0,
             km_per_px_x: 0.1,
             km_per_px_y: 0.1,
+            rotation_rad: 0.0,
         }
     }
 
@@ -5884,6 +5954,7 @@ mod tests {
             radar_y_px: 128.0,
             km_per_px_x: 0.12,
             km_per_px_y: 0.12,
+            rotation_rad: 0.0,
         };
 
         for quality in [
@@ -5970,6 +6041,7 @@ mod tests {
             radar_y_px: 128.0,
             km_per_px_x: 0.12,
             km_per_px_y: 0.12,
+            rotation_rad: 0.0,
         };
 
         let render_through_sample_cache = |filter: &GateFilter| {
@@ -6216,6 +6288,7 @@ mod tests {
             radar_y_px: 410.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         for (moment, label) in [
@@ -6318,6 +6391,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 0.4,
             km_per_px_y: 0.4,
+            rotation_rad: 0.0,
         };
         let mut pixels = vec![0_u8; viewport_rgba_buffer_len(wide)];
         // A closure cannot be generic, and the two arms need two censor types,

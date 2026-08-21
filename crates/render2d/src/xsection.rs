@@ -1417,7 +1417,24 @@ mod tests {
     // real-data tests in `quality.rs`.
     // ------------------------------------------------------------------
 
+    /// One Archive II file named by `NEXRAD_LEVEL2_SAMPLE`. Pin it and these
+    /// tests run on exactly that volume instead of on whichever radar the live
+    /// cache happens to hold, which is what a gate needs.
+    fn pinned_sample() -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var_os("NEXRAD_LEVEL2_SAMPLE")?);
+        assert!(
+            path.is_file(),
+            "NEXRAD_LEVEL2_SAMPLE names {}, which is not a file",
+            path.display()
+        );
+        Some(path)
+    }
+
     fn level2_cache_dir() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("RADAR_WORKSTATION_L2_CACHE") {
+            let path = std::path::PathBuf::from(path);
+            return path.is_dir().then_some(path);
+        }
         let local = std::env::var_os("LOCALAPPDATA")?;
         let path = std::path::PathBuf::from(local)
             .join("FahrenheitResearch")
@@ -1428,6 +1445,9 @@ mod tests {
     }
 
     fn decode_cached(name_contains: &str) -> Option<RadarVolume> {
+        if let Some(path) = pinned_sample() {
+            return nexrad_io::decode_volume_from_path(&path).ok();
+        }
         let dir = level2_cache_dir()?;
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .ok()?
@@ -1448,6 +1468,9 @@ mod tests {
     }
 
     fn any_cached_volume() -> Option<RadarVolume> {
+        if let Some(path) = pinned_sample() {
+            return nexrad_io::decode_volume_from_path(&path).ok();
+        }
         let dir = level2_cache_dir()?;
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .ok()?
@@ -2144,6 +2167,10 @@ mod tests {
             return;
         };
         let Some(cell) = strongest_cell_km(&volume) else {
+            eprintln!(
+                "the cached volume carries no low-tilt reflectivity to aim a line through; the \
+                 synthetic half of this test stands alone"
+            );
             return;
         };
         let request = line_through_cell(cell, 60.0);

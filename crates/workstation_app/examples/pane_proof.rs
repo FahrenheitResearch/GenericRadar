@@ -42,6 +42,7 @@ mod source {
     pub mod load_service;
     pub mod nearest_site;
     pub mod net_tuning;
+    pub mod north_up;
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
@@ -66,9 +67,9 @@ mod source {
 #[allow(unused_imports)]
 pub(crate) use source::{
     annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, palette_editor, palettes, pane_canvas, popup, probe, product,
-    product_availability, product_picker, render_service, settings_ui, sites_service, sweep, theme,
-    units, user_tables, vol3d, vrot, warnings_service, xsection,
+    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
+    product, product_availability, product_picker, render_service, settings_ui, sites_service,
+    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::PathBuf;
@@ -221,6 +222,7 @@ fn raster_lowest_reflectivity(
         radar_y_px: side as f32 / 2.0,
         km_per_px_x: camera.km_per_point / viewport.pixels_per_point,
         km_per_px_y: camera.km_per_point / viewport.pixels_per_point,
+        rotation_rad: 0.0,
     };
     let tables = color_tables::ColorTableSet::default();
     let quality = render2d::DisplayQuality::default();
@@ -326,7 +328,6 @@ impl eframe::App for Proof {
                     probe: None,
                     // This proof photographs the pane chrome with nothing
                     // hidden, so there is no band to draw over it.
-                    filter_notice: None,
                 };
                 draw_pane(
                     ui,
@@ -334,6 +335,10 @@ impl eframe::App for Proof {
                     rect,
                     true,
                     self.camera,
+                    // No projection: this proof photographs the pane chrome
+                    // with a camera it wrote itself, so the map's north-up
+                    // rule has nothing to say about it.
+                    north_up::NorthUpFrame::new(None, self.viewport, 0.0),
                     pane_canvas::NavTuning::default(),
                     Some(PaneTexture {
                         handle: texture,

@@ -230,6 +230,7 @@ fn frame_options() -> ViewportRasterOptions {
         radar_y_px: FRAME_PX as f32 / 2.0,
         km_per_px_x: KM_PER_PX,
         km_per_px_y: KM_PER_PX,
+        rotation_rad: 0.0,
     }
 }
 

@@ -536,7 +536,15 @@ fn pixel_azimuth_deg(options: ViewportRasterOptions, x: u32, y: u32) -> f32 {
     let km_per_px_y = options.km_per_px_y.max(f32::EPSILON);
     let dx_km = (x as f32 + 0.5 - options.radar_x_px) * km_per_px_x;
     let dy_km = (options.radar_y_px - (y as f32 + 0.5)) * km_per_px_y;
-    azimuth_from_xy(dx_km, dy_km)
+    // The camera rotation comes off, exactly as it does in the gate lookup:
+    // the reveal test compares this against TRUE sweep azimuths reported by
+    // the radar, and a rotated pane would otherwise reveal the wrong wedge.
+    let rotation_deg = if options.rotation_rad.is_finite() {
+        options.rotation_rad.to_degrees()
+    } else {
+        0.0
+    };
+    azimuth_from_xy(dx_km, dy_km) - rotation_deg
 }
 
 /// What a layer does to a stored value on the way to a colour.
@@ -833,6 +841,7 @@ mod tests {
             radar_y_px: 100.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         }
     }
 
@@ -1799,6 +1808,7 @@ mod tests {
             radar_y_px: 71.75,
             km_per_px_x: 0.37,
             km_per_px_y: 0.61,
+            rotation_rad: 0.0,
         };
         let (incoming_cut, incoming_grid) = sweep(0.0, 360, INCOMING_RAW);
         let expected = normal_render_with(&incoming_cut, &incoming_grid, raster_options);
@@ -1841,6 +1851,7 @@ mod tests {
                 radar_y_px: 0.0,
                 km_per_px_x: 0.0,
                 km_per_px_y: 0.0,
+                rotation_rad: 0.0,
             },
             ViewportRasterOptions {
                 width: 5,
@@ -1849,6 +1860,7 @@ mod tests {
                 radar_y_px: 2.5,
                 km_per_px_x: -1.0,
                 km_per_px_y: -1.0,
+                rotation_rad: 0.0,
             },
             ViewportRasterOptions {
                 width: 64,
@@ -1857,6 +1869,7 @@ mod tests {
                 radar_y_px: 900.0,
                 km_per_px_x: 0.25,
                 km_per_px_y: 0.25,
+                rotation_rad: 0.0,
             },
         ] {
             let mut rgba = vec![0; viewport_rgba_buffer_len(raster_options)];
@@ -2357,11 +2370,11 @@ mod tests {
         );
     }
 
-    // -- adversarial review, second pass -----------------------------------
+    // -- tests written to break the module, not to describe it --------------
     //
-    // Everything below this line was written against the finished module rather
-    // than alongside it, to break it rather than to describe it. Each test names
-    // the input that failed before the fix beside it.
+    // Everything below this line was written against the finished module
+    // rather than alongside it. Each test names the input that failed before
+    // the fix beside it.
 
     /// A sweep of one chosen moment, scale and offset, so a test can hand the
     /// two layers grids that a caller could really get them confused over.
@@ -2714,6 +2727,7 @@ mod tests {
             radar_y_px: 200.5,
             km_per_px_x: 0.1,
             km_per_px_y: 0.1,
+            rotation_rad: 0.0,
         };
         let (incoming_cut, incoming_grid) = velocity_sweep(0.0, 360, 10.0);
         let (previous_cut, previous_grid) = velocity_sweep(0.0, 360, 10.0);
@@ -2976,6 +2990,7 @@ mod tests {
             radar_y_px: 100.5,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
         let (wide_cut, wide_grid) =
             sized_sweep(0.0, 360, PREVIOUS_RAW, FIRST_GATE_M, GATE_SPACING_M, 90);
@@ -3100,8 +3115,32 @@ mod tests {
         PathBuf::from("level2-live")
     }
 
-    /// Every cached archive file, sorted so a run is reproducible.
+    /// One Archive II file named by `NEXRAD_LEVEL2_SAMPLE` -- the workspace's
+    /// existing convention for pointing a test at real data.
+    fn pinned_sample() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os("NEXRAD_LEVEL2_SAMPLE")?);
+        assert!(
+            path.is_file(),
+            "NEXRAD_LEVEL2_SAMPLE names {}, which is not a file",
+            path.display()
+        );
+        Some(path)
+    }
+
+    /// The volumes these tests run on, most deterministic source first: the
+    /// pinned `NEXRAD_LEVEL2_SAMPLE`, else every archive file in the cache
+    /// directory, sorted.
+    ///
+    /// The default source is the LIVE cache the running app fills, so which
+    /// volumes are there records which radars were last looked at and changes
+    /// while the app runs. No test below may FAIL because of what it found:
+    /// they state their preconditions and skip out loud. Pin
+    /// `NEXRAD_LEVEL2_SAMPLE` at one volume to make a run repeatable, which is
+    /// what a gate needs.
     fn cached_volumes() -> Vec<PathBuf> {
+        if let Some(path) = pinned_sample() {
+            return vec![path];
+        }
         let Ok(entries) = std::fs::read_dir(level2_cache_dir()) else {
             return Vec::new();
         };
@@ -3134,6 +3173,7 @@ mod tests {
             radar_y_px: 350.0,
             km_per_px_x: 0.7,
             km_per_px_y: 0.7,
+            rotation_rad: 0.0,
         }
     }
 
@@ -3398,6 +3438,14 @@ mod tests {
             .filter(|(_, (reference, candidate))| reference[3] != 0 && candidate[3] == 0)
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// How many pixels a raster actually paints. How much echo a sweep puts on
+    /// screen is the cache's business -- a 15 deg tilt reaches 60 km where a
+    /// 0.5 deg tilt reaches 460 km -- so shares of THIS are what the tests
+    /// below assert on, never absolute pixel counts.
+    fn painted_pixels(pixels: &[u8]) -> usize {
+        pixels.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
     }
 
     fn differing_pixels(left: &[u8], right: &[u8]) -> Vec<usize> {
@@ -3713,15 +3761,36 @@ mod tests {
             );
 
             let ground_relative = render_blend_with(&blend, real_options());
+            let painted = painted_pixels(&ground_relative);
             let moved = differing_pixels(&blended, &ground_relative);
+            let share = moved.len() as f32 / painted.max(1) as f32;
             println!(
-                "{label}: storm motion changed {} px ({:.1}%)",
+                "{label}: {painted} px of echo, storm motion changed {} of them ({:.1}% of the \
+                 echo, {:.1}% of the frame)",
                 moved.len(),
+                100.0 * share,
                 100.0 * moved.len() as f32 / (real_options().width * real_options().height) as f32
             );
+            // Measured as a share of the echo, not as a count of pixels: the
+            // dealiased layer is whichever cut folds hardest, which on a day
+            // of high-tilt folding is a 15 deg sweep painting a few thousand
+            // pixels where the 0.5 deg sweep paints forty thousand. A count
+            // would only be measuring which tilt the cache happened to offer;
+            // the share is a property of the shading, and it is near total
+            // (measured 93.5 % and 100.0 % on KAKQ 2026-08-20 18:22 UTC).
+            if painted < 1_000 {
+                eprintln!(
+                    "{label}: only {painted} px of echo on screen, too little to conclude from; \
+                     skipping the storm-motion half of this layer"
+                );
+                continue;
+            }
             assert!(
-                moved.len() > 10_000,
-                "{label}: a storm motion that moves almost nothing proves nothing"
+                share > 0.5,
+                "{label}: a 20 m/s storm motion changed {} of the {painted} pixels this sweep \
+                 paints ({:.1}%) -- a layer still in the ground-relative frame looks like this",
+                moved.len(),
+                100.0 * share
             );
         }
     }

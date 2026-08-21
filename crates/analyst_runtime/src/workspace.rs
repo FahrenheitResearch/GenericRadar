@@ -254,6 +254,13 @@ impl WorkspaceState {
     /// who turned the map to put a front across the screen asked for that, and
     /// no part of arriving at a radar undoes it.
     ///
+    /// That is a statement about the STORED rotation, which is the only
+    /// rotation this crate knows about. What the analyst SEES may still change,
+    /// because the map scene adds a derived north-up rotation on top of it that
+    /// depends on where the pane is looking; arriving at a radar puts the
+    /// antenna in the middle of the pane, where that derived term is exactly
+    /// zero. See `map_scene::projection::RadarProjection::view_rotation_rad`.
+    ///
     /// Returns every pane whose camera moved. It ignores camera link groups
     /// deliberately: every pane is being pointed at the same anchor, so they
     /// all end up sharing the camera a link group would have given them.
@@ -323,10 +330,18 @@ impl WorkspaceState {
     /// this method exists to answer, not a fix for it.
     ///
     /// Returns every pane whose camera moved.
+    /// `display_rotation` is the rotation the pane will actually be DRAWN
+    /// with, once the new anchor is in place and the held centre is where it
+    /// says. It is asked for, rather than read off the stored camera, because
+    /// the stored camera carries only the analyst's own rotation while the
+    /// pane may be displayed with a derived one on top of it - and the second
+    /// clause below measures a SCREEN rectangle, which a rotation turns.
+    /// Returning `0.0` from it restores exactly the behaviour that shipped.
     pub fn apply_site_change(
         &mut self,
         viewports: &[Option<ViewportMetrics>; MAX_PANES],
         mut reproject: impl FnMut(WorldPoint) -> Option<WorldPoint>,
+        display_rotation: impl Fn(PaneId, WorldPoint) -> f32,
     ) -> Vec<PaneId> {
         let mut decided = [None; MAX_PANES];
         for index in std::iter::once(self.active_pane.index()).chain(0..MAX_PANES) {
@@ -339,7 +354,11 @@ impl WorkspaceState {
                 previous.center_east_km,
                 previous.center_north_km,
             ));
-            let decision = decide_across_site_change(previous, held, viewports[index]);
+            let display_rotation_rad = held.map_or(previous.rotation_rad, |world| {
+                previous.rotation_rad + display_rotation(leader, world)
+            });
+            let decision =
+                decide_across_site_change(previous, held, viewports[index], display_rotation_rad);
             let group = self.pane(leader).links.camera;
             for (follower, slot) in decided.iter_mut().enumerate() {
                 let shares_camera = follower == index
@@ -462,10 +481,17 @@ impl WorkspaceState {
 /// It is applied to the middle of the screen, and only there; see
 /// [`decide_across_site_change`] for the measurement that settled that.
 ///
+/// `pub` because the map projection needs the SAME radius, for the same
+/// reason, and two 460s in two crates would be one citation and one accident
+/// waiting to drift apart: `map_scene::projection::RadarProjection::view_rotation_rad`
+/// leaves the map exactly as it is whenever the middle of the pane is inside
+/// this range, which is the definition of "the analyst is still working this
+/// radar" already written here.
+///
 /// Crum, T. D., and R. L. Alberty, 1993: The WSR-88D and the WSR-88D
 /// Operational Support Facility. Bull. Amer. Meteor. Soc., 74, 1669-1687,
 /// doi:10.1175/1520-0477(1993)074<1669:TWATWO>2.0.CO;2.
-const NEXRAD_SURVEILLANCE_RANGE_KM: f64 = 460.0;
+pub const NEXRAD_SURVEILLANCE_RANGE_KM: f64 = 460.0;
 
 /// What a site change did to one camera.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -526,6 +552,7 @@ fn decide_across_site_change(
     previous: Camera2D,
     held_center: Option<WorldPoint>,
     viewport: Option<ViewportMetrics>,
+    display_rotation_rad: f32,
 ) -> SiteChangeDecision {
     let previous = previous.sanitized();
     // A geodesic that did not converge is not a place. Substituting one would
@@ -536,9 +563,16 @@ fn decide_across_site_change(
     else {
         return SiteChangeDecision::Recentre;
     };
+    // The pane as it will be DISPLAYED: the second clause below asks whether
+    // the antenna is inside a screen rectangle, and a rectangle measured with
+    // the wrong rotation is the wrong rectangle. The dominant first clause is
+    // rotation-independent, so this only bites for a pane whose centre is
+    // already beyond the surveillance range and whose antenna is near the
+    // edge - which is exactly the case that would never have failed loudly.
     let held_camera = Camera2D {
         center_east_km: held.east_km,
         center_north_km: held.north_km,
+        rotation_rad: display_rotation_rad,
         ..previous
     };
     let reaches_the_middle = held.east_km.hypot(held.north_km) <= NEXRAD_SURVEILLANCE_RANGE_KM;
@@ -588,6 +622,30 @@ fn antenna_gap_km(camera: Camera2D, viewport: Option<ViewportMetrics>) -> f64 {
 mod tests {
     use super::*;
     use crate::{DEFAULT_KM_PER_POINT, MAX_KM_PER_POINT};
+
+    /// A pane drawn with no derived rotation on top of the analyst's own,
+    /// which is what the application did before the map learned to straighten
+    /// itself. Every test below that is not ABOUT the rotation uses it, so
+    /// they keep asserting exactly what they asserted before.
+    fn no_display_rotation(_pane: PaneId, _world: WorldPoint) -> f32 {
+        0.0
+    }
+
+    /// The same shim for the decision function, so the eight tests that call
+    /// it directly keep reading as the questions they are about. Shadows the
+    /// glob-imported item of the same name, which is the point.
+    fn decide_across_site_change(
+        previous: Camera2D,
+        held_center: Option<WorldPoint>,
+        viewport: Option<ViewportMetrics>,
+    ) -> SiteChangeDecision {
+        super::decide_across_site_change(
+            previous,
+            held_center,
+            viewport,
+            previous.sanitized().rotation_rad,
+        )
+    }
 
     #[test]
     fn layout_limits_active_panes() {
@@ -784,7 +842,11 @@ mod tests {
         let previous = camera_at(40.0, -60.0, 0.35);
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, previous);
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KMKX_TO_KLOT));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KMKX_TO_KLOT),
+            no_display_rotation,
+        );
         let held = workspace.pane(PANE_0).camera;
         let moved = (held.center_east_km - previous.center_east_km)
             .hypot(held.center_north_km - previous.center_north_km);
@@ -807,8 +869,11 @@ mod tests {
         };
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, previous);
-        let changed = workspace
-            .apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KMKX_TO_KLOT));
+        let changed = workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KMKX_TO_KLOT),
+            no_display_rotation,
+        );
         assert_eq!(changed, vec![PANE_0, PANE_1, PANE_2, PANE_3]);
         let camera = workspace.pane(PANE_0).camera;
         assert_centre(camera, 1.631_773, 91.336_141);
@@ -913,7 +978,11 @@ mod tests {
         let previous = camera_at(15.0, -25.0, 0.1);
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, previous);
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KTLX_TO_TOKC));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KTLX_TO_TOKC),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 36.172_705, -18.576_150);
     }
 
@@ -923,7 +992,11 @@ mod tests {
     fn a_storm_downrange_of_the_old_radar_survives_the_change() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(120.0, 180.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KTLX_TO_KEAX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KTLX_TO_KEAX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, -148.430_324, -205.353_865);
     }
 
@@ -938,7 +1011,11 @@ mod tests {
         };
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, previous);
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KTLX_TO_KMKX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KTLX_TO_KMKX),
+            no_display_rotation,
+        );
         let camera = workspace.pane(PANE_0).camera;
         assert_centre(camera, 0.0, 0.0);
         assert_eq!(camera.km_per_point, previous.km_per_point);
@@ -953,7 +1030,11 @@ mod tests {
     fn a_continent_wide_view_is_not_dragged_by_a_site_change() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(0.0, 0.0, 4.0));
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KTLX_TO_KMKX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KTLX_TO_KMKX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, -794.544_771, -808.225_853);
         assert_eq!(workspace.pane(PANE_0).camera.km_per_point, 4.0);
     }
@@ -970,12 +1051,20 @@ mod tests {
     fn the_hold_decision_straddles_on_whether_the_antenna_is_on_screen() {
         let mut inside = WorkspaceState::default();
         inside.apply_camera_from(PANE_0, camera_at(0.0, 0.0, 4.0));
-        inside.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KTLX_TO_KEAX));
+        inside.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KTLX_TO_KEAX),
+            no_display_rotation,
+        );
         assert_centre(inside.pane(PANE_0).camera, -274.078_999, -381.457_276);
 
         let mut outside = WorkspaceState::default();
         outside.apply_camera_from(PANE_0, camera_at(0.0, 0.0, 4.0));
-        outside.apply_site_change(&everywhere(None), measured(KTLX_TO_KEAX));
+        outside.apply_site_change(
+            &everywhere(None),
+            measured(KTLX_TO_KEAX),
+            no_display_rotation,
+        );
         assert_centre(outside.pane(PANE_0).camera, 0.0, 0.0);
     }
 
@@ -994,7 +1083,7 @@ mod tests {
             workspace.apply_camera_from(PANE_0, camera_at(0.0, 0.0, 4.0));
             let mut viewports = everywhere(viewport(1200.0, 800.0));
             viewports[PANE_1.index()] = None;
-            workspace.apply_site_change(&viewports, measured(KTLX_TO_KEAX));
+            workspace.apply_site_change(&viewports, measured(KTLX_TO_KEAX), no_display_rotation);
             assert_centre(
                 workspace.pane(PANE_0).camera,
                 expected_east_km,
@@ -1018,7 +1107,7 @@ mod tests {
         workspace.pane_mut(PANE_1).links.camera = None;
         let mut viewports = everywhere(viewport(1200.0, 800.0));
         viewports[PANE_1.index()] = None;
-        workspace.apply_site_change(&viewports, measured(KTLX_TO_KEAX));
+        workspace.apply_site_change(&viewports, measured(KTLX_TO_KEAX), no_display_rotation);
         assert_centre(workspace.pane(PANE_0).camera, -274.078_999, -381.457_276);
         assert_centre(workspace.pane(PANE_1).camera, 0.0, 0.0);
         assert_centre(workspace.pane(PANE_2).camera, -274.078_999, -381.457_276);
@@ -1041,7 +1130,11 @@ mod tests {
         assert_eq!(workspace.pane(PANE_0).links.camera, Some(0));
         assert_eq!(workspace.pane(PANE_1).links.camera, Some(0));
 
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(KMKX_TO_KLOT));
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(KMKX_TO_KLOT),
+            no_display_rotation,
+        );
 
         assert_centre(workspace.pane(PANE_0).camera, 1.631_773, 91.336_141);
         assert_centre(workspace.pane(PANE_1).camera, -38.039_582, 151.554_885);
@@ -1064,13 +1157,17 @@ mod tests {
         workspace.set_layout(PaneLayout::Four);
         workspace.pane_mut(PANE_0).camera = camera_at(40.0, -60.0, 0.35);
         workspace.pane_mut(PANE_1).camera = camera_at(10.0, 10.0, 0.35);
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), |world| {
-            if world.east_km == 10.0 {
-                Some(WorldPoint::new(f64::INFINITY, f64::NAN))
-            } else {
-                Some(WorldPoint::new(1.631_773, 91.336_141))
-            }
-        });
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            |world| {
+                if world.east_km == 10.0 {
+                    Some(WorldPoint::new(f64::INFINITY, f64::NAN))
+                } else {
+                    Some(WorldPoint::new(1.631_773, 91.336_141))
+                }
+            },
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 1.631_773, 91.336_141);
         assert_centre(workspace.pane(PANE_1).camera, 0.0, 0.0);
         assert!(workspace.pane(PANE_1).camera.center_east_km.is_finite());
@@ -1081,7 +1178,11 @@ mod tests {
     fn a_reprojection_that_cannot_answer_recentres_rather_than_inventing_a_place() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(40.0, -60.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), |_| None);
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            |_| None,
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 0.0, 0.0);
     }
 
@@ -1105,7 +1206,11 @@ mod tests {
         );
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(40.0, -60.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), |_| poison);
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            |_| poison,
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 0.0, 0.0);
     }
 
@@ -1161,7 +1266,11 @@ mod tests {
         workspace.set_layout(PaneLayout::Four);
         assert!(workspace.set_active(PANE_2));
         workspace.apply_camera_from(PANE_0, camera_at(40.0, -60.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1200.0, 800.0)), measured(KMKX_TO_KLOT));
+        workspace.apply_site_change(
+            &everywhere(viewport(1200.0, 800.0)),
+            measured(KMKX_TO_KLOT),
+            no_display_rotation,
+        );
         assert_eq!(workspace.layout, PaneLayout::Four);
         assert_eq!(workspace.active_pane, PANE_2);
     }
@@ -1175,7 +1284,11 @@ mod tests {
     fn the_worst_real_pair_of_the_old_rule_now_takes_the_middle_of_the_screen() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(0.0, 0.0, DEFAULT_KM_PER_POINT));
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(KDGX_TO_KTLX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(KDGX_TO_KTLX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 0.0, 0.0);
     }
 
@@ -1190,12 +1303,20 @@ mod tests {
     fn a_site_change_across_the_dateline_is_decided_the_same_way_as_any_other() {
         let mut working = WorkspaceState::default();
         working.apply_camera_from(PANE_0, camera_at(120.0, -80.0, DEFAULT_KM_PER_POINT));
-        working.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(PGUA_TO_KTLX));
+        working.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(PGUA_TO_KTLX),
+            no_display_rotation,
+        );
         assert_centre(working.pane(PANE_0).camera, 0.0, 0.0);
 
         let mut whole_earth = WorkspaceState::default();
         whole_earth.apply_camera_from(PANE_0, camera_at(0.0, 0.0, MAX_KM_PER_POINT));
-        whole_earth.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(PGUA_TO_KTLX));
+        whole_earth.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(PGUA_TO_KTLX),
+            no_display_rotation,
+        );
         assert_centre(
             whole_earth.pane(PANE_0).camera,
             -10_202.793_114,
@@ -1209,7 +1330,11 @@ mod tests {
     fn a_radar_forty_kilometres_away_holds_the_ground() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(25.0, -15.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(KMKX_TO_TMKE));
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(KMKX_TO_TMKE),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, -16.253_524, 1.500_626);
     }
 
@@ -1221,7 +1346,11 @@ mod tests {
     fn a_radar_two_thousand_kilometres_away_takes_the_middle_of_the_screen() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(60.0, 90.0, 0.35));
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(KTLX_TO_KVTX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(KTLX_TO_KVTX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 0.0, 0.0);
         assert_eq!(workspace.pane(PANE_0).camera.km_per_point, 0.35);
     }
@@ -1234,7 +1363,11 @@ mod tests {
     fn the_far_extreme_holds_its_ground_when_one_screen_holds_both_radars() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(0.0, 0.0, MAX_KM_PER_POINT));
-        workspace.apply_site_change(&everywhere(viewport(1484.0, 820.0)), measured(KTLX_TO_KVTX));
+        workspace.apply_site_change(
+            &everywhere(viewport(1484.0, 820.0)),
+            measured(KTLX_TO_KVTX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 1_975.188_228, 319.895_759);
         assert_eq!(workspace.pane(PANE_0).camera.km_per_point, MAX_KM_PER_POINT);
     }
@@ -1245,7 +1378,11 @@ mod tests {
     fn a_pane_with_no_viewport_is_measured_as_a_point() {
         let mut workspace = WorkspaceState::default();
         workspace.apply_camera_from(PANE_0, camera_at(0.0, 0.0, 0.05));
-        workspace.apply_site_change(&everywhere(None), measured(KTLX_TO_KEAX));
+        workspace.apply_site_change(
+            &everywhere(None),
+            measured(KTLX_TO_KEAX),
+            no_display_rotation,
+        );
         assert_centre(workspace.pane(PANE_0).camera, 0.0, 0.0);
     }
 

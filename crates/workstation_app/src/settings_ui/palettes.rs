@@ -1,8 +1,8 @@
 //! Persisting colour table choices, and restoring them defensively.
 //!
 //! A palette is stored as its **base name** plus its **rendering** - the two
-//! halves `color_tables` split a table into when rendering became a property
-//! (commit 18af957): `base_name()` is stable across the smooth/stepped
+//! halves `color_tables` splits a table into now that rendering is a
+//! property: `base_name()` is stable across the smooth/stepped
 //! switch, and the rendering is one word. Restoring resolves the name
 //! through the shipped catalog for that family, then through the analyst's
 //! own colour table folder - the one `settings::user_colortables_dir` names,

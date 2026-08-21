@@ -55,11 +55,24 @@ const KTLX: (f64, f64) = (35.333_049_774_169_92, -97.277_748_107_910_16);
 /// ocean.
 const RODN: (f64, f64) = (26.302_000_045_776_367, 127.909_004_211_425_78);
 
-/// The live site catalogue the application downloads and caches.
-const SITE_CATALOGUE: &str = concat!(
-    env!("LOCALAPPDATA"),
-    "\\FahrenheitResearch\\RadarWorkstation\\cache\\radar-sites.tsv"
-);
+/// The live site catalogue the application downloads and caches, resolved the
+/// way `sites_service::cache_path` resolves it.
+///
+/// Resolved when the test RUNS, not when it builds: as a compile-time
+/// `env!("LOCALAPPDATA")` this made the whole test binary fail to compile on
+/// any machine without that variable, and baked one machine's profile path
+/// into the binary on the machines where it did compile.
+fn site_catalogue() -> Option<PathBuf> {
+    let base = if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+        PathBuf::from(path)
+            .join("FahrenheitResearch")
+            .join("RadarWorkstation")
+            .join("cache")
+    } else {
+        PathBuf::from(std::env::var_os("XDG_CACHE_HOME")?).join("radar-workstation")
+    };
+    Some(base.join("radar-sites.tsv"))
+}
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
@@ -326,9 +339,13 @@ fn uniform_for(camera: Camera2D, viewport: ViewportMetrics, blend: f32) -> [f32;
     let sy = scale / half_height_points;
     let cx = camera.center_east_km as f32;
     let cy = camera.center_north_km as f32;
+    // Row 0 scaled by `sx`, row 1 by `sy`, matching the shipped
+    // `MapPaintCallback::uniform`. Every frame here is drawn at rotation 0,
+    // where the two forms differ only by the sign of zero, but a stale
+    // transcription is a lie waiting to be believed.
     let m00 = cos * sx;
-    let m10 = sin * sx;
-    let m01 = -sin * sy;
+    let m01 = sin * sx;
+    let m10 = -sin * sy;
     let m11 = cos * sy;
     let tx = -(m00 * cx + m01 * cy);
     let ty = -(m10 * cx + m11 * cy);
@@ -654,11 +671,14 @@ fn geometry_for_bucket(lod: LodBucket, anchor: (f64, f64)) -> Arc<MapGeometry> {
     }))
 }
 
-/// The REAL site catalogue, as the application cached it.
-fn real_sites() -> Vec<(String, f64, f64)> {
-    let text = std::fs::read_to_string(SITE_CATALOGUE)
-        .unwrap_or_else(|error| panic!("the real site catalogue at {SITE_CATALOGUE}: {error}"));
-    text.lines()
+/// The REAL site catalogue, as the application cached it. `None` when the app
+/// has never downloaded it on this machine -- a state of the machine, not of
+/// this crate, so the callers say so out loud and stop.
+fn real_sites() -> Option<Vec<(String, f64, f64)>> {
+    let path = site_catalogue()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let sites: Vec<(String, f64, f64)> = text
+        .lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
             let id = fields.next()?.to_owned();
@@ -666,7 +686,22 @@ fn real_sites() -> Vec<(String, f64, f64)> {
             let lon = fields.next()?.parse().ok()?;
             Some((id, lat, lon))
         })
-        .collect()
+        .collect();
+    (!sites.is_empty()).then_some(sites)
+}
+
+/// The catalogue, or the reason there is not one, for a test to print before
+/// it stops.
+fn real_sites_or_reason() -> Result<Vec<(String, f64, f64)>, String> {
+    match site_catalogue() {
+        None => Err("this platform has no cache root to look in".to_owned()),
+        Some(path) => real_sites().ok_or_else(|| {
+            format!(
+                "the app has not cached a site catalogue at {} yet",
+                path.display()
+            )
+        }),
+    }
 }
 
 /// Draw the site markers into the read-back frame the way `draw_radar_sites`
@@ -676,7 +711,9 @@ fn draw_sites(pixels: &mut [u8], camera: Camera2D, blend: f32, color: [u8; 3]) -
     let projection = RadarProjection::new(KTLX.0, KTLX.1);
     let viewport = viewport().sanitized();
     let mut drawn = 0;
-    for (_, lat, lon) in real_sites() {
+    // Only reached from the ignored PNG proof, which the operator asked for by
+    // name: no catalogue there is a reason to stop, not to draw nothing.
+    for (_, lat, lon) in real_sites().expect("the app has cached a site catalogue") {
         let Some(world) = projection.try_lon_lat_to_world(lon, lat) else {
             continue;
         };
@@ -1010,7 +1047,16 @@ fn the_marker_cull_and_the_line_fade_share_one_horizon() {
 /// hop is the case where the whole globe turns under the analyst.
 #[test]
 fn switching_to_a_radar_22_km_or_1903_km_away_keeps_the_near_view_and_the_limb_honest() {
-    let sites = real_sites();
+    let sites = match real_sites_or_reason() {
+        Ok(sites) => sites,
+        Err(reason) => {
+            println!(
+                "SKIPPED switching_to_a_radar_22_km_or_1903_km_away_keeps_the_near_view_and_the_limb_honest: \
+                 {reason}, so the anchor hop is UNPROVEN on this machine"
+            );
+            return;
+        }
+    };
     let find = |id: &str| {
         sites
             .iter()
@@ -1088,7 +1134,16 @@ fn switching_to_a_radar_22_km_or_1903_km_away_keeps_the_near_view_and_the_limb_h
 #[test]
 fn real_sites_return_to_their_own_pixel_after_a_zoom_round_trip() {
     let projection = RadarProjection::new(KTLX.0, KTLX.1);
-    let sites = real_sites();
+    let sites = match real_sites_or_reason() {
+        Ok(sites) => sites,
+        Err(reason) => {
+            println!(
+                "SKIPPED real_sites_return_to_their_own_pixel_after_a_zoom_round_trip: {reason}, \
+                 so the zoom round trip is UNPROVEN on this machine"
+            );
+            return;
+        }
+    };
     assert!(
         sites.len() > 100,
         "the real catalogue is {} rows",

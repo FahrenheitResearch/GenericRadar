@@ -396,6 +396,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         radar_y_px: 400.0,
         km_per_px_x: 0.25,
         km_per_px_y: 0.25,
+        rotation_rad: 0.0,
     };
     for (label, quality) in [
         ("native", DisplayQuality::NATIVE),

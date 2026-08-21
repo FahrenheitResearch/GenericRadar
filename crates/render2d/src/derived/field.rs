@@ -73,6 +73,13 @@ pub struct FieldRasterOptions {
     pub radar_y_px: f32,
     pub km_per_px_x: f32,
     pub km_per_px_y: f32,
+    /// Clockwise screen rotation of the camera, radians, exactly as on
+    /// [`crate::ViewportRasterOptions`].
+    ///
+    /// The polar path's azimuth shortcut does NOT apply here: a derived field
+    /// is sampled on a Cartesian analysis grid, not on a polar lattice, so the
+    /// sample coordinate takes the full two-by-two rotation.
+    pub rotation_rad: f32,
 }
 
 /// Paint a field into an RGBA buffer.
@@ -97,11 +104,26 @@ pub fn render_field_rgba_into(
     rgba.fill(0);
 
     let folded = table.range_folded_rgba();
+    // The inverse of the camera's screen rotation, applied once per raster
+    // rather than derived per pixel. `Camera2D::screen_to_world` uses the
+    // reflection `(cos, sin; sin, -cos)` on a screen offset whose y grows
+    // DOWNWARD; the offsets below are stated with north positive, which flips
+    // the sign of the second column and leaves the plain rotation written
+    // here. At zero rotation `sin` is 0 and `cos` is 1, so both expressions
+    // collapse to the two the shipped code wrote.
+    let rotation_rad = if options.rotation_rad.is_finite() {
+        options.rotation_rad
+    } else {
+        0.0
+    };
+    let (sin, cos) = rotation_rad.sin_cos();
     for y in 0..options.height {
         for x in 0..options.width {
             // Pixel centres, matching the polar viewport path. +y is south.
-            let east_km = f64::from((x as f32 + 0.5 - options.radar_x_px) * options.km_per_px_x);
-            let north_km = f64::from((options.radar_y_px - (y as f32 + 0.5)) * options.km_per_px_y);
+            let screen_east_km = (x as f32 + 0.5 - options.radar_x_px) * options.km_per_px_x;
+            let screen_north_km = (options.radar_y_px - (y as f32 + 0.5)) * options.km_per_px_y;
+            let east_km = f64::from(cos * screen_east_km - sin * screen_north_km);
+            let north_km = f64::from(sin * screen_east_km + cos * screen_north_km);
             let Some((value, state)) = field.sample(GroundPointKm::new(east_km, north_km)) else {
                 continue;
             };
@@ -186,6 +208,7 @@ mod tests {
             radar_y_px: 4.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let mut rgba = vec![255_u8; field_rgba_buffer_len(options)];
         render_field_rgba_into(&field, &builtin_reflectivity_table(), options, &mut rgba);
@@ -206,6 +229,7 @@ mod tests {
             radar_y_px: 2.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let mut rgba = vec![0_u8; field_rgba_buffer_len(options)];
         render_field_rgba_into(&field, &table, options, &mut rgba);
@@ -227,6 +251,7 @@ mod tests {
             radar_y_px: 1.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let mut rgba = vec![0_u8; field_rgba_buffer_len(options)];
         render_field_rgba_into(&field, &table, options, &mut rgba);
@@ -263,6 +288,7 @@ mod tests {
             radar_y_px: 2.5,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
         let mut rgba = vec![0_u8; field_rgba_buffer_len(options)];
         render_field_rgba_into(&field, &builtin_reflectivity_table(), options, &mut rgba);

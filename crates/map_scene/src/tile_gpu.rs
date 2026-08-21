@@ -613,9 +613,13 @@ impl TilePaintCallback {
         let cx = camera.center_east_km as f32;
         let cy = camera.center_north_km as f32;
 
+        // Same packing, same row/column discipline, and the same reason: see
+        // the comment on [`crate::gpu::MapPaintCallback::uniform`]. The two
+        // must agree scalar for scalar, which
+        // `the_tile_camera_matches_the_vector_map_camera_exactly` pins.
         let m00 = cos * sx;
-        let m10 = sin * sx;
-        let m01 = -sin * sy;
+        let m01 = sin * sx;
+        let m10 = -sin * sy;
         let m11 = cos * sy;
         let tx = -(m00 * cx + m01 * cy);
         let ty = -(m10 * cx + m11 * cy);

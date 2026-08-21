@@ -3,8 +3,8 @@
 How a new capability — a data
 provider, a derived product, an overlay, a whole module ported from BowEcho —
 plugs into this workspace so that it appears in the application, appears in
-the master settings window, persists its state, and passes the gates. It is
-written for an agent doing the work: exact seams, exact files, no narrative.
+the master settings window, persists its state, and passes the gates. It
+gives exact seams and exact files, and no narrative.
 
 Baseline for this document: the settings system landed with the
 `settings` crate rewrite and `workstation_app/src/settings_ui.rs`.
@@ -466,25 +466,27 @@ Plus the standing rules that are not commands:
   ≥ 24 pt (`settings_ui::MIN_INTERACT_HEIGHT` is the existing floor), no
   hardcoded desktop paths (§2.5), no continuous repaint (repaint on input or
   on `request_repaint_after` with a reason).
-* **Line endings are per-file.** This tree mixes CRLF and LF; scripts that
-  patch files must detect and preserve. Never bulk-rewrite files with
-  PowerShell `Get-Content`/`Set-Content`.
+* **Line endings are LF.** `.gitattributes` sets `* text=auto eol=lf` for the
+  whole tree; do not commit CRLF, and prefer editors and scripts that leave
+  the ending alone rather than rewriting a whole file to change one line.
 * The firewall test (§1) runs with `-p workstation_app`; if your change adds
   a workstation dependency without the allowlist comment, the gate is red by
   design.
 
-## 6. Current temporary scaffolding (delete-on-wiring)
+## 6. The settings window is compiled in two homes
 
-Until the human-owned `mod settings_ui;` wiring lands in
-`workstation_app/src/main.rs`, the settings window is compiled and tested via
-`crates/settings/tests/workstation_settings_ui.rs` (a `#[path]` include of
-the real source) and photographed via
-`crates/settings/examples/settings_preview.rs`. When the wiring lands:
+`workstation_app/src/settings_ui.rs` is linked into the binary by
+`mod settings_ui;` in `workstation_app/src/main.rs`. It is ALSO compiled a
+second time by `crates/settings/tests/workstation_settings_ui.rs` (a `#[path]`
+include of the same source) and photographed by
+`crates/settings/examples/settings_preview.rs`. That is deliberate, and if you
+touch the settings window:
 
-* keep the example (it remains the fastest way to photograph the window),
-* delete the harness test **or** leave it as a second compile — but if it is
-  deleted, move its three proof tests into `settings_ui`'s own `#[cfg(test)]`
-  modules first,
+* keep the example — it remains the fastest way to photograph the window,
+* keep the harness test, or if you delete it, move its three proof tests into
+  `settings_ui`'s own `#[cfg(test)]` modules first. The harness is what pins
+  that the settings window reaches back into nothing in `workstation_app`; a
+  change that breaks that rule fails there before it fails anywhere else,
 * do not "simplify" the explicit `#[path = "settings_ui/…"]` child-module
   attributes in `settings_ui.rs`; the comment above them says why they
   resolve identically in both homes.

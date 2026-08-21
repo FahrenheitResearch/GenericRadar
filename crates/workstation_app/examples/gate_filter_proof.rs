@@ -9,13 +9,13 @@
 //! through its own `eframe::App::ui` until the volume is on the bar, and then
 //! **driven with synthetic pointer events through the real controls**: the
 //! toolbar chip is clicked to open its panel, a preset row is clicked to apply
-//! it, and the pane's own FILTERED band is clicked to clear it again. Each
+//! it, and the bar's own clear key is clicked to clear it again. Each
 //! step is rasterised through the real egui to wgpu pipeline.
 //!
 //! So the five frames per theme are:
 //!
-//! 1. `off` - the shipped state. The chip reads "Filter: off" and no pane
-//!    carries a band.
+//! 1. `off` - the shipped state. The chip reads "Filter: off", the bar offers
+//!    no clear key and no pane says anything about a filter.
 //! 2. `panel` - the live control open: the presets, the four thresholds with
 //!    "off" written at their left ends, the range-folded toggle, and the way
 //!    out.
@@ -23,11 +23,19 @@
 //!    down: the thresholds now carry the preset's numbers and the panel names
 //!    what it is hiding, in the theme's error ink, immediately above the way
 //!    out of it.
-//! 4. `storm` - the same state with the panel put away. Every pane carries the
-//!    FILTERED band, the legend badge stack carries its one-word copy, and the
-//!    chip is latched and names the preset.
-//! 5. `cleared` - after clicking the band. Back to (1), which is the half of
-//!    the safety rule that says there must be one obvious way out.
+//! 4. `storm` - the same state with the panel put away. Every pane's header
+//!    carries the whole statement, the legend badge stack carries its one-word
+//!    copy, the chip is latched and names the preset, and the clear key sits
+//!    beside it.
+//! 5. `cleared` - after clicking the clear key. Back to (1), which is the half
+//!    of the safety rule that says there must be one obvious way out.
+//!
+//! There used to be a fifth indicator and it was the loudest: a full-width
+//! FILTERED band across the top of every filtered pane, which is what step 5
+//! used to click. It is gone, so what these photographs are now for is the
+//! harder question that its removal raises -
+//! whether the quiet indicators that remain are legible at the sizes and
+//! scales an analyst actually runs.
 //!
 //! It asserts what it photographed rather than only writing the files, so a
 //! run that silently stops driving the controls fails instead of producing
@@ -44,20 +52,20 @@
 //!
 //! The theme list is the catalog's, never a list here, so a theme registered
 //! tomorrow is photographed by the proof written today. That matters for this
-//! feature in particular: the pane's furniture - the band, the header, the
-//! legend badge - paints its own opaque ground on purpose and does NOT follow
-//! the theme, and "on purpose" is only credible if somebody looked at it on
-//! every theme.
+//! feature in particular: the pane's furniture - the header and the legend
+//! badge - paints its own ground on purpose and does NOT follow the theme, and
+//! "on purpose" is only credible if somebody looked at it on every theme.
 //!
 //! Nor is the scale sweep decoration. Two different multipliers reach
 //! `pixels_per_point`: the DISPLAY (a 2x panel, which egui takes as
 //! `native_pixels_per_point`) and the analyst's UI-SCALE setting (which
 //! `theme::install` puts in egui's zoom factor). egui lays out afresh under
-//! both, so the band's one-row truncation, the chip's width and the legend
-//! badge's column are all different measurements at each. A band that is
-//! unmissable on a 1408-point window at 1x is not evidence about the pane an
-//! analyst has at 160 % in the 960-point window this application opens at -
-//! which is why `full_dense_160` exists and is the tightest case here.
+//! both, so the header's one-row truncation, the chip's width, the clear key's
+//! position and the legend badge's column are all different measurements at
+//! each. A statement that is unmissable on a 1408-point window at 1x is not
+//! evidence about the pane an analyst has at 160 % in the 960-point window
+//! this application opens at - which is why `full_dense_160` exists and is the
+//! tightest case here.
 
 // The whole application, exactly as `src/main.rs` compiles it - the same
 // construction `theme_gallery` and `palette_editor_proof` use, and for the
@@ -76,6 +84,7 @@ mod source {
     pub mod load_service;
     pub mod nearest_site;
     pub mod net_tuning;
+    pub mod north_up;
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
@@ -100,9 +109,9 @@ mod source {
 #[allow(unused_imports)]
 pub(crate) use source::{
     annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, palette_editor, palettes, pane_canvas, popup, probe, product,
-    product_availability, product_picker, render_service, settings_ui, sites_service, sweep, theme,
-    units, user_tables, vol3d, vrot, warnings_service, xsection,
+    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
+    product, product_availability, product_picker, render_service, settings_ui, sites_service,
+    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};
@@ -117,15 +126,16 @@ use theme::Appearance;
 ///
 /// 1408 is 22 · 64, and the read-back below copies whole rows: wgpu requires
 /// `bytes_per_row` to be a multiple of 256, so the pixel width has to be a
-/// multiple of 64. Tall enough that the pane, its FILTERED band, the legend
-/// badge stack and the timeline are all in one frame.
+/// multiple of 64. Tall enough that the pane, its header, the legend badge
+/// stack and the timeline are all in one frame.
 const SHOT_POINTS: egui::Vec2 = egui::vec2(1408.0, 896.0);
 
 /// The smallest window the application will open in, from `main.rs`'s
 /// `with_min_inner_size`. Photographed at 2x as well as the roomy window,
 /// because the safety rule is about the pane an analyst actually has: a
-/// FILTERED band that is unmissable at 1408 points and truncated to nothing at
-/// 960 on a 2x display would satisfy the rule only on the reviewer's monitor.
+/// FILTERED statement that is unmissable at 1408 points and truncated to
+/// nothing at 960 on a 2x display would satisfy the rule only on the
+/// reviewer's monitor.
 /// 960 x 2 is 1920, a multiple of 64, so the read-back still copies whole rows.
 const MIN_WINDOW_POINTS: egui::Vec2 = egui::vec2(960.0, 620.0);
 
@@ -202,7 +212,7 @@ const CAPTURES: &[Capture] = &[
         capture_panels: false,
         tag: "full",
     },
-    // The hard case for the band: the smallest allowed window on a 2x
+    // The hard case for the header: the smallest allowed window on a 2x
     // display, where every pane is a quarter of 960 points wide.
     Capture {
         toolbar: "menus",
@@ -243,8 +253,9 @@ const CAPTURES: &[Capture] = &[
     // Dense buys its density from the space BETWEEN controls, and 160 % makes
     // every glyph and every control 1.6x while the WINDOW stays 960 x 620 -
     // so the bar has the least room it will ever have and the pane the least
-    // height. If the band's sentence and the legend's badge survive here they
-    // survive every combination the settings offer.
+    // height. If the header's sentence, the legend's badge and the bar's
+    // clear key survive here they survive every combination the settings
+    // offer.
     Capture {
         toolbar: "menus",
         points: MIN_WINDOW_POINTS_AT_160,
@@ -371,10 +382,10 @@ fn run(input: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // EVERY registered theme, not the two that existed when this was
         // written. The catalog is the list (`theme::catalog::THEMES`), so a
         // theme added tomorrow is photographed by the proof written today -
-        // which is the whole point of the catalog being data. The FILTERED
-        // band is the indicator the safety rule names, and "legible" is a
+        // which is the whole point of the catalog being data. The pane
+        // header is the indicator the safety rule names, and "legible" is a
         // claim about the theme an analyst is actually running, not about
-        // the two the band was authored against.
+        // the two it was authored against.
         for theme_spec in theme::catalog::THEMES {
             theme::apply(shot.context, &capture.appearance(theme_spec.id));
             written += photograph_one_theme(
@@ -483,8 +494,8 @@ fn photograph_one_theme(
         written += write(shot, app, theme_name, "panel_storm");
     }
 
-    // 4. Put the panel away, so the pane and its band are what the frame is
-    //    about.
+    // 4. Put the panel away, so the pane and its header are what the frame
+    //    is about.
     //
     // Put away with Escape rather than by clicking the chip again, because
     // the chip is not always reachable. In the smallest window at 160 % UI
@@ -502,12 +513,16 @@ fn photograph_one_theme(
          photograph of the panel rather than of the pane"
     );
     let after = texts(&shapes);
-    let band = after
+    // The pane header's statement: the one a setting cannot switch off. It
+    // starts with the word and a colon, which is what tells it apart from the
+    // legend's one-word badge in a list of runs.
+    let statement = after
         .iter()
-        .find(|text| text.contains("show everything"))
-        .unwrap_or_else(|| panic!("{theme_name}: a filtered pane drew no band: {after:?}"));
-    println!("  band: {band}");
-    assert!(band.starts_with(gate_filter_ui::FILTERED_WORD));
+        .find(|text| text.starts_with(&format!("{}:", gate_filter_ui::FILTERED_WORD)))
+        .unwrap_or_else(|| {
+            panic!("{theme_name}: a filtered pane made no statement at all: {after:?}")
+        });
+    println!("  header: {statement}");
     assert!(
         after.iter().any(|text| text.contains(PRESET_ROW)),
         "{theme_name}: the chip does not name the preset that is on: {after:?}"
@@ -515,44 +530,52 @@ fn photograph_one_theme(
     assert!(
         after
             .iter()
-            .any(|text| text.starts_with(gate_filter_ui::FILTERED_WORD)
-                && !text.contains("show everything")),
+            .any(|text| text.trim() == gate_filter_ui::FILTERED_WORD),
         "{theme_name}: the legend badge stack carries no filter badge: {after:?}"
     );
-    // And it landed ON THE SCREEN. Existing in the shape list is not the same
-    // as being visible: a pane allocated wider than the window draws its
+    // And the way out is on the bar, beside the chip that is latched.
+    assert!(
+        after
+            .iter()
+            .any(|text| text.trim() == gate_filter_ui::CLEAR_GLYPH),
+        "{theme_name}: a filtered bar offers no way out: {after:?}"
+    );
+    // And they landed ON THE SCREEN. Existing in the shape list is not the
+    // same as being visible: a pane allocated wider than the window draws its
     // right-aligned legend past the edge, where the badge is clipped to "FIL"
     // while still reading as FILTERED to the assertion above. That is exactly
     // what shipped, and the assertion above is exactly what missed it.
     let window = shot.context.content_rect();
-    let badge = bounds(&shapes, gate_filter_ui::FILTERED_WORD)
+    let badge = exact_bounds(&shapes, gate_filter_ui::FILTERED_WORD)
         .expect("the badge is in the shape list, so it has a rect");
     assert!(
         badge.right() <= window.right() && badge.left() >= window.left(),
         "{theme_name}: the FILTERED badge is drawn at {badge:?}, outside the {window:?} \
          window - the one indicator that says data is hidden has been pushed off screen"
     );
-    // The band as well, which is the loud one. It spans the pane's width, so
-    // a pane that ran past the window truncates its sentence too.
-    let band_rect = bounds(&shapes, "show everything").expect("the band has a rect");
+    // The clear key too. It is the only way out of a filtered view, and a bar
+    // that overflows its window - which the Everything bar does, and does more
+    // once the chip latches - would push it past the edge. This assertion is
+    // the reason the key is a single glyph rather than a labelled button.
+    let key = exact_bounds(&shapes, gate_filter_ui::CLEAR_GLYPH).expect("the key has a rect");
     assert!(
-        band_rect.right() <= window.right(),
-        "{theme_name}: the FILTERED band runs to {} against a window ending at {}",
-        band_rect.right(),
-        window.right()
+        key.right() <= window.right() && key.left() >= window.left(),
+        "{theme_name}: the clear key is drawn at {key:?}, outside the {window:?} window - \
+         the one obvious action out has been pushed off screen"
     );
     written += write(shot, app, theme_name, "storm");
 
-    // 5. The one obvious way out: click the band itself.
-    let band_at = position(&shapes, "show everything").expect("the band has a position");
-    click(shot, app, band_at);
+    // 5. The one obvious way out: click the clear key on the bar.
+    let key_at =
+        exact_position(&shapes, gate_filter_ui::CLEAR_GLYPH).expect("the clear key has a position");
+    click(shot, app, key_at);
     let shapes = settle(shot, app, 4);
     let cleared = texts(&shapes);
     assert!(
         !cleared
             .iter()
             .any(|text| text.contains(gate_filter_ui::FILTERED_WORD)),
-        "{theme_name}: clicking the band left the pane still claiming to filter: {cleared:?}"
+        "{theme_name}: clearing left the pane still claiming to filter: {cleared:?}"
     );
     assert!(
         cleared.iter().any(|text| text.starts_with("Filter: off")),
@@ -578,7 +601,7 @@ struct Shot<'a> {
     points: egui::Vec2,
     /// The display scale it is being driven at. Not a zoom on the finished
     /// picture: egui lays every galley, rounded rectangle and truncation out
-    /// again at this scale, so a band that fits at 1x is not evidence that it
+    /// again at this scale, so a line that fits at 1x is not evidence that it
     /// fits at 2x. The DISPLAY scale times the analyst's UI scale.
     pixels_per_point: f32,
     /// The display's own scale, without the analyst's UI scale on it. Fed to
@@ -874,6 +897,28 @@ fn bounds(shapes: &[egui::Shape], needle: &str) -> Option<egui::Rect> {
         }
     }
     shapes.iter().find_map(|shape| walk(shape, needle))
+}
+
+/// Where a text run that IS `wanted` landed, rather than one containing it.
+///
+/// The clear key is a single multiplication sign, and other runs on a full
+/// frame contain that character - a supersampling label, a scale readout - so
+/// the substring form would answer for whichever came first in the shape list.
+fn exact_bounds(shapes: &[egui::Shape], wanted: &str) -> Option<egui::Rect> {
+    fn walk(shape: &egui::Shape, wanted: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().trim() == wanted => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, wanted)),
+            _ => None,
+        }
+    }
+    shapes.iter().find_map(|shape| walk(shape, wanted))
+}
+
+fn exact_position(shapes: &[egui::Shape], wanted: &str) -> Option<egui::Pos2> {
+    exact_bounds(shapes, wanted).map(|rect| rect.center())
 }
 
 fn rasterise(

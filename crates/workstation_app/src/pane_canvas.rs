@@ -10,6 +10,7 @@ use map_scene::gpu::{MapPaintCallback, TilePaintCallback};
 use map_scene::{MapChrome, MapGeometry, RadarProjection, TileFrame};
 
 use crate::hazards::PlacedHazard;
+use crate::north_up::{Gesture, NorthUpFrame};
 
 use crate::annotation::Annotation;
 use crate::units::UnitSystem;
@@ -119,15 +120,6 @@ pub struct PaneOverlay<'a> {
     pub badges: &'a [String],
     /// The formatted value under the cursor, from the previous frame.
     pub probe: Option<&'a str>,
-    /// What the gate filter is hiding, when it is hiding anything.
-    ///
-    /// `Some` draws the FILTERED band under the header - unconditionally, in
-    /// the error ink, on its own opaque ground - and makes that band clear the
-    /// filter when it is clicked. It is separate from `badges` on purpose:
-    /// badges are drawn by the legend, and the legend can be switched off,
-    /// which must never be a way to switch off the admission that gates are
-    /// being hidden. See `crate::gate_filter_ui` for the whole rule.
-    pub filter_notice: Option<&'a str>,
 }
 
 /// A radar site at a known world position, ready to draw and hit-test.
@@ -162,9 +154,6 @@ pub struct PaneInteraction {
     /// Where a Ctrl+click landed, in degrees `(longitude, latitude)`, when the
     /// pane has a projection to place it with.
     pub ctrl_clicked_lon_lat: Option<(f64, f64)>,
-    /// The analyst clicked the FILTERED band. The one obvious way out of a
-    /// filtered view, right where the evidence of it is.
-    pub clear_filter_clicked: bool,
 }
 
 pub fn pane_rects(canvas: egui::Rect, layout: PaneLayout) -> Vec<(PaneId, egui::Rect)> {
@@ -222,6 +211,7 @@ pub fn draw_pane(
     rect: egui::Rect,
     active: bool,
     camera: Camera2D,
+    north_up: NorthUpFrame,
     tuning: NavTuning,
     texture: Option<PaneTexture<'_>>,
     map: &PaneMap,
@@ -239,13 +229,27 @@ pub fn draw_pane(
         height_points: rect.height().max(1.0),
         pixels_per_point: ui.ctx().pixels_per_point().max(1.0),
     };
+    // The pane has just measured its own viewport, and that is the one every
+    // gesture below has to be resolved against: `zoom_about` anchors on the
+    // viewport's centre and the globe blend is a function of its diagonal.
+    let north_up = north_up.for_viewport(viewport);
     let mut updated_camera = camera;
     let mut camera_changed = false;
 
+    // Every camera gesture below goes through `north_up.resolve` rather than
+    // straight at `Camera2D`, so that a gesture and its reverse still compose
+    // to the identity while the map is being turned north-up under them. See
+    // `crate::north_up` for what that costs and what it replaced.
     if response.dragged() {
         let delta = ui.input(|input| input.pointer.delta());
         if delta.length_sq() > 0.0 {
-            updated_camera.pan_by_screen_delta(delta.x, delta.y);
+            north_up.resolve(
+                &mut updated_camera,
+                Gesture::Pan {
+                    delta_x_points: delta.x,
+                    delta_y_points: delta.y,
+                },
+            );
             camera_changed = true;
         }
     }
@@ -263,7 +267,13 @@ pub fn draw_pane(
                 .input(|input| input.pointer.hover_pos())
                 .unwrap_or(rect.center());
             let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
-            updated_camera.zoom_about(factor, local, viewport);
+            north_up.resolve(
+                &mut updated_camera,
+                Gesture::Zoom {
+                    factor,
+                    anchor: local,
+                },
+            );
             camera_changed = true;
         }
     }
@@ -276,7 +286,13 @@ pub fn draw_pane(
         if nav.reset {
             // Reset wins outright inside `apply_nav`; splitting it would
             // let the zoom pass move a camera the reset just homed.
-            camera_changed |= updated_camera.apply_nav(nav, dt, viewport);
+            camera_changed |= north_up.resolve(
+                &mut updated_camera,
+                Gesture::Nav {
+                    input: nav,
+                    dt_seconds: dt,
+                },
+            );
         } else {
             // Two passes so pan and zoom each run at their own configured
             // rate: dt scaling is exact because the pan step is linear in dt
@@ -292,8 +308,20 @@ pub fn draw_pane(
                 zoom_steps: nav.zoom_steps * tuning.zoom_exp,
                 ..nav
             };
-            camera_changed |= updated_camera.apply_nav(pan_only, dt * tuning.pan_scale, viewport);
-            camera_changed |= updated_camera.apply_nav(zoom_only, dt * tuning.kzoom_exp, viewport);
+            camera_changed |= north_up.resolve(
+                &mut updated_camera,
+                Gesture::Nav {
+                    input: pan_only,
+                    dt_seconds: dt * tuning.pan_scale,
+                },
+            );
+            camera_changed |= north_up.resolve(
+                &mut updated_camera,
+                Gesture::Nav {
+                    input: zoom_only,
+                    dt_seconds: dt * tuning.kzoom_exp,
+                },
+            );
         }
         // A held key produces no further events, so without this the flight
         // would stop after one frame and resume on the next mouse twitch.
@@ -382,13 +410,15 @@ pub fn draw_pane(
     // Overlays sit above the readout and below the header, so the header and
     // the active-pane border stay on top of everything.
     if let (Some(layout), Some(table)) = (overlay.legend, overlay.table) {
-        // The legend measures itself from the top of the rect it is given, and
-        // the FILTERED band is painted after it. Handing it the whole pane put
-        // the band straight through the product name - caught by looking at
-        // the photograph - so the band's strip is taken off the top first.
+        // The whole pane rect: the legend insets itself past the header by its
+        // own `TOP_MARGIN`. It used to be handed a rect with a strip taken off
+        // the top, because the FILTERED band was painted after it and over it
+        // - the first capture of Storm mode showed "REF" cut in half by the
+        // red bar. With the band gone there is nothing above the legend but
+        // the header it already clears.
         crate::legend::draw_legend(
             &painter,
-            legend_rect(rect, overlay.filter_notice.is_some()),
+            rect,
             layout,
             table,
             overlay.product_name,
@@ -399,58 +429,23 @@ pub fn draw_pane(
         draw_probe_readout(&painter, rect, probe, chrome_color(map.chrome.probe_ink));
     }
     draw_tile_attribution(&painter, rect, map);
+    // The header is the last thing drawn on the data and under the active
+    // border, because its right-hand end carries the pane's filter statement -
+    // the one thing on this pane that is about the data being incomplete. See
+    // `crate::gate_filter_ui` for the rule it serves.
     draw_header(&painter, rect, title, status);
-    // Over the header's band and under the active border: the last thing
-    // drawn on the data, because it is the one thing on this pane that is
-    // about the data being incomplete.
-    let filter_band = overlay
-        .filter_notice
-        .map(|notice| draw_filter_band(&painter, rect, notice));
-    let clear_filter_clicked = filter_band.is_some_and(|band| {
-        response.clicked()
-            && response
-                .interact_pointer_pos()
-                .is_some_and(|pointer| band.contains(pointer))
-    });
-    if filter_band.is_some_and(|band| {
-        ui.input(|input| input.pointer.hover_pos())
-            .is_some_and(|pointer| band.contains(pointer))
-    }) {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    // The band takes the whole click, not just `clicked`.
-    //
-    // Site markers are hit-tested anywhere in the pane, and the band is
-    // painted over them in its own opaque ground - so a marker whose halo
-    // reaches under the band is a target the analyst cannot see. Left as it
-    // was, one click on the band both cleared the filter AND called
-    // `start_live` on that invisible marker, and a Ctrl+click on it cleared
-    // the filter AND loaded the nearest S-band radar: the analyst asks to see
-    // the echo that was being hidden and is shown a different radar instead,
-    // with the volume they were reading gone. Withheld here rather than in
-    // `app.rs` so every consumer of a pane click gets the same answer from
-    // one place; the markers are still drawn, only the click is refused.
-    let (clicked_site, ctrl_clicked_lon_lat) = if clear_filter_clicked {
-        (None, None)
-    } else {
-        (clicked_site, ctrl_clicked_lon_lat)
-    };
     draw_border(&painter, rect, active);
 
     PaneInteraction {
-        // A click that selected a site is consumed by that site, a Ctrl+click
-        // by the radar switch, and a click on the FILTERED band by the filter.
-        clicked: response.clicked()
-            && clicked_site.is_none()
-            && ctrl_clicked_lon_lat.is_none()
-            && !clear_filter_clicked,
+        // A click that selected a site is consumed by that site and a
+        // Ctrl+click by the radar switch.
+        clicked: response.clicked() && clicked_site.is_none() && ctrl_clicked_lon_lat.is_none(),
         hovered_world_km: hovered_world_km(ui, rect, updated_camera, viewport, response.hovered()),
         camera: updated_camera,
         camera_changed,
         viewport,
         clicked_site,
         ctrl_clicked_lon_lat,
-        clear_filter_clicked,
     }
 }
 
@@ -682,16 +677,24 @@ fn draw_hazards(
         outline.push(points[0]);
         painter.add(egui::Shape::line(outline, egui::Stroke::new(width, color)));
 
-        draw_hazard_motion(painter, &points, hazard, width);
+        draw_hazard_motion(
+            painter,
+            &points,
+            hazard,
+            width,
+            camera.sanitized().rotation_rad,
+        );
         draw_hazard_tag(painter, &points, hazard, chrome_color(map.chrome.canvas));
     }
 }
 
 /// Build the fill from the triangles worked out at placement time.
 ///
-/// The camera is a translate and a scale, so a triangulation computed in world
-/// kilometres stays valid in screen points -- which is why this pass only
-/// transforms vertices and never re-triangulates.
+/// The camera is a translate, a scale and a rotation -- an affine map -- so a
+/// triangulation computed in world kilometres stays valid in screen points,
+/// which is why this pass only transforms vertices and never re-triangulates.
+/// Affine is the property that matters: it is what makes a rotated pane cost
+/// nothing here.
 fn fill_mesh(points: &[egui::Pos2], triangles: &[[u32; 3]], fill: egui::Color32) -> egui::Mesh {
     let mut mesh = egui::Mesh::default();
     for point in points {
@@ -707,11 +710,19 @@ fn fill_mesh(points: &[egui::Pos2], triangles: &[[u32; 3]], fill: egui::Color32)
 ///
 /// The bulletin reports the direction the storm comes FROM, so the vector is
 /// that bearing plus 180 degrees.
+///
+/// `rotation_rad` is the camera's, and it is not optional: the bulletin states
+/// a COMPASS bearing, and this function turns it into screen sines and
+/// cosines. Without the camera's rotation added, a pane whose map has been
+/// straightened would draw every warning's motion vector pointing somewhere
+/// the storm is not going. That was already true of any non-zero rotation
+/// before this branch; nothing had ever set one.
 fn draw_hazard_motion(
     painter: &egui::Painter,
     points: &[egui::Pos2],
     hazard: &PlacedHazard,
     width: f32,
+    rotation_rad: f32,
 ) {
     let Some((from_degrees, knots)) = hazard.motion else {
         return;
@@ -721,7 +732,7 @@ fn draw_hazard_motion(
         points.iter().map(|point| point.x).sum::<f32>() / count,
         points.iter().map(|point| point.y).sum::<f32>() / count,
     );
-    let heading = (f32::from(from_degrees) + 180.0).to_radians();
+    let heading = (f32::from(from_degrees) + 180.0).to_radians() + rotation_rad;
     // Length scales with speed but is capped: a 60 kt arrow that reaches
     // across the county says nothing extra.
     let length = (f32::from(knots) * 0.9).clamp(14.0, 54.0);
@@ -743,8 +754,13 @@ fn draw_hazard_motion(
     }
 }
 
-/// The short tag, at the NORTHERNMOST vertex -- the top of the polygon on
-/// screen, which is where there is reliably room outside the shape.
+/// The short tag, at the TOPMOST-ON-SCREEN vertex, which is where there is
+/// reliably room outside the shape.
+///
+/// That is a screen-space heuristic and stays the right one under a rotated
+/// camera - the room is above the shape on the SCREEN, wherever north has got
+/// to. It used to say "northernmost", which was the same vertex only while the
+/// map was north-up.
 ///
 /// `halo` is the pane's own ground, so the outline around the tag is the
 /// colour the tag is most often sitting on. On a light basemap a dark halo
@@ -1152,6 +1168,11 @@ fn draw_range_rings(
     let center = egui::pos2(rect.left() + radar.x, rect.top() + radar.y);
     let stroke = egui::Stroke::new(0.8_f32, chrome_color(map.chrome.range_ring));
     let ink = chrome_color(map.chrome.readout_ink);
+    // Which way world north points on screen. A ring is a CIRCLE under any
+    // camera rotation - that is what keeps the near-field promise, and it is
+    // why `circle_stroke` below is still the right call - but its label is
+    // placed at a bearing, and a bearing turns.
+    let (rotation_sin, rotation_cos) = camera.sanitized().rotation_rad.sin_cos();
     // Radii are kilometres whatever the analyst reads in: the camera measures
     // the world in kilometres, so a converted radius would put the ring in the
     // wrong place. Only the label changes unit.
@@ -1162,6 +1183,11 @@ fn draw_range_rings(
             if map.annotation.ring_labels {
                 // Due north of the radar, just inside the arc, so a ladder of
                 // labels reads as one column instead of chasing the circle.
+                // Under a rotated camera that column is SLANTED, because it
+                // follows world north rather than screen-up: the settings help
+                // text promises the distance is written where the ring crosses
+                // due north, and that promise is about the ground, not about
+                // the top of the window.
                 //
                 // On a plate of the map's own label halo, because that column
                 // crosses whatever the basemap has written north of the radar:
@@ -1177,9 +1203,16 @@ fn draw_range_rings(
                     ink,
                 );
                 let padding = egui::vec2(3.0, 1.0);
-                let text_at = egui::pos2(
-                    center.x - galley.size().x * 0.5,
-                    center.y - radius + 2.0 + padding.y,
+                // World north on screen is `(sin r, -cos r)`: the image of the
+                // world unit north vector under `Camera2D::world_to_screen`'s
+                // linear part.
+                let north = egui::vec2(rotation_sin, -rotation_cos);
+                let text_at = ring_label_top_left(
+                    center,
+                    north,
+                    radius,
+                    galley.size(),
+                    RING_LABEL_GAP_POINTS + padding.y,
                 );
                 painter.rect_filled(
                     egui::Rect::from_min_size(text_at - padding, galley.size() + padding * 2.0),
@@ -1191,6 +1224,52 @@ fn draw_range_rings(
         }
     }
     painter.circle_filled(center, 3.2, chrome_color(map.chrome.origin_dot));
+}
+
+/// Clear air between a range ring and the label written against it, in screen
+/// points, before the label's own halo padding is added.
+///
+/// The number is the one the north-up expression this replaced used, so a ring
+/// at zero rotation is drawn exactly where it always was.
+const RING_LABEL_GAP_POINTS: f32 = 2.0;
+
+/// Where to put a range-ring label's galley so it sits against the inside of
+/// the arc, at any camera rotation.
+///
+/// The label marks where the ring crosses TRUE NORTH, so the crossing walks
+/// around the arc as the map turns; but a galley is always axis-aligned,
+/// because a rotated line of digits is harder to read than a level one and the
+/// application does not rotate text anywhere else. So the crossing is found on
+/// the ring, and the galley is pushed INWARD along the same direction by
+/// exactly its own half-width in that direction plus `gap`.
+///
+/// That half-width is the support function of an axis-aligned rectangle,
+/// `h(u) = (w|u.x| + h|u.y|) / 2`, which is the standard way to ask how far a
+/// box reaches in a direction and is what keeps the box clear of the arc at
+/// every angle rather than only near the top. The previous rule placed the
+/// galley's TOP-LEFT at the crossing, which is right while north is near
+/// screen-up and wrong as soon as it is not: measured over the shipped station
+/// table the derived rotation reaches 93.3 degrees at PACG with the view
+/// centre 3702 km downrange, and `map_scene::projection::MAX_ROTATION_DEG`
+/// bounds it at 93.36 by argument. At angles like those the box straddled the
+/// arc instead of sitting inside it.
+///
+/// At zero rotation `north` is `(0, -1)`, the support half-width is half the
+/// galley's height, and the result reduces to
+/// `(center.x - w/2, center.y - radius + gap)` - the expression this replaced,
+/// term for term.
+fn ring_label_top_left(
+    center: egui::Pos2,
+    north: egui::Vec2,
+    radius: f32,
+    galley: egui::Vec2,
+    gap: f32,
+) -> egui::Pos2 {
+    let crossing = center + north * radius;
+    let inward = -north;
+    let reach = 0.5 * (galley.x * inward.x.abs() + galley.y * inward.y.abs());
+    let middle = crossing + inward * (reach + gap);
+    egui::pos2(middle.x - galley.x * 0.5, middle.y - galley.y * 0.5)
 }
 
 /// The pointer's radar-local position, when it is over this pane.
@@ -1322,8 +1401,14 @@ fn draw_cursor_readout(
 /// of the two and the one that identifies the pane, and it must not be the
 /// thing that disappears. The status takes the rest, because the filter line
 /// grows with the number of criteria and there is no width at which it is
-/// guaranteed to fit - the full statement is on the band below, which has the
-/// pane's whole width to say it in.
+/// guaranteed to fit.
+///
+/// There is no longer a wider band below to fall back to, so what happens at
+/// the narrow end matters more than it did. `app.rs::pane_header_status`
+/// builds this end with the filter statement FIRST, ahead of the stall word
+/// and the frame age, precisely because this end truncates from the right: on
+/// a quarter-pane in the smallest window the analyst loses the age and keeps
+/// `FILTERED: REF below 20 dBZ…`, rather than the other way round.
 const HEADER_TITLE_SHARE: f32 = 1.0 / 3.0;
 
 /// Margin at each end of the header row, and between its two ends.
@@ -1331,6 +1416,34 @@ const HEADER_MARGIN: f32 = 8.0;
 
 const HEADER_TITLE_COLOR: egui::Color32 = egui::Color32::from_rgb(239, 243, 246);
 const HEADER_STATUS_COLOR: egui::Color32 = egui::Color32::from_rgb(166, 184, 196);
+
+/// The header's own ground.
+///
+/// Hard-coded rather than taken from `MapChrome`, and that is the same
+/// decision `crate::legend` already makes: a row that paints its own ground is
+/// furniture, not a mark on the map, so it is not subject to the "everything
+/// the pane paints on its ground comes from the chrome" rule and must NOT
+/// follow the basemap look. This row carries the pane's filter statement -
+/// since the FILTERED band was removed it is the only place on the pane the
+/// whole sentence appears - and a statement that changed colour with the
+/// basemap would be one an analyst could tune down.
+///
+/// 218 of 255 rather than opaque so the radar stays faintly readable under the
+/// top of the pane; `the_pane_headers_two_inks_stay_readable_over_any_echo`
+/// composites it over black and over white and measures both inks against the
+/// result, rather than trusting that sentence.
+///
+/// A named function, not a literal at the paint site, so the audits below read
+/// the colour the header is actually filled with. A function rather than a
+/// `const` because `Color32::from_rgba_unmultiplied` premultiplies and so is
+/// not a `const fn` - the same reason `legend::panel_color` is one.
+fn header_ground() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(4, 7, 10, HEADER_GROUND_ALPHA)
+}
+
+/// The header ground's alpha, named separately so the audits can composite it
+/// over a backing without unpicking the premultiplied colour back out.
+const HEADER_GROUND_ALPHA: u8 = 218;
 
 /// Lay one end of the header out to a width, truncating to a single row.
 fn header_galley(
@@ -1385,11 +1498,7 @@ fn draw_header(painter: &egui::Painter, rect: egui::Rect, title: &str, status: &
             (rect.top() + HEADER_HEIGHT).min(rect.bottom()),
         ),
     );
-    painter.rect_filled(
-        header,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(4, 7, 10, 218),
-    );
+    painter.rect_filled(header, 0.0, header_ground());
 
     let (title, status) = header_galleys(painter, header.width(), title, status);
     painter.galley(
@@ -1410,83 +1519,6 @@ fn draw_header(painter: &egui::Painter, rect: egui::Rect, title: &str, status: &
     );
 }
 
-/// Height of the FILTERED band, in points. Deliberately taller than the
-/// header's text needs, so it reads as a bar and not as a second status line -
-/// and so it is a comfortable click target at any device scale.
-const FILTER_BAND_HEIGHT: f32 = 22.0;
-
-/// The band's ground and ink.
-///
-/// Hard-coded rather than taken from `MapChrome`, and that is the same
-/// decision `draw_header` and `crate::legend` already make: a band that paints
-/// its own opaque ground is furniture, not a mark on the map, so it is not
-/// subject to the "everything the pane paints on its ground comes from the
-/// chrome" rule and must NOT follow the basemap look. A warning that changed
-/// colour with the basemap would be a warning an analyst could tune down.
-///
-/// The pair is a deep red ground under near-white text: 9.60:1 by WCAG 2.2
-/// relative luminance, past the 7:1 AAA floor and well past the 4.5:1 the rest
-/// of the chrome is held to. `the_filtered_bands_own_contrast_clears_aaa`
-/// computes it rather than trusting this sentence. It is also the only
-/// red-grounded band in the application, which is the point: no other piece of
-/// chrome can be mistaken for it at a glance.
-const FILTER_BAND_GROUND: egui::Color32 = egui::Color32::from_rgb(122, 18, 18);
-const FILTER_BAND_INK: egui::Color32 = egui::Color32::from_rgb(255, 236, 236);
-
-/// The rect the colour legend lays itself out in: the pane, less the FILTERED
-/// band's strip when there is one.
-///
-/// A function so the band's height is named once and the two callers - the
-/// paint site and its test - cannot drift apart.
-fn legend_rect(pane: egui::Rect, filtered: bool) -> egui::Rect {
-    if !filtered {
-        return pane;
-    }
-    egui::Rect::from_min_max(
-        egui::pos2(
-            pane.left(),
-            (pane.top() + FILTER_BAND_HEIGHT).min(pane.bottom()),
-        ),
-        pane.max,
-    )
-}
-
-/// Draw the "this pane is hiding gates" band and answer where it landed.
-///
-/// Unconditional whenever the caller passes a notice: this is the one thing on
-/// the pane that no setting may switch off, because every setting that could
-/// would be a way to hide the fact that data is being hidden.
-fn draw_filter_band(painter: &egui::Painter, rect: egui::Rect, notice: &str) -> egui::Rect {
-    let top = (rect.top() + HEADER_HEIGHT).min(rect.bottom());
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), top),
-        egui::pos2(rect.right(), (top + FILTER_BAND_HEIGHT).min(rect.bottom())),
-    );
-    painter.rect_filled(band, 0.0, FILTER_BAND_GROUND);
-    // Laid out with an explicit one-row truncation rather than handed to
-    // `Painter::text`, which would let the sentence run off the right of a
-    // quarter-pane and be cut mid-word by the clip rect. An ellipsis is a
-    // truncation the analyst can see; a clipped word looks like a rendering
-    // fault, and this is the one band on the pane that must never look like
-    // one. The word that carries the whole meaning is first either way.
-    let mut job = egui::text::LayoutJob::simple(
-        notice.to_owned(),
-        egui::FontId::proportional(11.5),
-        FILTER_BAND_INK,
-        (band.width() - 16.0).max(1.0),
-    );
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    job.wrap.overflow_character = Some('\u{2026}');
-    let galley = painter.layout_job(job);
-    painter.galley(
-        egui::pos2(band.left() + 8.0, band.center().y - 0.5 * galley.size().y),
-        galley,
-        FILTER_BAND_INK,
-    );
-    band
-}
-
 fn draw_border(painter: &egui::Painter, rect: egui::Rect, active: bool) {
     let color = if active {
         egui::Color32::from_rgb(78, 180, 244)
@@ -1505,37 +1537,108 @@ fn draw_border(painter: &egui::Painter, rect: egui::Rect, active: bool) {
 mod tests {
     use super::*;
 
-    /// The band is the one piece of chrome that is read in a hurry, so its own
-    /// two colours are held to WCAG 2.2's AAA floor rather than to the 4.5:1
-    /// the rest of the bar clears.
+    /// A RANGE-RING LABEL SITS AGAINST THE ARC AT EVERY ROTATION.
     ///
-    /// Computed rather than pasted: the first version of this claimed 12.9:1
-    /// in a comment and the real figure is 9.60:1. A number in prose is a
-    /// number nobody rechecks.
+    /// The rule that shipped placed the galley's TOP-LEFT at the point where
+    /// world north crosses the ring, which is right only while north is near
+    /// screen-up. Over the shipped station table the derived rotation reaches
+    /// 93.3 degrees at PACG, and at angles like that the box straddled the
+    /// arc: the label crossed the ring it was labelling. This sweeps a whole
+    /// turn regardless, because the placement is a claim about the camera and
+    /// not about the policy.
+    ///
+    /// Two things are asserted at every rotation and both have to hold: the
+    /// whole box is INSIDE the ring, and it is against the ring rather than
+    /// wandering off toward the middle.
     #[test]
-    fn the_filtered_bands_own_contrast_clears_aaa() {
-        fn channel(byte: u8) -> f64 {
-            let value = f64::from(byte) / 255.0;
-            if value <= 0.03928 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
+    fn a_range_ring_label_stays_inside_the_arc_it_labels() {
+        let center = egui::pos2(700.0, 420.0);
+        let galley = egui::vec2(38.0, 13.0);
+        let gap = RING_LABEL_GAP_POINTS + 1.0;
+        let mut worst_clearance = f32::INFINITY;
+        let mut worst_at = 0.0f32;
+        for step in 0..360 {
+            let rotation = (step as f32).to_radians();
+            let (sin, cos) = rotation.sin_cos();
+            let north = egui::vec2(sin, -cos);
+            for &radius in &[40.0f32, 180.0, 700.0] {
+                let top_left = ring_label_top_left(center, north, radius, galley, gap);
+                let box_rect = egui::Rect::from_min_size(top_left, galley);
+                // INSIDE: every corner is within the arc. Only asked of a ring
+                // big enough to hold the label at all - a box wider than its
+                // own ring has no placement that fits, which is a fact about
+                // the ring and not about this rule.
+                if radius >= galley.length() {
+                    let furthest = [
+                        box_rect.left_top(),
+                        box_rect.right_top(),
+                        box_rect.left_bottom(),
+                        box_rect.right_bottom(),
+                    ]
+                    .into_iter()
+                    .map(|corner| (corner - center).length())
+                    .fold(0.0f32, f32::max);
+                    assert!(
+                        furthest <= radius,
+                        "at {step} degrees, radius {radius}: a corner of the label is \
+                         {:.3} points OUTSIDE the ring",
+                        furthest - radius
+                    );
+                }
+                // AGAINST: the box's own reach toward the crossing leaves
+                // exactly `gap` of clear air, so the label cannot drift inward
+                // as the rotation grows either.
+                let crossing = center + north * radius;
+                let inward = -north;
+                let reach = 0.5 * (galley.x * inward.x.abs() + galley.y * inward.y.abs());
+                let clearance = (box_rect.center() - crossing).length() - reach;
+                assert!(
+                    (clearance - gap).abs() < 1.0e-3,
+                    "at {step} degrees, radius {radius}: the label sits {clearance:.4} \
+                     points off the arc, not {gap}"
+                );
+                if clearance < worst_clearance {
+                    worst_clearance = clearance;
+                    worst_at = rotation.to_degrees();
+                }
             }
         }
-        fn luminance(color: egui::Color32) -> f64 {
-            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
-        }
-        let ink = luminance(FILTER_BAND_INK);
-        let ground = luminance(FILTER_BAND_GROUND);
-        let contrast = (ink.max(ground) + 0.05) / (ink.min(ground) + 0.05);
-        assert!(
-            contrast >= 7.0,
-            "the FILTERED band reads at {contrast:.2}:1, under the 7:1 this band is held to"
+        println!(
+            "ring label clearance over a full turn: worst {worst_clearance:.4} points at \
+             {worst_at:.0} degrees"
         );
-        // Opaque, both of them. A translucent warning band would take its
-        // contrast from whatever reflectivity happened to be underneath it.
-        assert_eq!(FILTER_BAND_GROUND.a(), 255);
-        assert_eq!(FILTER_BAND_INK.a(), 255);
+    }
+
+    /// AND AT ZERO ROTATION IT IS THE EXPRESSION IT REPLACED, term for term.
+    ///
+    /// The shipped placement was
+    /// `(center.x - width/2, center.y - radius + 2 + padding.y)`. A rewrite
+    /// that moved the label on the analysis view - where the rule holds the
+    /// rotation at an exact zero and nothing is allowed to move - would be a
+    /// regression whatever it fixed at Barrow.
+    #[test]
+    fn at_zero_rotation_the_ring_label_has_not_moved() {
+        let center = egui::pos2(512.5, 311.25);
+        let galley = egui::vec2(37.0, 13.0);
+        let padding = egui::vec2(3.0, 1.0);
+        for &radius in &[37.5f32, 142.857, 900.0] {
+            let north = egui::vec2(0.0, -1.0);
+            let shipped = egui::pos2(
+                center.x - galley.x * 0.5,
+                center.y - radius + RING_LABEL_GAP_POINTS + padding.y,
+            );
+            let now = ring_label_top_left(
+                center,
+                north,
+                radius,
+                galley,
+                RING_LABEL_GAP_POINTS + padding.y,
+            );
+            assert!(
+                (now.x - shipped.x).abs() < 1.0e-4 && (now.y - shipped.y).abs() < 1.0e-4,
+                "radius {radius}: {now:?} is not the shipped {shipped:?}"
+            );
+        }
     }
 
     /// The header's two ends never print through each other, at any pane
@@ -1598,16 +1701,102 @@ mod tests {
         );
     }
 
-    /// The FILTERED band is painted after the legend, so a legend that laid
-    /// itself out from the top of the whole pane has its product name struck
-    /// through by the band.
+    /// However narrow the pane, the header keeps the word that says data is
+    /// missing - and on every pane the application can actually produce, the
+    /// first criterion after it as well.
     ///
-    /// This was on the photograph before it was in a test: the first capture
-    /// of Storm mode showed "REF" cut in half by the red bar. The claim is
-    /// about the two rectangles rather than about a pixel, so it is checked on
-    /// the real geometry the legend measured, for every pane a layout offers.
+    /// This end of the header truncates from the right, so what an analyst
+    /// keeps is whatever `app.rs::pane_header_status` put FIRST - which is why
+    /// that function builds the filter statement ahead of the stall word and
+    /// the frame age. There is no wider band under the header to fall back on
+    /// any more, and on a quarter-pane the legend refuses to draw at all
+    /// (`legend::MIN_DATA_WIDTH`), so at the narrow end this row is the only
+    /// thing on the pane that can carry the fact.
+    ///
+    /// Two tiers, because they are two different promises. The WORD is
+    /// absolute: at any width whatsoever the pane says FILTERED rather than
+    /// nothing, so a censored sweep is never indistinguishable from a quiet
+    /// sky. WHAT is hidden is promised down to `NARROWEST_PANE`, which is a
+    /// quarter of the smallest window `main.rs` will open (960 points) at the
+    /// largest UI scale `theme::UiScale` offers (1.60), less the gap between
+    /// panes - the narrowest pane an analyst can arrive at without a build
+    /// that allows a smaller window or a larger scale. Below that the sentence
+    /// is an ellipsis and the criteria are read off the latched toolbar chip
+    /// instead.
+    ///
+    /// Measured on the laid-out galley, because the question is which glyphs
+    /// landed.
     #[test]
-    fn the_filtered_band_is_never_painted_through_the_legends_own_lines() {
+    fn the_filter_statement_survives_the_narrowest_pane() {
+        const NARROWEST_PANE: f32 = (960.0 / 1.60 - PANE_GAP) / 2.0;
+        let context = egui::Context::default();
+        const TITLE: &str = "1 · DVEL (kt) · 0.5°";
+        // Exactly the order `pane_header_status` composes: the statement, then
+        // the stall word, the age and the timing behind it.
+        const STATUS: &str = "FILTERED: REF below 20 dBZ, VEL where REF below 20 dBZ, \
+                              everything inside 5 km - 269,740 of 298,195 gates hidden \
+                              (90.5%) · STALLED · 19 h old · 27.5 ms";
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(2000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let painter = ui.painter();
+                for width in [
+                    120.0_f32,
+                    200.0,
+                    NARROWEST_PANE,
+                    300.0,
+                    480.0,
+                    960.0,
+                    1920.0,
+                ] {
+                    let (_, status) = header_galleys(painter, width, TITLE, STATUS);
+                    let painted: String = status
+                        .rows
+                        .iter()
+                        .map(|row| row.row.text())
+                        .collect::<Vec<_>>()
+                        .concat();
+                    assert!(
+                        painted.starts_with(crate::gate_filter_ui::FILTERED_WORD),
+                        "at a {width}-point pane the header reads {painted:?} - the word \
+                         that says gates are hidden did not survive the truncation, and \
+                         there is no band under this row to say it instead"
+                    );
+                    if width >= NARROWEST_PANE {
+                        assert!(
+                            painted.contains("REF below"),
+                            "at a {width}-point pane - one an analyst can actually open - \
+                             the header names no criterion: {painted:?}"
+                        );
+                    }
+                    println!("{width:7.1} pt pane: {painted:?}");
+                }
+            },
+        );
+    }
+
+    /// The legend never lays its product name under the pane header.
+    ///
+    /// The subject used to be the FILTERED band, which was painted after the
+    /// legend and over it: the first capture of Storm mode showed "REF" cut in
+    /// half by the red bar, and the fix was to hand the legend a rect with the
+    /// band's strip taken off the top. The band is gone and the strip with it,
+    /// so the legend is handed the whole pane again - and the claim that
+    /// survives is the one that was always underneath: whatever is painted
+    /// across the top of the pane must not strike through the legend's own
+    /// lines. The header is now the only thing up there.
+    ///
+    /// The claim is about the two rectangles rather than about a pixel, so it
+    /// is checked on the real geometry the legend measured, for every pane a
+    /// layout offers.
+    #[test]
+    fn the_pane_header_is_never_painted_through_the_legends_own_lines() {
         let layout = crate::legend::LegendLayout {
             span: product_engine::domain::ValueRange::new(0.0, 1.0),
             ticks: ["-20", "0", "20", "40", "60", "80"]
@@ -1632,16 +1821,13 @@ mod tests {
                             egui::pos2(11.0, 7.0),
                             egui::vec2(width, height),
                         );
-                        let band = egui::Rect::from_min_max(
-                            egui::pos2(pane.left(), pane.top() + HEADER_HEIGHT),
-                            egui::pos2(
-                                pane.right(),
-                                pane.top() + HEADER_HEIGHT + FILTER_BAND_HEIGHT,
-                            ),
+                        let header = egui::Rect::from_min_max(
+                            pane.min,
+                            egui::pos2(pane.right(), pane.top() + HEADER_HEIGHT),
                         );
                         let Some(geometry) = crate::legend::legend_geometry(
                             ui.painter(),
-                            legend_rect(pane, true),
+                            pane,
                             &layout,
                             "REF",
                             &[crate::gate_filter_ui::FILTERED_WORD.to_owned()],
@@ -1649,19 +1835,16 @@ mod tests {
                             continue;
                         };
                         assert!(
-                            geometry.panel.top() >= band.bottom(),
-                            "a {width}x{height} pane puts the legend panel at {} under a band \
-                             that reaches {} - the product name is struck through",
+                            geometry.panel.top() >= header.bottom(),
+                            "a {width}x{height} pane puts the legend panel at {} under a \
+                             header that reaches {} - the product name is struck through",
                             geometry.panel.top(),
-                            band.bottom()
+                            header.bottom()
                         );
                     }
                 }
             });
         }
-        // And an unfiltered pane keeps every point it had.
-        let pane = egui::Rect::from_min_size(egui::pos2(11.0, 7.0), egui::vec2(600.0, 600.0));
-        assert_eq!(legend_rect(pane, false), pane);
     }
 
     #[test]
@@ -2405,7 +2588,6 @@ mod tests {
             product_name: "REF",
             badges: &[],
             probe: None,
-            filter_notice: None,
         };
         let mut camera = camera;
         let mut last = None;
@@ -2417,6 +2599,7 @@ mod tests {
                     rect,
                     active,
                     camera,
+                    NorthUpFrame::unrotated(),
                     NavTuning::default(),
                     None,
                     &map,

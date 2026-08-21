@@ -15,7 +15,7 @@ repository.workspace = true
 # half lives in `map_scene`, which depends on this crate rather than the other
 # way round.
 [dependencies]
-# DEVIATION from the handed-down plan, which listed `{ image, reqwest }`:
+# Why `bytemuck` is here and not only `image` and `reqwest`:
 # `TileVertex` derives `bytemuck::Pod`/`Zeroable` so `map_scene` can turn a
 # `TileMesh` into a vertex buffer with `bytemuck::cast_slice` instead of an
 # `unsafe` transmute. `bytemuck` is already a workspace dependency and already

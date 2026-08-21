@@ -70,7 +70,6 @@ fn painted(map: &PaneMap) -> Vec<egui::Shape> {
                     product_name: "REF",
                     badges: &[],
                     probe: None,
-                    filter_notice: None,
                 };
                 draw_pane(
                     ui,
@@ -78,6 +77,7 @@ fn painted(map: &PaneMap) -> Vec<egui::Shape> {
                     PANE,
                     true,
                     Camera2D::default(),
+                    crate::north_up::NorthUpFrame::unrotated(),
                     NavTuning::default(),
                     None,
                     map,
@@ -600,7 +600,6 @@ fn painted_hovered(map: &PaneMap, probe: Option<&str>) -> Vec<egui::Shape> {
                     product_name: "REF",
                     badges: &[],
                     probe,
-                    filter_notice: None,
                 };
                 draw_pane(
                     ui,
@@ -608,6 +607,7 @@ fn painted_hovered(map: &PaneMap, probe: Option<&str>) -> Vec<egui::Shape> {
                     PANE,
                     true,
                     Camera2D::default(),
+                    crate::north_up::NorthUpFrame::unrotated(),
                     NavTuning::default(),
                     None,
                     map,
@@ -968,235 +968,24 @@ mod the_picker_itself {
     }
 }
 
-/// Who gets a click that lands on the FILTERED band.
-///
-/// The band is painted last and in its own opaque ground, over everything the
-/// pane has already drawn - including the radar site markers, which are
-/// hit-tested anywhere in the pane inside a halo of `SITE_MARKER_HALF +
-/// SITE_CLICK_SLACK`. So a marker that happens to sit under the band is a
-/// target the analyst cannot see, and `draw_pane` used to hand its id back
-/// alongside `clear_filter_clicked`. `app.rs` consumes `clicked_site` and
-/// `ctrl_clicked_lon_lat` in an else-if chain that the band's own flag does
-/// not guard, so one click on the band both cleared the filter and called
-/// `start_live` on the invisible marker: the analyst asks to see the echo that
-/// was being hidden, and the volume they were reading is replaced by another
-/// radar's.
-///
-/// Every test here is paired with the same click on a pane with no band, which
-/// is what stops it passing vacuously: the pair proves the marker really is
-/// under that point and really would have been taken.
-#[cfg(test)]
-mod who_gets_the_band_click {
-    use super::*;
-
-    const VIEWPORT: ViewportMetrics = ViewportMetrics {
-        width_points: 600.0,
-        height_points: 600.0,
-        pixels_per_point: 1.0,
-    };
-
-    pub(super) const NOTICE: &str =
-        "FILTERED - hiding REF below 20 dBZ - click here to show everything";
-
-    /// The centre of the band `draw_filter_band` paints for `PANE`.
-    fn band_center() -> egui::Pos2 {
-        egui::pos2(
-            PANE.center().x,
-            PANE.top() + HEADER_HEIGHT + FILTER_BAND_HEIGHT * 0.5,
-        )
-    }
-
-    /// The Slate map with one site placed exactly under `at`.
-    ///
-    /// Placed through the camera's own inverse rather than by guessing a
-    /// latitude: the question is about screen geometry, and a site that
-    /// happened to land two points off would make the whole test vacuous.
-    pub(super) fn map_with_a_site_under(at: egui::Pos2) -> PaneMap {
-        let mut map = map_for(MapStylePreset::Slate);
-        let local = ScreenPoint::new(at.x - PANE.left(), at.y - PANE.top());
-        let world = Camera2D::default().screen_to_world(local, VIEWPORT);
-        map.sites = Arc::from(vec![PlacedSite {
-            id: "kdvn".to_owned(),
-            world,
-        }]);
-        map
-    }
-
-    /// One press-and-release on `at`, through three real egui passes.
-    ///
-    /// Three because egui resolves hover against the rects registered on the
-    /// previous pass, and a site marker is only a candidate while the pointer
-    /// is over it - so the move has to land before the press.
-    fn click_at(
-        map: &PaneMap,
-        at: egui::Pos2,
-        notice: Option<&str>,
-        modifiers: egui::Modifiers,
-    ) -> PaneInteraction {
-        let context = egui::Context::default();
-        let mut last = None;
-        let passes = [
-            (1.0_f64, vec![egui::Event::PointerMoved(at)]),
-            (
-                1.1,
-                vec![
-                    egui::Event::PointerMoved(at),
-                    egui::Event::PointerButton {
-                        pos: at,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers,
-                    },
-                ],
-            ),
-            (
-                1.2,
-                vec![egui::Event::PointerButton {
-                    pos: at,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers,
-                }],
-            ),
-        ];
-        for (time, events) in passes {
-            let input = egui::RawInput {
-                time: Some(time),
-                // The window system sets the modifier state before it
-                // dispatches the button that carries it, and `nearest_site`
-                // reads `InputState::modifiers` - a test that set only the
-                // event's own would be testing a state no window system
-                // produces.
-                modifiers,
-                events,
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1000.0, 800.0),
-                )),
-                ..Default::default()
-            };
-            let mut result = None;
-            let _ = context.run_ui(input, |ui| {
-                let overlay = PaneOverlay {
-                    legend: None,
-                    table: None,
-                    product_name: "REF",
-                    badges: &[],
-                    probe: None,
-                    filter_notice: notice,
-                };
-                result = Some(draw_pane(
-                    ui,
-                    PaneId::new(0).expect("pane 0"),
-                    PANE,
-                    true,
-                    Camera2D::default(),
-                    NavTuning::default(),
-                    None,
-                    map,
-                    "1 - REF (dBZ)",
-                    "",
-                    &overlay,
-                ));
-            });
-            last = result;
-        }
-        last.expect("the pass body runs")
-    }
-
-    /// The control: with no band, this exact point IS a site click.
-    #[test]
-    fn without_the_band_the_marker_under_it_takes_the_click() {
-        let at = band_center();
-        let map = map_with_a_site_under(at);
-        let plain = click_at(&map, at, None, egui::Modifiers::NONE);
-        assert_eq!(
-            plain.clicked_site.as_deref(),
-            Some("kdvn"),
-            "the marker is not under the band at all - the pairs below prove nothing"
-        );
-        assert!(!plain.clear_filter_clicked);
-
-        let ctrl = click_at(&map, at, None, egui::Modifiers::CTRL);
-        assert!(
-            ctrl.ctrl_clicked_lon_lat.is_some(),
-            "Ctrl+click on this point does not reach the radar switch - the pair below \
-             proves nothing"
-        );
-        assert!(!ctrl.clear_filter_clicked);
-    }
-
-    /// A plain click on the band clears the filter and does nothing else.
-    #[test]
-    fn a_click_on_the_band_does_not_also_change_the_radar_site() {
-        let at = band_center();
-        let map = map_with_a_site_under(at);
-        let interaction = click_at(&map, at, Some(NOTICE), egui::Modifiers::NONE);
-
-        assert!(
-            interaction.clear_filter_clicked,
-            "the band did not take the click at all"
-        );
-        assert_eq!(
-            interaction.clicked_site, None,
-            "clearing the filter also loaded whatever site marker the band was painted over"
-        );
-        assert_eq!(interaction.ctrl_clicked_lon_lat, None);
-        assert!(
-            !interaction.clicked,
-            "the band's click also reached the pane's ordinary click consumers"
-        );
-    }
-
-    /// And a Ctrl+click on it does not load the nearest S-band radar either.
-    #[test]
-    fn a_ctrl_click_on_the_band_does_not_also_load_the_nearest_radar() {
-        let at = band_center();
-        let map = map_with_a_site_under(at);
-        let interaction = click_at(&map, at, Some(NOTICE), egui::Modifiers::CTRL);
-
-        assert!(
-            interaction.clear_filter_clicked,
-            "the band did not take the Ctrl+click at all"
-        );
-        assert_eq!(
-            interaction.ctrl_clicked_lon_lat, None,
-            "clearing the filter also swapped the pane onto the nearest S-band radar"
-        );
-        assert_eq!(interaction.clicked_site, None);
-        assert!(!interaction.clicked);
-    }
-
-    /// The suppression is the band's, not a blanket ban: a click anywhere else
-    /// on a filtered pane still reaches the site marker under it.
-    #[test]
-    fn a_click_away_from_the_band_still_selects_a_site_on_a_filtered_pane() {
-        let at = PANE.center();
-        assert!(
-            at.y > PANE.top() + HEADER_HEIGHT + FILTER_BAND_HEIGHT,
-            "this point is inside the band, so it proves nothing"
-        );
-        let map = map_with_a_site_under(at);
-        let interaction = click_at(&map, at, Some(NOTICE), egui::Modifiers::NONE);
-
-        assert!(!interaction.clear_filter_clicked);
-        assert_eq!(
-            interaction.clicked_site.as_deref(),
-            Some("kdvn"),
-            "a filtered pane stopped answering site clicks everywhere, not just on the band"
-        );
-    }
-}
-
 /// The filter indicators are legible on EVERY registered theme, and they are
 /// legible there because they do not follow the theme at all.
 ///
-/// The pane's furniture - the FILTERED band, the header, the legend's panel -
-/// paints its own opaque ground on purpose, so that a warning cannot be tuned
-/// down by picking a different look. That is a claim about paint, and it was
-/// made when there were two themes and eight arrived. These measure it, with
-/// the same WCAG arithmetic `tests/theme_catalog.rs` audits the chrome with,
-/// so a number here and a number there mean the same thing.
+/// The pane's furniture - the header and the legend's panel - paints its own
+/// ground on purpose, so that a statement cannot be tuned down by picking a
+/// different look. That is a claim about paint, and it was made when there
+/// were two themes and eight arrived. These measure it, with the same WCAG
+/// arithmetic `tests/theme_catalog.rs` audits the chrome with, so a number
+/// here and a number there mean the same thing.
+///
+/// This module used to audit a full-width FILTERED band as well: its deep-red
+/// ground against its near-white ink, and the invariance of that pair across
+/// the catalog. The band is gone, so those two audits have no subject and are
+/// gone with it; the claims they made - "the
+/// indicator that says gates are hidden is readable" and "it does not follow
+/// the theme" - are re-pointed here onto the pane header, which is where the
+/// statement now lives and which, unlike the colour legend, no setting can
+/// switch off.
 mod the_filter_indicators_across_every_theme {
     use super::*;
     use crate::theme::{Appearance, catalog};
@@ -1234,46 +1023,23 @@ mod the_filter_indicators_across_every_theme {
     /// and the brightest pixel any colour table produces.
     const BACKINGS: [egui::Color32; 2] = [egui::Color32::BLACK, egui::Color32::WHITE];
 
-    /// The band's own pair clears AAA, and it is the same pair whatever theme
-    /// is installed.
-    ///
-    /// Both halves matter. The ratio alone would pass a band rewired to the
-    /// theme's error ink that happened to clear 7:1 on the themes somebody
-    /// checked; the invariance alone would pass a band that was consistently
-    /// unreadable.
-    #[test]
-    fn the_bands_pair_is_the_same_on_every_theme_and_clears_aaa() {
-        let context = egui::Context::default();
-        for theme in catalog::THEMES {
-            crate::theme::apply(&context, &Appearance::by_id(theme.id));
-            let ratio = contrast(FILTER_BAND_INK, FILTER_BAND_GROUND);
-            assert!(
-                ratio >= 7.0,
-                "{}: the FILTERED band reads at {ratio:.2}:1, under the 7:1 the one \
-                 indicator the safety rule names is held to",
-                theme.id
-            );
-            assert_eq!(
-                (FILTER_BAND_GROUND.a(), FILTER_BAND_INK.a()),
-                (255, 255),
-                "{}: the band went translucent, so its contrast is now whatever \
-                 reflectivity happens to be underneath it",
-                theme.id
-            );
-        }
-    }
-
-    /// The pane header carries the engine's filter line, and it stays readable
+    /// The pane header carries the filter statement, and it stays readable
     /// over an empty sweep and over a 70 dBZ core alike.
     ///
     /// Its ground is translucent, so the real contrast is against the
     /// composite rather than against the constant. 218 of 255 is enough that
     /// even pure white underneath leaves a dark bar; this is what says so
     /// rather than a sentence claiming it.
+    ///
+    /// The status ink is the one that matters most here. Since the FILTERED
+    /// band was removed this row is the only place on the pane that carries
+    /// the whole statement - `FILTERED: REF below 20 dBZ - 269,740 of 298,195
+    /// gates hidden (90.5%)` - so an unreadable status is a censored sweep
+    /// with nothing on the pane to account for it.
     #[test]
     fn the_pane_headers_two_inks_stay_readable_over_any_echo() {
         for backing in BACKINGS {
-            let ground = over(egui::Color32::from_rgb(4, 7, 10), 218, backing);
+            let ground = over(header_ground(), HEADER_GROUND_ALPHA, backing);
             for (name, ink) in [
                 ("title", HEADER_TITLE_COLOR),
                 ("status", HEADER_STATUS_COLOR),
@@ -1282,30 +1048,73 @@ mod the_filter_indicators_across_every_theme {
                 assert!(
                     ratio >= 4.5,
                     "the header's {name} reads at {ratio:.2}:1 over {backing:?}, under the \
-                     4.5:1 floor - and the status is where the engine says how many gates \
-                     it removed"
+                     4.5:1 floor - and the status is where the pane says what it is hiding \
+                     and how many gates went"
                 );
             }
         }
     }
 
-    /// And the pane paints the SAME filter band, byte for byte, whatever theme
-    /// is installed.
+    /// The header's colours are the same whatever theme is installed, and the
+    /// ground it paints is opaque enough to keep them.
     ///
-    /// Read off real egui passes rather than off the constants, so it covers
-    /// the whole path: a band that started taking its colour from `MapChrome`
-    /// or from the theme's error ink fails here even though the constants
-    /// above are untouched. That is a plausible future edit - it looks like an
-    /// improvement - and it would make the loudest warning in the application
-    /// quiet on some themes and not others.
+    /// Re-pointed from the band's own `..._pair_is_the_same_on_every_theme_
+    /// and_clears_aaa`. Both halves still matter, for the reasons they
+    /// mattered about the band. The ratio alone would pass a header rewired to
+    /// the theme's own text colour that happened to clear the floor on the
+    /// themes somebody checked; the invariance alone would pass a header that
+    /// was consistently unreadable.
     #[test]
-    fn every_theme_paints_the_same_filter_band() {
-        let map = super::who_gets_the_band_click::map_with_a_site_under(PANE.center());
-        let mut first: Option<(&str, Vec<(egui::Rect, egui::Color32)>)> = None;
+    fn the_headers_inks_are_the_same_on_every_theme_and_stay_readable() {
+        let context = egui::Context::default();
+        for theme in catalog::THEMES {
+            crate::theme::apply(&context, &Appearance::by_id(theme.id));
+            let ground = over(header_ground(), HEADER_GROUND_ALPHA, egui::Color32::WHITE);
+            let ratio = contrast(HEADER_STATUS_COLOR, ground);
+            assert!(
+                ratio >= 4.5,
+                "{}: the pane header's status reads at {ratio:.2}:1 over the brightest \
+                 echo, and that status is the pane's whole filter statement",
+                theme.id
+            );
+            assert!(
+                header_ground().a() >= 200,
+                "{}: the header ground went translucent, so its contrast is now whatever \
+                 reflectivity happens to be underneath it",
+                theme.id
+            );
+        }
+    }
+
+    /// And the pane paints the SAME header, byte for byte, whatever theme is
+    /// installed - including the filter statement it is carrying.
+    ///
+    /// Re-pointed from `every_theme_paints_the_same_filter_band`, and read off
+    /// real egui passes for the same reason that one was: a header that
+    /// started taking its ground from `MapChrome` or its ink from the theme's
+    /// text colour fails here even though the constants above are untouched.
+    /// That is a plausible future edit - it looks like an improvement - and it
+    /// would make the pane's only full account of what is hidden quiet on some
+    /// themes and not others.
+    ///
+    /// The statement arrives as the `status` argument, which is exactly how
+    /// `app.rs::pane_header_status` delivers it, and the assertion covers the
+    /// laid-out words as well as the bar: a theme that painted them in its own
+    /// ink would differ here even with an identical ground.
+    #[test]
+    fn every_theme_paints_the_same_pane_header() {
+        const STATEMENT: &str =
+            "FILTERED: REF below 20 dBZ - 269,740 of 298,195 gates hidden (90.5%)";
+        let map = map_for(MapStylePreset::Slate);
+        // One theme's header, as the shape list reported it: the filled
+        // rows and the laid-out runs with the ink each was painted in.
+        type PaintedHeader = (Vec<(egui::Rect, egui::Color32)>, Vec<String>);
+        let mut first: Option<(&str, PaintedHeader)> = None;
         for theme in catalog::THEMES {
             let context = egui::Context::default();
             crate::theme::apply(&context, &Appearance::by_id(theme.id));
-            let mut bands = Vec::new();
+            let mut header = Vec::new();
+            let mut words = Vec::new();
             for _ in 0..2 {
                 let output = context.run_ui(egui::RawInput::default(), |ui| {
                     egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -1315,7 +1124,6 @@ mod the_filter_indicators_across_every_theme {
                             product_name: "REF",
                             badges: &[],
                             probe: None,
-                            filter_notice: Some(super::who_gets_the_band_click::NOTICE),
                         };
                         draw_pane(
                             ui,
@@ -1323,43 +1131,137 @@ mod the_filter_indicators_across_every_theme {
                             PANE,
                             true,
                             Camera2D::default(),
+                            crate::north_up::NorthUpFrame::unrotated(),
                             NavTuning::default(),
                             None,
                             &map,
                             "1 - REF (dBZ)",
-                            "",
+                            STATEMENT,
                             &overlay,
                         );
                     });
                 });
-                bands = output
-                    .shapes
-                    .into_iter()
-                    .filter_map(|clipped| match clipped.shape {
+                header.clear();
+                words.clear();
+                for clipped in output.shapes {
+                    match clipped.shape {
                         egui::Shape::Rect(rect)
-                            if (rect.rect.height() - FILTER_BAND_HEIGHT).abs() < 0.5 =>
+                            if (rect.rect.height() - HEADER_HEIGHT).abs() < 0.5 =>
                         {
-                            Some((rect.rect, rect.fill))
+                            header.push((rect.rect, rect.fill));
                         }
-                        _ => None,
-                    })
-                    .collect();
+                        egui::Shape::Text(text) => {
+                            let run = text.galley.text().trim().to_owned();
+                            if !run.is_empty() {
+                                words.push(format!("{run}@{:?}", text.fallback_color));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             assert!(
-                !bands.is_empty(),
-                "{}: a filtered pane painted no band at all",
+                !header.is_empty(),
+                "{}: the pane painted no header row at all",
+                theme.id
+            );
+            assert!(
+                words
+                    .iter()
+                    .any(|run| run.starts_with(crate::gate_filter_ui::FILTERED_WORD)),
+                "{}: the header did not put the filter statement on the glass: {words:?}",
                 theme.id
             );
             match first {
-                None => first = Some((theme.id, bands)),
-                Some((other, ref expected)) => assert_eq!(
-                    &bands, expected,
-                    "{} paints a different FILTERED band from {other}. The band is \
-                     furniture, not a mark on the map: it must not follow the theme, or a \
-                     warning becomes something an analyst can tune down",
-                    theme.id
-                ),
+                None => first = Some((theme.id, (header, words))),
+                Some((other, (ref expected_header, ref expected_words))) => {
+                    assert_eq!(
+                        &header, expected_header,
+                        "{} paints a different pane header from {other}. The header is \
+                         furniture, not a mark on the map: it must not follow the theme, \
+                         or the pane's account of what it is hiding becomes something an \
+                         analyst can tune down",
+                        theme.id
+                    );
+                    assert_eq!(
+                        &words, expected_words,
+                        "{} writes the header's words in different ink from {other}",
+                        theme.id
+                    );
+                }
             }
         }
+    }
+
+    /// A pane with its colour legend switched off still says what is hidden.
+    ///
+    /// This is the hole the band's removal opened, pinned shut at the level
+    /// that owns the paint. The band was drawn unconditionally, and its module
+    /// docs said why in as many words: the legend can be switched off in
+    /// Settings and that must never be a way to switch off the admission that
+    /// gates are being hidden. With the band gone the badge beside the colour
+    /// bar goes with the bar, so the statement has to survive on the header -
+    /// which is drawn whatever `legend` and `table` are.
+    ///
+    /// `legend: None` here is exactly what `app.rs` passes when the setting is
+    /// off, and the pane is given no badges for the same reason.
+    #[test]
+    fn a_pane_with_no_legend_still_carries_its_filter_statement() {
+        const STATEMENT: &str =
+            "FILTERED: REF below 20 dBZ - 269,740 of 298,195 gates hidden (90.5%)";
+        let map = map_for(MapStylePreset::Slate);
+        let context = egui::Context::default();
+        let mut words: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let overlay = PaneOverlay {
+                        legend: None,
+                        table: None,
+                        product_name: "REF",
+                        badges: &[],
+                        probe: None,
+                    };
+                    draw_pane(
+                        ui,
+                        PaneId::new(0).expect("pane 0"),
+                        PANE,
+                        true,
+                        Camera2D::default(),
+                        crate::north_up::NorthUpFrame::unrotated(),
+                        NavTuning::default(),
+                        None,
+                        &map,
+                        "1 - REF (dBZ)",
+                        STATEMENT,
+                        &overlay,
+                    );
+                });
+            });
+            words.clear();
+            for clipped in output.shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    words.push(text.galley.text().trim().to_owned());
+                }
+            }
+        }
+        let statement = words
+            .iter()
+            .find(|run| run.starts_with(crate::gate_filter_ui::FILTERED_WORD))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a filtered pane with its colour legend off drew nothing at all about \
+                     the filter - the only evidence left would be the missing echo: \
+                     {words:?}"
+                )
+            });
+        assert!(
+            statement.contains("REF below 20 dBZ"),
+            "the header names no criterion: {statement:?}"
+        );
+        assert!(
+            statement.contains("gates hidden"),
+            "the header dropped the engine's count: {statement:?}"
+        );
     }
 }

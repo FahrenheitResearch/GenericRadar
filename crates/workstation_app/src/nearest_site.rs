@@ -24,9 +24,8 @@
 //!
 //! # Ported from BowEcho, and where this departs
 //!
-//! BowEcho spells the same gesture `ctrl_best_radar_click` (`app_ui/src/
-//! main.rs`) feeding `best_radar_candidates` (`app_ui/src/sites_ui.rs`).
-//! What it actually does:
+//! BowEcho spells the same gesture as a `ctrl_best_radar_click` predicate
+//! feeding a `best_radar_candidates` selector. What it actually does:
 //!
 //!   * chord: `ctrl && !alt && !shift`;
 //!   * take every site within 460 km whose catalogued kind is `Wsr88d` or
@@ -288,8 +287,7 @@ pub fn nearest_s_band_click(
 /// the feature.
 ///
 /// BowEcho settles this the same way and does it in the predicate rather
-/// than at the call site: `plain_map_click_allowed`
-/// (`app_ui/src/main.rs:46693`) is
+/// than at the call site: its `plain_map_click_allowed` is
 /// `!shift && !ctrl_best_radar_click(modifiers) && !alt_model_sounding(..)`,
 /// and the marker branch is gated on it, so a held Ctrl takes the marker
 /// hit-test out of the running entirely before `handle_marker_click` is
@@ -506,76 +504,25 @@ pub fn nearest_s_band_site(
     })
 }
 
+/// The real NWS radar-station catalog, transcribed verbatim from
+/// `https://api.weather.gov/radar/stations` on 2026-08-18: every station
+/// the feed publishes, with the position and the `stationType` it
+/// publishes. Columns are id, latitude, longitude, name, station type.
+///
+/// It is embedded rather than fetched so the tests are hermetic and
+/// offline, and it is the whole catalog rather than a handful of rows so
+/// that "the nearest WSR-88D to downtown Dallas" is a real answer over
+/// the real network and not an artifact of which sites got listed.
+/// `the_shipped_site_cache_agrees_with_the_transcript` re-checks it
+/// against the file this application actually reads, when that file is on
+/// the machine running the tests.
+///
+/// Test-only, but at module level rather than inside `mod tests`: the
+/// catalogue is the shipped station table, and `north_up`'s bound proofs
+/// have to sweep every row of it rather than a mid-latitude handful. See
+/// `crate::north_up` for what they measure.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A finished choice, so the two status lines can be read without a
-    /// catalog behind them. KDVN at 118 km with the 0.5 degree beam 1.4 km
-    /// up is an ordinary Ctrl+click result.
-    fn a_choice() -> SiteChoice {
-        SiteChoice {
-            id: "KDVN".to_owned(),
-            name: Some("Davenport".to_owned()),
-            distance_km: 118.0,
-            beam_height_m: 1_432.0,
-        }
-    }
-
-    /// The shipped line, character for character. Nothing in this wave may
-    /// move a character of it under the default units.
-    #[test]
-    fn the_site_choice_line_is_what_it_has_always_been() {
-        assert_eq!(
-            a_choice().status_line(UnitSystem::default()),
-            "KDVN - nearest WSR-88D, 118 km, 0.5 deg beam 1.4 km"
-        );
-        assert_eq!(
-            no_site_in_range_status(UnitSystem::default()),
-            "No WSR-88D within 460 km of that point"
-        );
-    }
-
-    /// The same choice, announced to an analyst working in miles and feet.
-    ///
-    /// The defect this closes: `status_line` was the site-pick half of the
-    /// unit rollout and was never converted, so Ctrl+click reported
-    /// kilometres into a session whose pane corner read miles.
-    #[test]
-    fn the_site_choice_line_follows_the_unit_settings() {
-        let imperial = UnitSystem {
-            distance: crate::units::DistanceUnit::StatuteMiles,
-            altitude: crate::units::AltitudeUnit::Feet,
-            ..UnitSystem::default()
-        };
-        // 118 km is 73 statute miles; 1432 m is 4698 ft.
-        assert_eq!(
-            a_choice().status_line(imperial),
-            "KDVN - nearest WSR-88D, 73 mi, 0.5 deg beam 4698 ft"
-        );
-        // And the fence is stated in the same unit as everything else.
-        assert_eq!(
-            no_site_in_range_status(imperial),
-            "No WSR-88D within 286 mi of that point"
-        );
-        // The ranking is untouched: the choice still holds the kilometres it
-        // was ranked on.
-        assert_eq!(a_choice().distance_km, 118.0);
-    }
-
-    /// The real NWS radar-station catalog, transcribed verbatim from
-    /// `https://api.weather.gov/radar/stations` on 2026-08-18: every station
-    /// the feed publishes, with the position and the `stationType` it
-    /// publishes. Columns are id, latitude, longitude, name, station type.
-    ///
-    /// It is embedded rather than fetched so the tests are hermetic and
-    /// offline, and it is the whole catalog rather than a handful of rows so
-    /// that "the nearest WSR-88D to downtown Dallas" is a real answer over
-    /// the real network and not an artifact of which sites got listed.
-    /// `the_shipped_site_cache_agrees_with_the_transcript` re-checks it
-    /// against the file this application actually reads, when that file is on
-    /// the machine running the tests.
-    const REAL_STATION_CATALOG: &str = "\
+pub(crate) const REAL_STATION_CATALOG: &str = "\
 AWPA2\t61.15\t-149.78\tAnchorage\tProfiler\n\
 HWPA2\t59.65\t-151.46\tHomer\tProfiler\n\
 KABR\t45.45583\t-98.41305\tAberdeen\tWSR-88D\n\
@@ -785,6 +732,63 @@ TSTL\t38.805\t-90.489\tSt. Louis\tTDWR\n\
 TTPA\t27.86\t-82.518\tTampa Bay\tTDWR\n\
 TTUL\t36.071\t-95.827\tTulsa\tTDWR\n\
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finished choice, so the two status lines can be read without a
+    /// catalog behind them. KDVN at 118 km with the 0.5 degree beam 1.4 km
+    /// up is an ordinary Ctrl+click result.
+    fn a_choice() -> SiteChoice {
+        SiteChoice {
+            id: "KDVN".to_owned(),
+            name: Some("Davenport".to_owned()),
+            distance_km: 118.0,
+            beam_height_m: 1_432.0,
+        }
+    }
+
+    /// The shipped line, character for character. Nothing in this wave may
+    /// move a character of it under the default units.
+    #[test]
+    fn the_site_choice_line_is_what_it_has_always_been() {
+        assert_eq!(
+            a_choice().status_line(UnitSystem::default()),
+            "KDVN - nearest WSR-88D, 118 km, 0.5 deg beam 1.4 km"
+        );
+        assert_eq!(
+            no_site_in_range_status(UnitSystem::default()),
+            "No WSR-88D within 460 km of that point"
+        );
+    }
+
+    /// The same choice, announced to an analyst working in miles and feet.
+    ///
+    /// The defect this closes: `status_line` was the site-pick half of the
+    /// unit rollout and was never converted, so Ctrl+click reported
+    /// kilometres into a session whose pane corner read miles.
+    #[test]
+    fn the_site_choice_line_follows_the_unit_settings() {
+        let imperial = UnitSystem {
+            distance: crate::units::DistanceUnit::StatuteMiles,
+            altitude: crate::units::AltitudeUnit::Feet,
+            ..UnitSystem::default()
+        };
+        // 118 km is 73 statute miles; 1432 m is 4698 ft.
+        assert_eq!(
+            a_choice().status_line(imperial),
+            "KDVN - nearest WSR-88D, 73 mi, 0.5 deg beam 4698 ft"
+        );
+        // And the fence is stated in the same unit as everything else.
+        assert_eq!(
+            no_site_in_range_status(imperial),
+            "No WSR-88D within 286 mi of that point"
+        );
+        // The ranking is untouched: the choice still holds the kilometres it
+        // was ranked on.
+        assert_eq!(a_choice().distance_km, 118.0);
+    }
 
     struct CatalogRow {
         site: LocatedSite,

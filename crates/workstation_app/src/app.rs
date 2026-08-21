@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use analyst_runtime::{
-    FrameOrigin, FrameStage, GenerationClock, PaneId, PaneLayout, PlaybackState, RenderStamp,
-    TiltSelection, ViewportMetrics, VolumeFrame, VolumeHistory, WorkspaceState,
+    Camera2D, FrameOrigin, FrameStage, GenerationClock, PaneId, PaneLayout, PlaybackState,
+    RenderStamp, TiltSelection, ViewportMetrics, VolumeFrame, VolumeHistory, WorkspaceState,
 };
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use color_tables::ColorTableSet;
@@ -19,6 +19,7 @@ use data_source::warnings::{WarningRecord, WarningsSource, WarningsState};
 use crate::hazards::{PlacedHazard, place_hazards};
 use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
+use crate::north_up::NorthUpFrame;
 use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 
@@ -178,6 +179,22 @@ struct PaneRuntime {
     terminal: Option<RenderTerminal>,
     viewport: Option<ViewportMetrics>,
     status: String,
+    /// The engine's own filter line for the picture on screen, counts and all:
+    /// `render2d::GateFilterReport::badge`, straight off the render that
+    /// installed here.
+    ///
+    /// Held apart from [`Self::status`] rather than formatted into it, and
+    /// that separation is what lets `pane_header_status` put the filter
+    /// statement FIRST on the row. The header truncates from the right, so
+    /// whichever part is built last is the part a narrow pane loses - and the
+    /// admission that gates are being hidden is not allowed to be that part.
+    ///
+    /// It is a report about the filter that WAS in force when the worker ran,
+    /// so it is only ever shown when it still agrees with the filter that is
+    /// in force now; `pane_header_status` checks that by the prefix relation
+    /// `gate_filter_ui::pane_status_line` guarantees, rather than by clearing
+    /// this on every settings change and hoping no path was missed.
+    filter_line: Option<String>,
     /// Where the pointer was over this pane last frame, in radar-local
     /// kilometres, and the readout built from it.
     hovered_world_km: Option<(f64, f64)>,
@@ -1847,11 +1864,32 @@ impl WorkstationApp {
                     analyst_runtime::DEFAULT_KM_PER_POINT,
                 )
             } else {
-                let viewports = array::from_fn(|index| self.panes[index].viewport);
-                self.workspace.apply_site_change(&viewports, |world| {
-                    let (lon, lat) = previous_anchor?.world_to_lon_lat(world);
-                    new_anchor?.try_lon_lat_to_world(lon, lat)
-                })
+                let viewports: [Option<ViewportMetrics>; analyst_runtime::MAX_PANES] =
+                    array::from_fn(|index| self.panes[index].viewport);
+                // Snapshotted BEFORE the call, because `apply_site_change`
+                // takes the workspace mutably and the closure below needs to
+                // know each pane's scale to ask the globe how far this pane
+                // has been carried.
+                let scales: [f32; analyst_runtime::MAX_PANES] = array::from_fn(|index| {
+                    PaneId::new(index as u8).map_or(analyst_runtime::DEFAULT_KM_PER_POINT, |pane| {
+                        self.workspace.pane(pane).camera.sanitized().km_per_point
+                    })
+                });
+                self.workspace.apply_site_change(
+                    &viewports,
+                    |world| {
+                        let (lon, lat) = previous_anchor?.world_to_lon_lat(world);
+                        new_anchor?.try_lon_lat_to_world(lon, lat)
+                    },
+                    |pane, world| {
+                        let (Some(projection), Some(_viewport)) =
+                            (new_anchor, viewports[pane.index()])
+                        else {
+                            return 0.0;
+                        };
+                        site_change_display_rotation(&projection, world, scales[pane.index()])
+                    },
+                )
             };
             self.invalidate_view_panes(&changed);
             if !opening {
@@ -2026,16 +2064,16 @@ impl WorkstationApp {
         if exact {
             runtime.pending_stamp = None;
             runtime.terminal = None;
-            // A frame with gates removed says so here, every time, in the words
-            // the filter itself uses. This is the floor, not the finished
-            // treatment: a persistent badge on the pane belongs on the pane.
-            // But no build of this application may ever draw a censored sweep
-            // and say nothing at all, because the only other evidence an
-            // analyst would have is the absence of the echo that was removed.
-            runtime.status = match rendered.gate_filter.badge() {
-                Some(badge) => format!("{:.1} ms | {badge}", rendered.elapsed_ms),
-                None => format!("{:.1} ms", rendered.elapsed_ms),
-            };
+            runtime.status = format!("{:.1} ms", rendered.elapsed_ms);
+            // A frame with gates removed says so on the pane header, every
+            // time, in the words the filter itself uses - and with the counts
+            // only the engine knows. Kept beside the timing rather than
+            // formatted into it so `pane_header_status` can put it at the head
+            // of the row, where a narrow pane cannot truncate it away. No
+            // build of this application may draw a censored sweep and say
+            // nothing at all, because the only other evidence an analyst would
+            // have is the absence of the echo that was removed.
+            runtime.filter_line = rendered.gate_filter.badge();
         }
         // A view-stale install leaves `pending_stamp` alone on purpose: the
         // exact-stamp render is still owed, and `ensure_render_requested`
@@ -2584,6 +2622,7 @@ impl WorkstationApp {
             // invalidation below, so the re-render it asks for is requested
             // under the new filter rather than the old one.
             self.recompute_settings_cache();
+            self.note_filter_cleared();
         }
         if quality_changed || palette_changed || filter_changed {
             // Same data, different picture: every pane's view generation moves,
@@ -2976,6 +3015,7 @@ impl WorkstationApp {
             // invalidation below, so the re-render it asks for is requested
             // under the new filter rather than the old one.
             self.recompute_settings_cache();
+            self.note_filter_cleared();
         }
         if quality_changed || palette_changed || filter_changed {
             // Same data, different picture: every pane's view generation moves,
@@ -3165,24 +3205,29 @@ impl WorkstationApp {
         // not four - but not every pane can obey them: a volume-derived
         // product is integrated out of the whole volume rather than rastered
         // from one sweep, and `render_service` answers that pane with
-        // `GateFilterReport::not_applicable`. So the band is built per pane,
-        // from the pane's own product, and a pane the filter did not run on
-        // says that rather than claiming gates are hidden in it.
-        //
-        // Whether it ran is known here, synchronously, from the product alone -
-        // it is not read back off the render, which would put the honest
-        // version of this band a frame or two behind the picture it describes.
-        // `render_service::render_request` routes on exactly the same
-        // `derived_volume()`, and a test pins the two to each other.
-        let mut clear_filter = false;
+        // `GateFilterReport::not_applicable`. So the header's filter statement
+        // is built per pane, from the pane's own product, and a pane the
+        // filter did not run on says that rather than claiming gates are
+        // hidden in it. See `pane_header_status`.
         for (pane, pane_rect) in pane_rects(rect, self.workspace.layout) {
-            let camera = self.workspace.pane(pane).camera;
+            // Everything below draws with the DISPLAY camera - the analyst's
+            // stored camera plus the derived north-up rotation - so the
+            // basemap, the imagery, the echo, the markers, the warnings, the
+            // rings, the labels and the section line are one picture. The
+            // stored camera is written back separately, without the
+            // derivation; see the `apply_camera_from` call at the foot of this
+            // loop.
+            // One frame object for the whole pane: it answers both what the map
+            // is drawn with and what a gesture is resolved through, so those two
+            // can never come apart. See `crate::north_up`.
+            let north_up = self.north_up_frame(pane, Self::pane_viewport(ui, pane_rect));
+            let camera = north_up.display_camera(self.workspace.pane(pane).camera);
             let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
             let cut_index = volume
                 .as_deref()
                 .and_then(|volume| self.resolve_cut_index(pane, volume));
             let title = pane_title(volume.as_deref(), pane, product, cut_index);
-            let status = self.pane_header_status(pane, now);
+            let status = self.pane_header_status(pane, product, now);
             // Ask the scene for this pane's LOD. Once resident this is a cache
             // lookup; it queues a build only when the bucket is new.
             let pane_map = PaneMap {
@@ -3205,13 +3250,6 @@ impl WorkstationApp {
                 hazards: Arc::clone(&self.placed_hazards),
             };
             let badges = self.pane_badges(product, now);
-            let filter_notice = crate::gate_filter_ui::pane_banner_text_for(
-                &self.settings_cache.gate_filter,
-                product
-                    .derived_volume()
-                    .is_some()
-                    .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED),
-            );
             let interaction = {
                 let texture =
                     self.panes[pane.index()]
@@ -3243,7 +3281,6 @@ impl WorkstationApp {
                     product_name: product.descriptor().short_name,
                     badges: &badges,
                     probe: self.panes[pane.index()].probe_text.as_deref(),
-                    filter_notice: filter_notice.as_deref(),
                 };
                 draw_pane(
                     ui,
@@ -3251,6 +3288,7 @@ impl WorkstationApp {
                     pane_rect,
                     pane == self.workspace.active_pane,
                     camera,
+                    north_up,
                     self.settings_cache.nav,
                     texture,
                     &pane_map,
@@ -3273,15 +3311,6 @@ impl WorkstationApp {
                 self.settings_cache.units,
             );
 
-            // The one obvious way out, taken where the evidence is. `draw_pane`
-            // has already withheld this click from `interaction.clicked`, from
-            // `clicked_site` and from `ctrl_clicked_lon_lat`, so clearing the
-            // filter cannot also drop a Vrot endpoint, drop a section handle,
-            // or change which radar this pane is showing.
-            if interaction.clear_filter_clicked {
-                clear_filter = true;
-                self.workspace.set_active(pane);
-            }
             if self.vrot_active && interaction.clicked {
                 self.take_vrot_sample(pane, volume.as_deref(), cut_index, product);
             } else if self.xsection.wants_pane_clicks()
@@ -3323,25 +3352,26 @@ impl WorkstationApp {
             self.refresh_probe(pane, volume.as_deref(), cut_index, product);
             self.update_viewport(pane, interaction.viewport);
             if interaction.camera_changed {
-                let changed = self.workspace.apply_camera_from(pane, interaction.camera);
+                // Strip the derived rotation on the way back in. The centre
+                // and the scale a gesture produces are WORLD quantities and
+                // are valid whatever rotation resolved them -
+                // `pan_by_screen_delta` and `zoom_about` both apply the
+                // camera's own rotation correctly - but the rotation itself is
+                // not the analyst's, and storing it would make the derivation
+                // compound with itself on the next frame.
+                let stored_rotation_rad = self.workspace.pane(pane).camera.rotation_rad;
+                let changed = self.workspace.apply_camera_from(
+                    pane,
+                    Camera2D {
+                        rotation_rad: stored_rotation_rad,
+                        ..interaction.camera
+                    },
+                );
                 self.invalidate_view_panes(&changed);
             }
             if let Some(volume) = &volume {
                 self.ensure_render_requested(pane, Arc::clone(volume), interaction.viewport);
             }
-        }
-        if clear_filter {
-            // After the loop, not inside it: every visible pane has already
-            // asked for a render under the old filter this frame, and the
-            // invalidation below has to be the last word so the request that
-            // actually reaches the worker is the unfiltered one.
-            crate::gate_filter_ui::write_values(
-                &mut self.settings_store,
-                crate::gate_filter_ui::FilterValues::OFF,
-            );
-            self.recompute_settings_cache();
-            self.invalidate_view_panes(self.workspace.visible_panes());
-            self.status = "Gate filter cleared - every gate is being drawn".to_owned();
         }
     }
 
@@ -3506,7 +3536,11 @@ impl WorkstationApp {
             environment: self.hail_environment.clone(),
             cut_index,
             product,
-            camera: self.workspace.pane(pane).camera,
+            // The DISPLAY camera, so the echo is rastered under the same
+            // rotation the basemap is drawn under. `radar_raster_view` carries
+            // it into `ViewportRasterOptions::rotation_rad`, and the raster's
+            // azimuth lookup takes it off again.
+            camera: self.display_camera(pane, viewport),
             viewport,
             storm_motion: self.workspace.pane(pane).storm_motion,
             color_tables: Arc::clone(&self.color_tables),
@@ -3715,6 +3749,51 @@ impl WorkstationApp {
         self.reset_all_panes();
         for runtime in &mut self.panes {
             runtime.texture = None;
+        }
+    }
+
+    /// The pane's stored camera, plus the rotation that puts north up at the
+    /// middle of THIS pane.
+    ///
+    /// The rotation is DERIVED here on every frame and never written back.
+    /// That is the load-bearing choice, not an implementation detail:
+    /// [`Camera2D`] keeps its exact current meaning (the analyst's own
+    /// intent), the settings file keeps persisting only what the analyst
+    /// chose, link groups, history, `apply_site_change` and `centre_on_anchor`
+    /// are untouched, and `camera_changed` cannot fire on a frame where only
+    /// the derivation moved. Storing it would make every one of those a new
+    /// question.
+    ///
+    /// The rule itself, the 460 km floor and the citations behind it live on
+    /// `RadarProjection::view_rotation_rad`; how a GESTURE is resolved through
+    /// the same rule, so that it and its inverse still compose to the identity,
+    /// lives on [`crate::north_up::NorthUpFrame`].
+    fn display_camera(&self, pane: PaneId, viewport: ViewportMetrics) -> Camera2D {
+        let stored = self.workspace.pane(pane).camera;
+        self.north_up_frame(pane, viewport).display_camera(stored)
+    }
+
+    /// The north-up frame this pane is being drawn in.
+    ///
+    /// One object so that the rotation the map is DRAWN with and the rotation a
+    /// GESTURE is resolved through can never be derived from two different
+    /// readings of the same rule.
+    fn north_up_frame(&self, pane: PaneId, viewport: ViewportMetrics) -> NorthUpFrame {
+        NorthUpFrame::new(
+            self.map_scene.projection(),
+            viewport,
+            self.workspace.pane(pane).camera.rotation_rad,
+        )
+    }
+
+    /// The viewport a pane rectangle implies, the same way `draw_pane`
+    /// measures it, so the display rotation is derived from the pane the
+    /// analyst is actually looking at.
+    fn pane_viewport(ui: &egui::Ui, pane_rect: egui::Rect) -> ViewportMetrics {
+        ViewportMetrics {
+            width_points: pane_rect.width().max(1.0),
+            height_points: pane_rect.height().max(1.0),
+            pixels_per_point: ui.ctx().pixels_per_point().max(1.0),
         }
     }
 
@@ -4330,9 +4409,10 @@ impl WorkstationApp {
         // Second, directly under the stall badge and ahead of PARTIAL: "what
         // you are looking at is not all of it" is the same class of claim as
         // "what you are looking at is not now", and the stack is truncated to
-        // `legend::MAX_BADGES`. This is the legend's copy of the statement -
-        // the loud one is the FILTERED band `canvas` draws under the header,
-        // which is not affected by the colour legend being switched off.
+        // `legend::MAX_BADGES`. This is the legend's one-word copy of the
+        // statement, for the eye already reading the colour ladder; the whole
+        // sentence is on the pane header, which - unlike this stack - cannot
+        // be switched off in Settings.
         if let Some(text) = crate::gate_filter_ui::pane_badge_text(&self.settings_cache.gate_filter)
         {
             badges.push(text);
@@ -4355,8 +4435,72 @@ impl WorkstationApp {
         badges
     }
 
-    fn pane_header_status(&self, pane: PaneId, now: DateTime<Utc>) -> String {
+    /// Say so on the status line when the gate filter has just gone off.
+    ///
+    /// The removed FILTERED band confirmed its own click this way, and the
+    /// confirmation is worth more now than it was then: the escape has moved
+    /// to a key on the toolbar, several inches from the panes whose pictures
+    /// it changes, so an analyst who hits it is not necessarily looking at the
+    /// thing that answers. Called after the cache has been recomputed, so it
+    /// reads the state the click produced rather than the one before it.
+    fn note_filter_cleared(&mut self) {
+        if !self.settings_cache.gate_filter.is_active() {
+            self.status = "Gate filter cleared - every gate is being drawn".to_owned();
+        }
+    }
+
+    /// The right-hand end of a pane's header row.
+    ///
+    /// The filter statement comes FIRST, ahead of the stall word and the frame
+    /// age, and that order is the safety rule rather than a preference. This
+    /// end of the header truncates from the right with a visible ellipsis
+    /// (`pane_canvas::header_galleys`), so on a quarter-pane in the smallest
+    /// window whatever is built last is what an analyst does not get to read -
+    /// and since the full-width FILTERED band was removed this row is the only
+    /// place on the pane the whole statement lives. The stall word and the age
+    /// each have a legend badge and the timeline behind them; the filter
+    /// statement has one word beside the colour bar.
+    ///
+    /// Two versions of that statement exist and this picks between them by
+    /// asking whether they agree. The engine's
+    /// [`PaneRuntime::filter_line`] carries the counts and is the one an
+    /// analyst wants, but it describes the filter the worker ran, which is not
+    /// the filter in force during the frames between a criterion moving and
+    /// the new render landing. `gate_filter_ui::pane_status_line` is built
+    /// from the settings this frame is being drawn under and is always current
+    /// but has no counts. The engine's line is a strict PREFIX of it when the
+    /// two describe the same criteria - pinned in `gate_filter_ui` - so a
+    /// prefix test is exactly "does the landed report still describe what is
+    /// switched on", and a stale one falls back rather than printing another
+    /// filter's numbers.
+    fn pane_header_status(
+        &self,
+        pane: PaneId,
+        product: DisplayProduct,
+        now: DateTime<Utc>,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
+        // Built from the settings cache, not from the render, so a pane that
+        // is still rendering, failed, has no frame yet or carries a product
+        // the filter cannot run against still says that gates are being
+        // hidden. That coverage was the removed band's, and it is inherited
+        // here whole.
+        if let Some(current) = crate::gate_filter_ui::pane_status_line(
+            &self.settings_cache.gate_filter,
+            product
+                .derived_volume()
+                .is_some()
+                .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED),
+        ) {
+            parts.push(
+                self.panes[pane.index()]
+                    .filter_line
+                    .as_ref()
+                    .filter(|landed| landed.starts_with(&current))
+                    .cloned()
+                    .unwrap_or(current),
+            );
+        }
         if self.live_feed_stalled(now) {
             parts.push(
                 if self.live_feed_archive_fallback() {
@@ -4572,6 +4716,33 @@ impl eframe::App for WorkstationApp {
             let _ = self.settings_store.save_now();
         }
     }
+}
+
+/// The rotation a pane will be DRAWN with once a site change has moved it,
+/// for the pane rectangle `decide_across_site_change` measures.
+///
+/// A free function with a name because the frame it works in is the whole
+/// point. `WorkspaceState::apply_site_change` hands its rotation closure a
+/// centre it has already taken out through longitude and latitude on the old
+/// anchor and back in on the new one, so what arrives is a GROUND point in the
+/// new radar's frame, while a camera centre past the globe's blend start is a
+/// WARPED one. An earlier version of the rule unwarped whatever it was given,
+/// so handing it a ground point unwarped it twice and answered about somewhere
+/// else - worth up to 1.83 degrees at a half-formed globe.
+///
+/// The two frames are now the same frame wherever the rule answers at all:
+/// `RadarProjection::view_rotation_rad` is confined to scales finer than
+/// `globe::MIN_BLEND_KM_PER_POINT`, where `globe::blend_for_pane` is an exact
+/// zero and `globe::warp_world` is the identity on the bit pattern. So the
+/// mistake is not fixed here, it is unrepresentable: the rule has no blend
+/// parameter to be given the wrong point for. This function stays because the
+/// caller's `world` really is a ground point and a reader should be told so.
+fn site_change_display_rotation(
+    projection: &map_scene::RadarProjection,
+    ground_centre: analyst_runtime::WorldPoint,
+    km_per_point: f32,
+) -> f32 {
+    projection.view_rotation_rad(ground_centre, km_per_point)
 }
 
 #[cfg(test)]
@@ -4861,6 +5032,166 @@ mod tests {
         pixels_per_point: 1.0,
     };
 
+    /// A SITE CHANGE MEASURES ITS PANE RECTANGLE IN THE FRAME IT WAS HANDED,
+    /// AND INSIDE THE DOMAIN THERE IS ONLY THE ONE FRAME.
+    ///
+    /// `WorkspaceState::apply_site_change` reprojects each pane centre through
+    /// longitude and latitude, so the point it gives its rotation closure is a
+    /// GROUND point in the new radar's frame. Past the globe's blend start a
+    /// camera centre is a WARPED point, and a rule that unwarps what it is
+    /// given used to unwarp this one a second time and answer about somewhere
+    /// else, up to 1.83 degrees of it.
+    ///
+    /// Three halves, and each is what makes the next worth something: the
+    /// helper is the rule itself with no extra step; wherever the rule
+    /// answers, the warped point IS the ground point on the bit pattern, so
+    /// there is no second frame to be in the wrong one of; and where the two
+    /// frames really do differ - a half-formed globe, where the gap is tens of
+    /// kilometres - the rule declines from both of them.
+    #[test]
+    fn a_site_change_asks_about_the_ground_point_it_was_given() {
+        let viewport = ViewportMetrics {
+            width_points: 1600.0,
+            height_points: 900.0,
+            pixels_per_point: 1.0,
+        };
+        // KRTX, the anchor in the complaint.
+        let projection =
+            map_scene::RadarProjection::new(45.714_968_872_070_31, -122.965_301_513_671_88);
+        let grounds = [
+            analyst_runtime::WorldPoint::new(1500.0, 900.0),
+            analyst_runtime::WorldPoint::new(3000.0, -400.0),
+            analyst_runtime::WorldPoint::new(-2500.0, 2500.0),
+        ];
+        let mut answered_somewhere = false;
+        for km_per_point in [0.35_f32, 2.8, 4.9, 5.5, 6.5, 6.99] {
+            let blend = map_scene::projection::globe::blend_for_pane(km_per_point, viewport);
+            for ground in grounds {
+                let used = super::site_change_display_rotation(&projection, ground, km_per_point);
+                assert_eq!(
+                    used.to_bits(),
+                    projection.view_rotation_rad(ground, km_per_point).to_bits(),
+                    "the site change is not asking the rule itself about {ground:?}"
+                );
+                if used != 0.0 {
+                    answered_somewhere = true;
+                    let warped = map_scene::projection::globe::warp_world(ground, blend)
+                        .expect("inside the limb");
+                    assert_eq!(
+                        warped.east_km.to_bits(),
+                        ground.east_km.to_bits(),
+                        "at {km_per_point} km per point the camera frame is not the ground \
+                         frame about {ground:?}"
+                    );
+                    assert_eq!(
+                        warped.north_km.to_bits(),
+                        ground.north_km.to_bits(),
+                        "at {km_per_point} km per point the camera frame is not the ground \
+                         frame about {ground:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            answered_somewhere,
+            "the rule answered zero everywhere, so this proof is not measuring what it claims"
+        );
+        // A half-formed globe, where a ground point and a camera centre really
+        // are different places: the rule declines from either one.
+        let outside = 11.0_f32;
+        let blend = map_scene::projection::globe::blend_for_pane(outside, viewport);
+        assert!(blend > 0.0 && blend < 1.0, "pick a scale inside the band");
+        let mut worst_frame_gap_km = 0.0f64;
+        for ground in grounds {
+            let warped =
+                map_scene::projection::globe::warp_world(ground, blend).expect("inside the limb");
+            worst_frame_gap_km = worst_frame_gap_km
+                .max((warped.east_km - ground.east_km).hypot(warped.north_km - ground.north_km));
+            for centre in [ground, warped] {
+                assert_eq!(
+                    super::site_change_display_rotation(&projection, centre, outside).to_bits(),
+                    0.0_f32.to_bits(),
+                    "a site change turned a pane outside the domain, about {centre:?}"
+                );
+            }
+        }
+        assert!(
+            worst_frame_gap_km > 50.0,
+            "the two frames are only {worst_frame_gap_km:.1} km apart, so this proof is not \
+             measuring what it claims"
+        );
+    }
+
+    /// The derived north-up rotation reaches the pane, and does NOT reach the
+    /// stored camera.
+    ///
+    /// Both halves matter. If it did not reach the pane the map would stay
+    /// crooked; if it reached the stored camera it would compound with itself
+    /// frame after frame, and it would be persisted as though the analyst had
+    /// asked for it.
+    #[test]
+    fn the_north_up_rotation_is_derived_for_the_pane_and_never_written_back() {
+        let mut app = test_app();
+        // KRTX, the anchor in the complaint.
+        assert!(
+            app.map_scene
+                .set_radar_anchor(45.714_968_872_070_31, -122.965_301_513_671_88)
+        );
+        let pane = PaneId::new(0).expect("pane 0");
+        let viewport = ViewportMetrics {
+            width_points: 1600.0,
+            height_points: 900.0,
+            pixels_per_point: 1.0,
+        };
+
+        // On the antenna: nothing at all, and by a bit pattern.
+        app.workspace.pane_mut(pane).camera = Camera2D {
+            center_east_km: 0.0,
+            center_north_km: 0.0,
+            km_per_point: 0.35,
+            rotation_rad: 0.0,
+        };
+        let displayed = app.display_camera(pane, viewport);
+        assert_eq!(displayed, app.workspace.pane(pane).camera);
+
+        // On the eastern seaboard, 3911 km away: about a third of a radian.
+        let projection = app.map_scene.projection().expect("the anchor is set");
+        let centre = projection
+            .try_lon_lat_to_world(-75.0, 40.0)
+            .expect("40N 75W projects from KRTX");
+        let stored = Camera2D {
+            center_east_km: centre.east_km,
+            center_north_km: centre.north_km,
+            km_per_point: 1.0,
+            rotation_rad: 0.0,
+        };
+        app.workspace.pane_mut(pane).camera = stored;
+        let displayed = app.display_camera(pane, viewport);
+        assert!(
+            (displayed.rotation_rad.to_degrees() - 32.327_957).abs() < 1e-3,
+            "the pane was drawn at {} deg",
+            displayed.rotation_rad.to_degrees()
+        );
+        assert_eq!(displayed.center_east_km, stored.center_east_km);
+        assert_eq!(displayed.km_per_point, stored.km_per_point);
+        // The STORED camera is untouched: deriving it per frame is what keeps
+        // `Camera2D` meaning the analyst's own intent.
+        assert_eq!(app.workspace.pane(pane).camera, stored);
+        assert_eq!(app.workspace.pane(pane).camera.rotation_rad, 0.0);
+
+        // An analyst's own rotation is carried, not replaced.
+        app.workspace.pane_mut(pane).camera = Camera2D {
+            rotation_rad: 0.25,
+            ..stored
+        };
+        let displayed = app.display_camera(pane, viewport);
+        assert!(
+            (displayed.rotation_rad - (0.25 + 0.564_226)).abs() < 1e-3,
+            "the analyst's own rotation was lost: {}",
+            displayed.rotation_rad
+        );
+    }
+
     fn test_app() -> WorkstationApp {
         WorkstationApp::with_context(
             egui::Context::default(),
@@ -5043,21 +5374,12 @@ mod tests {
             found.clear();
             let output = context.run_ui(egui::RawInput::default(), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                    // Off the same cache the live path reads, and with the same
-                    // `None` reason a moment pane passes: REF is not a derived
-                    // volume, so the band this helper sees is the band the
-                    // application would draw over these very pixels.
-                    let filter_notice = crate::gate_filter_ui::pane_banner_text_for(
-                        &app.settings_cache.gate_filter,
-                        None,
-                    );
                     let overlay = crate::pane_canvas::PaneOverlay {
                         legend: None,
                         table: None,
                         product_name: "REF",
                         badges: &[],
                         probe: None,
-                        filter_notice: filter_notice.as_deref(),
                     };
                     draw_pane(
                         ui,
@@ -5065,11 +5387,21 @@ mod tests {
                         rect,
                         true,
                         analyst_runtime::Camera2D::default(),
+                        crate::north_up::NorthUpFrame::unrotated(),
                         app.settings_cache.nav,
                         None,
                         &map,
                         "1 - REF (dBZ)",
-                        "",
+                        // The pane header, off the same cache the live path
+                        // reads and with the same `None` reason a moment pane
+                        // passes: REF is not a derived volume, so the
+                        // statement this helper sees is the statement the
+                        // application would draw over these very pixels.
+                        &crate::gate_filter_ui::pane_status_line(
+                            &app.settings_cache.gate_filter,
+                            None,
+                        )
+                        .unwrap_or_default(),
                         &overlay,
                     );
                 });
@@ -6229,12 +6561,19 @@ mod tests {
             "the age must ride behind the Z time: {status}"
         );
 
-        assert_eq!(app.pane_header_status(pane, observed_now()), "2 min old");
+        assert_eq!(
+            app.pane_header_status(pane, DisplayProduct::default(), observed_now()),
+            "2 min old"
+        );
 
         // Same volume, two hours later: the number moves without anything new
         // arriving, which is what makes it a live quantity rather than a stamp.
         assert_eq!(
-            app.pane_header_status(pane, observed_now() + TimeDelta::hours(2)),
+            app.pane_header_status(
+                pane,
+                DisplayProduct::default(),
+                observed_now() + TimeDelta::hours(2)
+            ),
             "2 h old"
         );
     }
@@ -6248,7 +6587,7 @@ mod tests {
         app.panes[pane.index()].status = "12.3 ms".to_owned();
 
         assert_eq!(
-            app.pane_header_status(pane, observed_now()),
+            app.pane_header_status(pane, DisplayProduct::default(), observed_now()),
             "2 min old · 12.3 ms"
         );
     }
@@ -6285,7 +6624,7 @@ mod tests {
         // The pane header leads with the word, not just the number: "3 d old"
         // alone is also what a deliberate archive load looks like.
         assert_eq!(
-            app.pane_header_status(first_pane(), observed_now()),
+            app.pane_header_status(first_pane(), DisplayProduct::default(), observed_now()),
             "STALLED · 3 d old"
         );
         assert!(app.live_feed_stalled(observed_now()));
@@ -6315,7 +6654,7 @@ mod tests {
             Some("KUEX archive fallback · newest data 40 s old")
         );
         assert_eq!(
-            app.pane_header_status(first_pane(), observed_now()),
+            app.pane_header_status(first_pane(), DisplayProduct::default(), observed_now()),
             "ARCHIVE FALLBACK · 40 s old"
         );
         assert_eq!(
@@ -6347,7 +6686,7 @@ mod tests {
         assert_eq!(app.live_stall_notice(observed_now()), None);
         assert!(!app.live_feed_stalled(observed_now()));
         assert_eq!(
-            app.pane_header_status(first_pane(), observed_now()),
+            app.pane_header_status(first_pane(), DisplayProduct::default(), observed_now()),
             "2 min old"
         );
     }
@@ -6804,7 +7143,7 @@ mod tests {
                 println!("    status line   {}", app.timeline_status(now));
                 println!(
                     "    pane header   {}",
-                    app.pane_header_status(first_pane(), now)
+                    app.pane_header_status(first_pane(), DisplayProduct::default(), now)
                 );
                 println!(
                     "    stall banner  {}",
@@ -6883,22 +7222,6 @@ mod tests {
         found
     }
 
-    /// Where a text run containing `needle` landed. The needle rather than a
-    /// prefix because the pane draws TWO runs beginning `FILTERED` - the band
-    /// and the legend badge - and only one of them is clickable.
-    fn text_position(shapes: &[egui::Shape], needle: &str) -> Option<egui::Pos2> {
-        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
-            match shape {
-                egui::Shape::Text(text) if text.galley.text().contains(needle) => {
-                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
-                }
-                egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, needle)),
-                _ => None,
-            }
-        }
-        shapes.iter().find_map(|shape| walk(shape, needle))
-    }
-
     /// One whole application frame, through the shipped `eframe::App::ui`.
     fn app_frame(
         app: &mut WorkstationApp,
@@ -6936,14 +7259,40 @@ mod tests {
         ]
     }
 
+    /// Where a text run that IS `wanted` landed, rather than one containing
+    /// it.
+    ///
+    /// The clear key is a single `×`, and several other runs on a full frame
+    /// contain that character - a supersampling label, a scale readout - so
+    /// the needle form would find whichever came first in the shape list.
+    fn exact_text_position(shapes: &[egui::Shape], wanted: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, wanted: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text().trim() == wanted => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, wanted)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|shape| walk(shape, wanted))
+    }
+
     /// THE safety pin. A pane that is hiding gates says so, naming what it is
     /// hiding; a pane that is hiding nothing says nothing.
     ///
     /// Asserted on a full application frame rather than on
-    /// `gate_filter_ui::pane_banner_text`, because the failure this guards
+    /// `gate_filter_ui::pane_status_line`, because the failure this guards
     /// against is not a wrong string - it is a right string that never reaches
     /// the glass, which is what deleting one line of `canvas` would produce
     /// while every unit test stayed green.
+    ///
+    /// The loud indicator this used to read - a full-width band under the
+    /// header - is gone. The pin did not go with it: the same claim is now
+    /// made against the pane HEADER, which
+    /// is drawn unconditionally and which `pane_header_status` builds from the
+    /// settings cache, so it is on the glass from the frame a criterion is set
+    /// rather than from the frame the render lands.
     #[test]
     fn a_pane_says_filtered_exactly_when_it_is_hiding_gates() {
         let context = egui::Context::default();
@@ -6963,32 +7312,184 @@ mod tests {
         let mut filtered = app_with_filter(&context, storm_mode(), "menus");
         app_frame(&mut filtered, &context, Vec::new());
         let texts = shape_texts(&app_frame(&mut filtered, &context, Vec::new()));
-        // The band: the loud one, drawn by `canvas` under every pane's header
-        // whatever the legend setting says.
-        let band = texts
+        // The pane header: the statement no setting can switch off, drawn by
+        // `canvas` at the right-hand end of every pane's title row.
+        let statement = texts
             .iter()
-            .find(|text| text.contains("show everything"))
+            .find(|text| text.starts_with(&format!("{FILTERED_WORD}:")))
             .unwrap_or_else(|| {
                 panic!(
-                    "a filtered pane drew no {FILTERED_WORD} band - the only evidence left \
-                     would be the missing echo itself: {texts:?}"
+                    "a filtered pane made no {FILTERED_WORD} statement - the only evidence \
+                     left would be the missing echo itself: {texts:?}"
                 )
             });
         assert!(
-            band.starts_with(FILTERED_WORD),
-            "the band buries the word that matters: {band:?}"
-        );
-        assert!(
-            band.contains("REF below 20 dBZ"),
-            "the band does not name what it hides: {band:?}"
+            statement.contains("REF below 20 dBZ"),
+            "the header does not name what it hides: {statement:?}"
         );
         // And the legend's own copy, beside the colour bar where the analyst
         // is already reading.
         assert!(
-            texts
-                .iter()
-                .any(|text| text.starts_with(FILTERED_WORD) && !text.contains("show everything")),
+            texts.iter().any(|text| text == FILTERED_WORD),
             "the legend badge stack carries no filter badge: {texts:?}"
+        );
+    }
+
+    /// The pane keeps saying so with the colour legend switched off.
+    ///
+    /// This is the hole the band's removal opened, pinned shut on a full
+    /// application frame. The band was unconditional precisely because the
+    /// legend - and with it the one-word badge - can be turned off in
+    /// Settings; the statement had to land somewhere that setting cannot
+    /// reach, and it landed on the header.
+    ///
+    /// The legend badge is asserted absent as well as the statement present,
+    /// so this cannot pass by the legend quietly ignoring the setting.
+    #[test]
+    fn a_filtered_pane_with_no_colour_legend_still_says_so() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+        let mut app = app_with_filter(&context, storm_mode(), "menus");
+        app.settings_store.set(
+            crate::settings_ui::catalog::keys::radar::CATEGORY,
+            crate::settings_ui::catalog::keys::radar::LEGEND,
+            settings::SettingValue::Bool(false),
+        );
+        app.recompute_settings_cache();
+        assert!(
+            !app.settings_cache.legend,
+            "the legend is still switched on"
+        );
+
+        app_frame(&mut app, &context, Vec::new());
+        let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
+        assert!(
+            !texts.iter().any(|text| text == FILTERED_WORD),
+            "the legend badge survived the legend being switched off, so this proves \
+             nothing about the header: {texts:?}"
+        );
+        let statement = texts
+            .iter()
+            .find(|text| text.starts_with(&format!("{FILTERED_WORD}:")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "with the colour legend off, a filtered pane said nothing at all - a \
+                     setting about a colour bar switched off the admission that gates are \
+                     being hidden: {texts:?}"
+                )
+            });
+        assert!(
+            statement.contains("REF below 20 dBZ"),
+            "the header does not name what it hides: {statement:?}"
+        );
+    }
+
+    /// The statement is on the glass BEFORE any render has landed.
+    ///
+    /// The engine's line - counts and all - only exists once a worker has
+    /// answered, and `PaneRuntime::filter_line` is empty until then. The band
+    /// covered that window because it was built from the settings; the header
+    /// inherits that, and this is what says so. A header built only from the
+    /// render result would leave a pane reading nothing at all for as long as
+    /// the render takes, and for ever on a pane whose product is unavailable.
+    #[test]
+    fn a_pane_says_filtered_before_any_render_has_answered() {
+        let context = egui::Context::default();
+        let app = app_with_filter(&context, storm_mode(), "menus");
+        let pane = first_pane();
+        assert!(
+            app.panes[pane.index()].filter_line.is_none(),
+            "this pane has already rendered, so the window under test is not open"
+        );
+        let status = app.pane_header_status(pane, DisplayProduct::default(), chrono::Utc::now());
+        assert!(
+            status.starts_with(FILTERED_WORD),
+            "a pane with no render behind it said {status:?}"
+        );
+        assert!(status.contains("REF below 20 dBZ"), "{status:?}");
+    }
+
+    /// The header quotes the ENGINE once the engine has answered, and refuses
+    /// to quote a report about criteria that are no longer switched on.
+    ///
+    /// Both halves are the same mechanism seen from two sides. The engine's
+    /// line is the one an analyst wants - it carries the counts - but it
+    /// describes the filter the worker ran, so a header that printed it
+    /// unconditionally would show one filter's numbers under another filter's
+    /// picture for the frames between a criterion moving and the new render
+    /// landing.
+    #[test]
+    fn the_header_takes_the_engines_counts_only_while_they_still_describe_the_filter() {
+        let context = egui::Context::default();
+        let mut app = app_with_filter(&context, storm_mode(), "menus");
+        let pane = first_pane();
+        let now = chrono::Utc::now();
+
+        // What the worker would have installed for this filter.
+        let landed = render2d::GateFilterReport {
+            filter: app.settings_cache.gate_filter,
+            gates_visible: 298_195,
+            gates_hidden: 269_740,
+            ..render2d::GateFilterReport::INACTIVE
+        }
+        .badge()
+        .expect("the engine reports an active filter");
+        app.panes[pane.index()].filter_line = Some(landed.clone());
+        let status = app.pane_header_status(pane, DisplayProduct::default(), now);
+        assert!(
+            status.starts_with(&landed),
+            "the header dropped the engine's own counts: {status:?}"
+        );
+        assert!(status.contains("269,740 of 298,195"), "{status:?}");
+
+        // Now the analyst moves a criterion. The installed report is about the
+        // old one until a new render lands.
+        apply_filter_through_settings(&mut app, FilterValues::OFF);
+        let status = app.pane_header_status(pane, DisplayProduct::default(), now);
+        assert!(
+            !status.contains(FILTERED_WORD),
+            "the filter is off and the header still quotes a filtered render: {status:?}"
+        );
+
+        let mut loosened = storm_mode();
+        loosened.min_dbz += 10.0;
+        apply_filter_through_settings(&mut app, loosened);
+        let status = app.pane_header_status(pane, DisplayProduct::default(), now);
+        assert!(
+            !status.contains("269,740"),
+            "the header printed one filter's counts under another filter's criteria: \
+             {status:?}"
+        );
+        assert!(
+            status.contains(&app.settings_cache.gate_filter.hidden_summary()),
+            "the header stopped naming what is being hidden: {status:?}"
+        );
+    }
+
+    /// The filter statement is built ahead of the age and the stall word, so a
+    /// narrow pane truncates those and not this.
+    ///
+    /// The order is the safety rule rather than a preference, and it is only
+    /// load-bearing because the band is gone: this row is the pane's whole
+    /// account of what is missing, and `pane_canvas::header_galleys`
+    /// truncates it from the right.
+    #[test]
+    fn the_filter_statement_comes_first_on_the_header_row() {
+        let context = egui::Context::default();
+        let mut app = app_with_filter(&context, storm_mode(), "menus");
+        install(&mut app, weak_echo_volume());
+        let pane = first_pane();
+        app.panes[pane.index()].status = "27.5 ms".to_owned();
+        // Old enough that the age and the stall word are both in the row.
+        let now = observed_now() + TimeDelta::hours(19);
+        let status = app.pane_header_status(pane, DisplayProduct::default(), now);
+        assert!(
+            status.starts_with(FILTERED_WORD),
+            "the header buries its filter statement behind {status:?}"
+        );
+        assert!(
+            status.contains("old"),
+            "this row carries no age, so the ordering claim is vacuous: {status:?}"
         );
     }
 
@@ -7019,32 +7520,83 @@ mod tests {
         }
     }
 
-    /// The one obvious action, exercised where it lives: clicking the band
-    /// clears every criterion.
+    /// THE one obvious action out, exercised where it now lives: the clear key
+    /// on the toolbar, in BOTH toolbar styles.
+    ///
+    /// It used to be the pane's FILTERED band, which took the click where the
+    /// evidence was. With the band gone the escape moved to the bar, beside
+    /// the chip that turned the filter on - so this is the same pin with a new
+    /// subject, and it is made in both bars because neither of the two
+    /// supported toolbars may be the one with no way out of a filtered view.
+    ///
+    /// Driven through the shipped `eframe::App::ui` with real pointer events,
+    /// like the band test before it: the claim is that an analyst can hit it,
+    /// not that a function exists.
     #[test]
-    fn clicking_the_filtered_band_shows_everything_again() {
-        let context = egui::Context::default();
-        crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
-        let mut app = app_with_filter(&context, storm_mode(), "menus");
-        app_frame(&mut app, &context, Vec::new());
-        let shapes = app_frame(&mut app, &context, Vec::new());
-        let band = text_position(&shapes, "show everything")
-            .expect("a filtered pane draws its band before it can be clicked");
-        assert!(app.settings_cache.gate_filter.is_active());
+    fn clicking_the_toolbars_clear_key_shows_everything_again() {
+        for style in ["menus", "full"] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+            let mut app = app_with_filter(&context, storm_mode(), style);
+            app_frame(&mut app, &context, Vec::new());
+            let shapes = app_frame(&mut app, &context, Vec::new());
+            assert!(app.settings_cache.gate_filter.is_active());
+            let key = exact_text_position(&shapes, crate::gate_filter_ui::CLEAR_GLYPH)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{style}: a filtered bar offers no way out at all: {:?}",
+                        shape_texts(&shapes)
+                    )
+                });
 
-        app_frame(&mut app, &context, pointer(band, true));
-        app_frame(&mut app, &context, pointer(band, false));
+            app_frame(&mut app, &context, pointer(key, true));
+            app_frame(&mut app, &context, pointer(key, false));
 
-        assert_eq!(
-            app.settings_cache.gate_filter,
-            render2d::GateFilter::OFF,
-            "clicking the band did not clear the filter"
-        );
-        let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
-        assert!(
-            !texts.iter().any(|text| text.contains(FILTERED_WORD)),
-            "the band outlived the filter it was warning about: {texts:?}"
-        );
+            assert_eq!(
+                app.settings_cache.gate_filter,
+                render2d::GateFilter::OFF,
+                "{style}: the clear key did not clear the filter"
+            );
+            let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
+            assert!(
+                !texts.iter().any(|text| text.contains(FILTERED_WORD)),
+                "{style}: the statement outlived the filter it was about: {texts:?}"
+            );
+            assert!(
+                !texts
+                    .iter()
+                    .any(|text| text == crate::gate_filter_ui::CLEAR_GLYPH),
+                "{style}: the clear key outlived the filter it cleared: {texts:?}"
+            );
+            assert!(
+                app.status.contains("cleared"),
+                "{style}: nothing confirmed the click, and the key is inches from the \
+                 panes whose pictures it changed: {:?}",
+                app.status
+            );
+        }
+    }
+
+    /// The clear key is offered ONLY while there is something to clear.
+    ///
+    /// The other half of the claim above, and the one that keeps an unfiltered
+    /// session's bar exactly the bar this application has always drawn: a dead
+    /// key beside the chip would be furniture, and a live one would be an
+    /// action with no subject.
+    #[test]
+    fn an_unfiltered_toolbar_offers_no_clear_key() {
+        for style in ["menus", "full"] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context, &crate::theme::Appearance::by_id("light"));
+            let mut app = app_with_filter(&context, FilterValues::OFF, style);
+            let texts = toolbar_texts(&mut app);
+            assert!(
+                !texts
+                    .iter()
+                    .any(|text| text == crate::gate_filter_ui::CLEAR_GLYPH),
+                "{style}: an unfiltered bar drew a clear key: {texts:?}"
+            );
+        }
     }
 
     /// Persistence, including the preset's identity: the numbers on disk are
@@ -7180,9 +7732,9 @@ mod tests {
             "a page reset left the filter on with no row on the page saying so"
         );
         assert_eq!(
-            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None),
+            crate::gate_filter_ui::pane_status_line(&app.settings_cache.gate_filter, None),
             None,
-            "a page reset cleared the pixels and left the band claiming otherwise"
+            "a page reset cleared the pixels and left the pane claiming otherwise"
         );
 
         // --- saved under a name, switched away from, and switched back --
@@ -7237,9 +7789,9 @@ mod tests {
         );
         // And the words came back with it.
         assert!(
-            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None)
-                .is_some_and(|band| band.contains(FILTERED_WORD)),
-            "the filter came back and the band did not"
+            crate::gate_filter_ui::pane_status_line(&app.settings_cache.gate_filter, None)
+                .is_some_and(|line| line.contains(FILTERED_WORD)),
+            "the filter came back and the pane's own statement did not"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7257,21 +7809,27 @@ mod tests {
     ///
     /// `GateFilter::hidden_summary` is the only implementation of that
     /// sentence after the merge - the UI branch's copy was a declared
-    /// placeholder and is gone - and both indicators quote it: the pane's band
-    /// through `gate_filter_ui::pane_banner_text_for`, and the engine's own
-    /// line through `GateFilterReport::badge`. Pinning that they quote it,
-    /// rather than pinning two literal strings, is what makes them unable to
-    /// drift apart.
+    /// placeholder and is gone - and both indicators quote it: the pane header
+    /// through `gate_filter_ui::pane_status_line`, and the engine's own line
+    /// through `GateFilterReport::badge`. Pinning that they quote it, rather
+    /// than pinning two literal strings, is what makes them unable to drift
+    /// apart.
     ///
     /// The second half is the case the merge created. A volume-derived product
     /// is integrated out of the whole volume rather than rastered from one
     /// sweep, so `render_service::render_derived` answers it with
-    /// `GateFilterReport::not_applicable` - and a canvas-wide band would then
-    /// have that pane reading FILTERED while its own status line read FILTER
-    /// NOT APPLIED. Two indicators on one pane disagreeing about whether
-    /// weather is being hidden is worse than either alone.
+    /// `GateFilterReport::not_applicable` - and an indicator built from the
+    /// settings alone would then have that pane reading FILTERED while the
+    /// engine's own line read FILTER NOT APPLIED. Two indicators on one pane
+    /// disagreeing about whether weather is being hidden is worse than either
+    /// alone, which is why `pane_status_line` takes the reason per pane.
+    ///
+    /// Re-pointed from the removed band, whose sentence carried its own "click
+    /// here to show everything" clause; that clause is now a key on the
+    /// toolbar and is pinned by
+    /// `clicking_the_toolbars_clear_key_shows_everything_again`.
     #[test]
-    fn the_band_and_the_engine_never_describe_the_same_pane_differently() {
+    fn the_pane_statement_and_the_engine_never_describe_the_same_pane_differently() {
         use crate::render_service::DERIVED_PRODUCT_NOT_FILTERED;
 
         let filter = storm_mode().to_filter();
@@ -7280,13 +7838,14 @@ mod tests {
 
         for product in DisplayProduct::ALL {
             // The one fact both sides route on. `render_request` sends a
-            // product with a derived volume down `render_derived`; `canvas`
-            // asks the identical question of the identical method.
+            // product with a derived volume down `render_derived`;
+            // `pane_header_status` asks the identical question of the
+            // identical method.
             let applies = product.derived_volume().is_none();
             let reason = (!applies).then_some(DERIVED_PRODUCT_NOT_FILTERED);
 
-            let band = crate::gate_filter_ui::pane_banner_text_for(&filter, reason)
-                .unwrap_or_else(|| panic!("{}: a filtered pane drew no band", product.id()));
+            let line = crate::gate_filter_ui::pane_status_line(&filter, reason)
+                .unwrap_or_else(|| panic!("{}: a filtered pane said nothing", product.id()));
             let report = if applies {
                 // What a sweep-rastered pane comes back with. The counts are
                 // not the subject here; the words are.
@@ -7304,8 +7863,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}: the engine reported nothing", product.id()));
 
             assert!(
-                band.contains(&summary),
-                "{}: the band does not name what is hidden: {band:?}",
+                line.contains(&summary),
+                "{}: the pane does not name what is hidden: {line:?}",
                 product.id()
             );
             assert!(
@@ -7314,23 +7873,25 @@ mod tests {
                 product.id()
             );
             assert_eq!(
-                band.starts_with(FILTERED_WORD),
+                line.starts_with(FILTERED_WORD),
                 report.is_applicable(),
-                "{}: the band says {band:?} while the engine says {badge:?}",
+                "{}: the pane says {line:?} while the engine says {badge:?}",
                 product.id()
             );
             if !applies {
                 assert!(
-                    band.contains(DERIVED_PRODUCT_NOT_FILTERED)
+                    line.contains(DERIVED_PRODUCT_NOT_FILTERED)
                         && badge.contains(DERIVED_PRODUCT_NOT_FILTERED),
-                    "{}: the two sides give different reasons: {band:?} / {badge:?}",
+                    "{}: the two sides give different reasons: {line:?} / {badge:?}",
                     product.id()
                 );
             }
-            // Whatever it says, the way out is on it.
+            // And the pane's own line is what the engine's line is built on
+            // top of, so the header does not reword itself when the render
+            // lands - it only gains the counts.
             assert!(
-                band.contains("click here to show everything"),
-                "{}: the band offers no way out: {band:?}",
+                badge.starts_with(&line),
+                "{}: the pane reads {line:?} before the render and {badge:?} after it",
                 product.id()
             );
         }
@@ -7448,17 +8009,18 @@ mod tests {
                 }
             );
 
-            // And the pane's own band agrees with both, for the same reason.
-            let band = crate::gate_filter_ui::pane_banner_text_for(
+            // And the pane's own header agrees with both, for the same
+            // reason.
+            let line = crate::gate_filter_ui::pane_status_line(
                 &app.settings_cache.gate_filter,
                 (!renderer_censors_this_pane)
                     .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED),
             )
-            .unwrap_or_else(|| panic!("{}: a filtered pane drew no band", product.id()));
+            .unwrap_or_else(|| panic!("{}: a filtered pane said nothing", product.id()));
             assert_eq!(
-                band.starts_with(FILTERED_WORD),
+                line.starts_with(FILTERED_WORD),
                 readout.contains(FILTERED_WORD),
-                "{}: the band says {band:?} and the readout says {readout:?}",
+                "{}: the header says {line:?} and the readout says {readout:?}",
                 product.id()
             );
         }
@@ -7466,16 +8028,16 @@ mod tests {
 
     /// A pane that is showing everything says nothing, whatever its product.
     #[test]
-    fn an_unfiltered_pane_draws_no_band_even_where_the_filter_could_not_run() {
+    fn an_unfiltered_pane_says_nothing_even_where_the_filter_could_not_run() {
         for product in DisplayProduct::ALL {
             let reason = product
                 .derived_volume()
                 .is_some()
                 .then_some(crate::render_service::DERIVED_PRODUCT_NOT_FILTERED);
             assert_eq!(
-                crate::gate_filter_ui::pane_banner_text_for(&render2d::GateFilter::OFF, reason),
+                crate::gate_filter_ui::pane_status_line(&render2d::GateFilter::OFF, reason),
                 None,
-                "{}: an unfiltered pane put a band on the glass",
+                "{}: an unfiltered pane put a filter statement on the glass",
                 product.id()
             );
         }
@@ -7606,17 +8168,21 @@ mod tests {
             filtered.gate_filter.gates_hidden
         );
 
-        // 3. The words. Band, legend badge and the engine's own line all quote
-        //    the same summary, so the pane and the picture cannot disagree.
+        // 3. The words. The pane header, the legend badge and the engine's
+        //    own line all quote the same summary, so the pane and the picture
+        //    cannot disagree.
         let summary = app.settings_cache.gate_filter.hidden_summary();
-        let band =
-            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None)
-                .expect("a filtered pane draws a band");
+        let line = crate::gate_filter_ui::pane_status_line(&app.settings_cache.gate_filter, None)
+            .expect("a filtered pane makes a statement");
         let engine_line = filtered
             .gate_filter
             .badge()
             .expect("the engine says what it removed");
-        assert!(band.contains(&summary) && engine_line.contains(&summary));
+        assert!(line.contains(&summary) && engine_line.contains(&summary));
+        assert!(
+            engine_line.starts_with(&line),
+            "the header reads {line:?} before the render and {engine_line:?} after it"
+        );
         assert!(
             crate::gate_filter_ui::pane_badge_text(&app.settings_cache.gate_filter).is_some(),
             "the legend badge went missing while gates were hidden"
@@ -7627,10 +8193,18 @@ mod tests {
         app_frame(&mut app, &context, Vec::new());
         let texts = shape_texts(&app_frame(&mut app, &context, Vec::new()));
         assert!(
+            texts.iter().any(|text| text.starts_with(&engine_line)),
+            "a filtered pane did not put the engine's own line on its header over real              data - wanted {engine_line:?} in {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == FILTERED_WORD),
+            "the legend badge is not on the glass over real data: {texts:?}"
+        );
+        assert!(
             texts
                 .iter()
-                .any(|text| text.starts_with(FILTERED_WORD) && text.contains("show everything")),
-            "a filtered pane drew no {FILTERED_WORD} band over real data: {texts:?}"
+                .any(|text| text == crate::gate_filter_ui::CLEAR_GLYPH),
+            "a filtered application over real data offers no way out on its bar: {texts:?}"
         );
         println!("unfiltered ink {unfiltered_ink} px");
         println!("filtered   ink {filtered_ink} px");
@@ -7662,9 +8236,9 @@ mod tests {
             unfiltered.rgba.len()
         );
         assert_eq!(
-            crate::gate_filter_ui::pane_banner_text_for(&app.settings_cache.gate_filter, None),
+            crate::gate_filter_ui::pane_status_line(&app.settings_cache.gate_filter, None),
             None,
-            "the band outlived the filter"
+            "the pane's statement outlived the filter"
         );
     }
 

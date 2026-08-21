@@ -636,6 +636,19 @@ impl TileSceneController {
         // Saturating the cap means the pane wants more tiles than the budget
         // allows; one coarser zoom quarters the count. Bounded below by
         // MIN_TILE_ZOOM, past which the layer switches off entirely.
+        //
+        // A ROTATED pane asks for more tiles than it needs, and it is worth
+        // saying why rather than leaving it as a mystery. A Web Mercator tile
+        // is an axis-aligned rectangle in a north-up frame, and
+        // `basemap_tiles::visibility::bounding_tiles` takes the AXIS-ALIGNED
+        // bounding box of the pane's projected boundary. Turn the pane and
+        // that box grows: by a factor of 2.06 at 32 degrees on a 16:9 pane,
+        // 2.17 at 45. Through the loop below the failure is bounded and
+        // self-correcting - at most one extra zoom is dropped, and only when
+        // the unrotated pane was already asking for close to the cap - so a
+        // rotated pane can be one level blurrier than an unrotated one. The
+        // fix, when it is worth it, is in `bounding_tiles`: reject candidates
+        // outside the true rotated boundary instead of taking a box around it.
         let mut zoom = zoom;
         let mut tiles = visible_tiles(zoom, &view, MAX_TILES_PER_PANE);
         while (tiles.is_empty() || tiles.len() >= MAX_TILES_PER_PANE) && zoom > MIN_TILE_ZOOM {

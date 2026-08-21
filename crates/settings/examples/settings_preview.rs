@@ -2,11 +2,10 @@
 //!
 //! `cargo run --release -p settings --example settings_preview -- <out.png> [category]`
 //!
-//! This exists because the settings window's `mod` wiring into the
-//! workstation binary is human-owned: until it lands, this example is the
-//! only way to LOOK at the real window - the same source file the
-//! workstation will compile, drawing the real catalog over a real store -
-//! rather than trusting that compiling code draws a usable dialog. The
+//! This exists so the settings window can be LOOKED at without launching the
+//! whole workstation: it opens the same source file the workstation compiles,
+//! drawing the real catalog over a real store, rather than trusting that
+//! compiling code draws a usable dialog. The
 //! screenshot is taken through eframe's own viewport command a few frames
 //! after startup (so layout has settled) and the process exits by itself.
 //!

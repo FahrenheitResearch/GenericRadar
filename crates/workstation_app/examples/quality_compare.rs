@@ -95,6 +95,7 @@ fn run(input: &Path, out_dir: &Path, moment: MomentType, km_per_px: f32) -> Resu
         radar_y_px: FRAME_PX as f32 / 2.0,
         km_per_px_x: km_per_px,
         km_per_px_y: km_per_px,
+        rotation_rad: 0.0,
     };
     let tables = color_tables::ColorTableSet::default();
 
