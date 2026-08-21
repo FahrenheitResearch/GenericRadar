@@ -837,7 +837,7 @@ fn warnings_http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
-        .user_agent(crate::HTTP_USER_AGENT)
+        .user_agent(crate::http_user_agent())
         .build()
         .map_err(|error| format!("HTTP client: {error}"))
 }

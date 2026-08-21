@@ -48,8 +48,11 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
+    pub mod iq_session;
+    pub mod iq_spectrum_ui;
     pub mod legend;
     pub mod live_service;
     pub mod load_service;
@@ -65,6 +68,7 @@ mod source {
     pub mod product_availability;
     pub mod product_picker;
     pub mod render_service;
+    pub mod research_sites;
     pub mod settings_ui;
     pub mod sites_service;
     pub mod sweep;
@@ -78,10 +82,11 @@ mod source {
 }
 
 pub(crate) use source::{
-    annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
-    product, product_availability, product_picker, render_service, settings_ui, sites_service,
-    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
+    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
+    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
+    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
+    units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};

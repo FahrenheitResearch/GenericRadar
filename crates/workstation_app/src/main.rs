@@ -5,8 +5,11 @@ use eframe::egui;
 mod annotation;
 mod app;
 mod app_support;
+mod file_browser;
 mod gate_filter_ui;
 mod hazards;
+mod iq_session;
+mod iq_spectrum_ui;
 mod legend;
 mod live_service;
 mod load_service;
@@ -22,6 +25,7 @@ mod product;
 mod product_availability;
 mod product_picker;
 mod render_service;
+mod research_sites;
 // `settings_ui` and `theme` are each compiled in a second home as well - the
 // `settings` crate's ui harness and the `theme_gallery` example include them
 // by `#[path]` - so items this binary does not call (the deep-link openers,

@@ -1,39 +1,84 @@
-//! Minimal read-only HDF5 parser — just enough for ODIM_H5 polar volumes.
+//! Minimal read-only HDF5 parser — just enough for the two radar formats
+//! that arrive inside HDF5 containers: ODIM_H5 polar volumes and netCDF-4.
 //!
 //! The workspace has no HDF5 dependency (the C library is a heavy, awkward
-//! build input on Windows CI), and ODIM files exercise a small, stable
-//! corner of the format: BALTRAD/rave, HL-HDF, and h5py (libver "earliest",
-//! its default) all write version-0 superblocks, version-1 object headers,
-//! old-style groups (symbol table + v1 B-tree + local heap), and contiguous
-//! or chunked+deflate dataset layouts. This module implements exactly that
-//! subset, byte-for-byte against the HDF5 File Format Specification
-//! (The HDF Group, "HDF5 File Format Specification Version 3.0";
+//! build input on Windows CI), and between them those two formats exercise
+//! a narrow, stable corner of the format — but they sit at opposite ends of
+//! it. ODIM writers (BALTRAD/rave, HL-HDF, IRIS export, and h5py at its
+//! default libver "earliest") stay on the 1.6 layout: version-0
+//! superblocks, version-1 object headers, old-style groups. netCDF-4 — the
+//! container CfRadial 1.x is dominantly written in, so
+//! [`crate::netcdf4`] and [`crate::cfradial`] depend on it — writes the 1.8
+//! layout instead: version-2/3 superblocks, version-2 object headers, and
+//! links and attributes in fractal heaps indexed by version-2 B-trees once
+//! a group outgrows compact storage. This module implements the union of
+//! the two, byte-for-byte against the HDF5 File Format Specification (The
+//! HDF Group, "HDF5 File Format Specification Version 3.0";
 //! <https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t3.html>):
 //!
-//! - Superblock v0/v1 (v2/v3 — the 1.10+ "latest" layout — is detected and
-//!   rejected with a clear error).
-//! - Version 1 object headers, including continuation blocks.
-//! - Version 2 object headers ("OHDR", with "OCHK" continuation blocks and
-//!   Jenkins lookup3 checksum verification). AEMET/Spain writes ODIM H5rad
-//!   2.4 files (IRIS 8.13/10.3 export, live in ORD since 2026-06-23) as a
-//!   mixed dialect: superblock v0 and old-style groups, but v2 headers on
-//!   the leaf metadata groups (`datasetN/{how,what,where}`,
-//!   `datasetN/dataM/{how,what}`). Their attributes stay compact (message
-//!   0x000C version 1) and their link-info fractal-heap addresses are
-//!   undefined, so v2 B-trees, fractal heaps, and dense attribute storage
-//!   remain out of scope below.
-//! - Messages: dataspace (0x0001), datatype (0x0003), data layout (0x0008,
-//!   v3 compact/contiguous/chunked), filter pipeline (0x000B, deflate id 1
-//!   and shuffle id 2), attribute (0x000C, versions 1-3), header
-//!   continuation (0x0010), symbol table (0x0011).
-//! - Datatypes: fixed-point, IEEE float (f32/f64), fixed-length strings, and
-//!   variable-length strings (global heap collections).
+//! - Superblock v0/v1 (offset and length sizes behind the free-space and
+//!   root-table version bytes, root group reached through a symbol table
+//!   entry) and v2/v3 (sizes straight after the version byte, root object
+//!   header addressed directly, trailing checksum).
+//! - Version 1 object headers, including continuation blocks, and version 2
+//!   headers ("OHDR", with "OCHK" continuation blocks and Jenkins lookup3
+//!   checksum verification). Real files mix the two: AEMET/Spain writes
+//!   ODIM H5rad 2.4 (IRIS 8.13/10.3 export, live in ORD since 2026-06-23)
+//!   with a version-0 superblock and old-style groups but version-2 headers
+//!   on the leaf metadata groups (`datasetN/{how,what,where}`,
+//!   `datasetN/dataM/{how,what}`).
+//! - All three group link storages: the symbol table message (0x0011) — a
+//!   v1 B-tree of SNOD leaves plus a local heap of names, which is what
+//!   ODIM writes; compact link messages (0x0006), which a group under its
+//!   max-compact threshold (eight links) uses; and dense storage behind a
+//!   link info message (0x0002) — a fractal heap indexed by a version 2
+//!   B-tree, where every netCDF-4 root group with more than eight variables
+//!   keeps its links, which is every published CfRadial 1 file.
+//! - Attributes both ways: compact attribute messages (0x000C, versions
+//!   1-3) and dense storage behind an attribute info message (0x0015),
+//!   again a fractal heap plus a version 2 B-tree.
+//! - Messages: dataspace (0x0001), link info (0x0002), datatype (0x0003),
+//!   fill value (0x0005 versions 1-3, and the deprecated 0x0004), link
+//!   (0x0006), data layout (0x0008, v3 compact/contiguous/chunked), filter
+//!   pipeline (0x000B, deflate id 1 and shuffle id 2), attribute (0x000C),
+//!   header continuation (0x0010), symbol table (0x0011), attribute info
+//!   (0x0015).
+//! - Datatypes: fixed-point (1-8 bytes, signed or not) and IEEE float
+//!   (f32/f64) anywhere, plus fixed-length strings — one byte wide in a
+//!   dataset, which is how netCDF-4 stores `NC_CHAR` (the string length is
+//!   the array's last dimension), any width in an attribute. Variable-length
+//!   strings are read in attributes only, through global heap collections.
 //! - Chunk index: v1 B-trees; raw chunks pass through the inverse filter
 //!   pipeline (deflate, then unshuffle) and edge chunks are clipped.
+//! - Storage the writer never allocated: a contiguous dataset whose data
+//!   address is undefined, and a chunk with no record in the index, both
+//!   read back as the dataset's FILL VALUE. Zero is the answer only where
+//!   the file defines no fill value, which is HDF5's own default — not a
+//!   stand-in for one it does define. A radar moment declared with
+//!   `_FillValue = -9999` and never written is no-data everywhere, and
+//!   returning 0.0 for it would paint weak echo over ground the file says
+//!   was never measured.
 //!
-//! Everything else (fractal heaps, dense attributes, v2 B-trees, shared
-//! messages, fill values beyond zero, named datatypes, ...) is out of scope
-//! and produces an explicit error rather than silent misreads.
+//! Out of scope, and refused BY NAME rather than guessed at: data layout
+//! messages other than version 3 — version 4 is the 1.10 "latest" set of
+//! chunk indexes (extensible array, fixed array, version 2 B-tree), and
+//! versions 1-2 predate 1.6 — virtual layout, external data storage
+//! (message 0x0007, which pairs with a contiguous layout whose address is
+//! undefined and must not be mistaken for a plane that was never written),
+//! filters other than deflate and shuffle (fletcher32 id 3, szip id 4,
+//! scale-offset id 6, LZF id 32000), datatype classes other than the four
+//! above (compound, enum, array, opaque, bitfield, reference, and
+//! variable-length datasets — as opposed to variable-length string
+//! attributes, which are read), object header messages carrying the SHARED
+//! flag, attributes whose datatype or dataspace is a shared message, and
+//! fractal heaps with I/O filters on their direct blocks. Soft and external
+//! links are the one thing skipped rather than refused, so a group that
+//! carries one alongside real datasets still opens.
+//!
+//! A committed (named) datatype — what netCDF-4 writes for a user-defined
+//! type — is recognised as neither a group nor a dataset
+//! ([`H5File::is_committed_datatype`]) so a caller can step over it; its
+//! contents are not read.
 //!
 //! Hostile input is assumed: these bytes arrive by file drop, so every walk
 //! is bounded by a `MAX_*` constant below and every failure must be a
@@ -56,7 +101,27 @@ const SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', b'\r', b'\n', 0x1a, b'\n'];
 const OHDR_SIGNATURE: &[u8; 4] = b"OHDR";
 /// Version 2 object header continuation block signature.
 const OCHK_SIGNATURE: &[u8; 4] = b"OCHK";
+/// Fractal heap header signature (HDF5 spec section III.G).
+const FRHP_SIGNATURE: &[u8; 4] = b"FRHP";
+/// Fractal heap indirect block signature.
+const FHIB_SIGNATURE: &[u8; 4] = b"FHIB";
+/// Fractal heap direct block signature.
+const FHDB_SIGNATURE: &[u8; 4] = b"FHDB";
+/// Version 2 B-tree header / internal node / leaf node signatures
+/// (HDF5 spec section III.A.2).
+const BTHD_SIGNATURE: &[u8; 4] = b"BTHD";
+const BTIN_SIGNATURE: &[u8; 4] = b"BTIN";
+const BTLF_SIGNATURE: &[u8; 4] = b"BTLF";
 const UNDEFINED_ADDR: u64 = u64::MAX;
+/// Object header message flag bit 1: the message body is a POINTER into the
+/// file's shared-message table, not the message itself.
+///
+/// Nothing that writes radar data turns shared messages on — HDF5 leaves
+/// `H5Pset_shared_mesg_nindexes` at zero and neither ODIM writers nor
+/// netCDF-C change it — and reading one as if it were inline would take a
+/// heap address for a datatype. So it is refused by name wherever it
+/// appears.
+const MESSAGE_FLAG_SHARED: u8 = 0x02;
 /// Defense against corrupt files: deepest group nesting we will walk.
 const MAX_GROUP_DEPTH: usize = 16;
 /// Defense against corrupt B-trees: most nodes visited per tree walk.
@@ -106,8 +171,28 @@ const MAX_HDF5_DATASET_BYTES: usize = 256 * 1024 * 1024;
 /// to ~100 MB: 10-14 sweeps x 8 moments x 720 rays x 1 200 gates x 2 bytes).
 pub(crate) const MAX_HDF5_TOTAL_DATASET_BYTES: usize = 512 * 1024 * 1024;
 const MAX_HDF5_ATTRIBUTE_BYTES: usize = 16 * 1024 * 1024;
+/// Longest link or attribute name accepted, so a corrupt length field
+/// cannot reserve a string the file does not contain.
+const MAX_HDF5_NAME_BYTES: usize = 64 * 1024;
 const MAX_HDF5_FILTERS: usize = 32;
 const MAX_HDF5_FILTER_VALUES: usize = 1024;
+/// Defense against corrupt fractal heaps: most managed direct blocks one
+/// heap may resolve to, and the deepest chain of indirect blocks walked.
+///
+/// A heap's doubling table doubles the row size every row after the second,
+/// so a legitimate heap reaches gigabytes in a couple of dozen rows and
+/// these ceilings cannot be met by real data: the widest netCDF-4 root
+/// group surveyed here (118 links, 37 attributes) resolves 12 direct blocks
+/// at depth 1. They exist because the row/column walk below is driven
+/// entirely by counts read out of the file.
+const MAX_FRACTAL_HEAP_BLOCKS: usize = 1 << 14;
+const MAX_FRACTAL_HEAP_DEPTH: usize = 16;
+/// Defense against corrupt version 2 B-trees: deepest node chain descended
+/// and most records collected from one tree. The depth ceiling matters for
+/// the same reason [`MAX_BTREE_DEPTH`] does — recursion is what a stack
+/// overflow is made of, and that is a process kill Rust cannot catch.
+const MAX_BTREE_V2_DEPTH: usize = 32;
+const MAX_BTREE_V2_RECORDS: usize = 1 << 20;
 
 /// `true` when the buffer starts with the HDF5 superblock signature.
 pub fn looks_like_hdf5_bytes(bytes: &[u8]) -> bool {
@@ -158,6 +243,11 @@ pub enum H5Data {
     U16(Vec<u16>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    /// Characters: a fixed-length string datatype one byte wide, which is
+    /// how netCDF-4 stores `NC_CHAR`. Kept apart from [`Self::U8`] because
+    /// the bytes mean text, not numbers — a caller that read a `sweep_mode`
+    /// as small integers would get digits where it wanted "rhi".
+    Chars(Vec<u8>),
 }
 
 impl H5Data {
@@ -167,6 +257,7 @@ impl H5Data {
             Self::U16(values) => values.len(),
             Self::F32(values) => values.len(),
             Self::F64(values) => values.len(),
+            Self::Chars(values) => values.len(),
         }
     }
 
@@ -209,32 +300,39 @@ impl<'a> H5File<'a> {
             return Err(invalid(0, "missing HDF5 superblock signature"));
         }
         let version = *bytes.get(8).ok_or_else(|| truncated(8, 1, bytes.len()))?;
-        if version > 1 {
-            // Real-world note: netCDF-4 files (modern CfRadial 1.x and all
-            // CfRadial 2, written by Radx/netCDF) carry this superblock —
-            // every public CfRadial sample checked in 2026 does. Point
-            // those users at the conversion that actually works.
+        if version > 3 {
             return Err(invalid(
                 8,
-                format!(
-                    "HDF5 superblock version {version} (1.10+ 'latest' layout) is unsupported. \
-                     If this is a netCDF-4 CfRadial file, convert it to classic netCDF \
-                     (`nccopy -k classic` or RadxConvert) and open the .nc; ODIM_H5 writers \
-                     should use default/earliest library settings"
-                ),
+                format!("HDF5 superblock version {version} is unsupported (need 0-3)"),
             ));
         }
-        let offset_size = read_u8(bytes, 13)? as usize;
-        let length_size = read_u8(bytes, 14)? as usize;
+        // Superblock v0/v1 put the offset/length sizes after a
+        // free-space/root-table version triple; v2/v3 (the 1.8+ "latest"
+        // layout, and what every netCDF-4 writer emits) put them straight
+        // after the version byte and drop the symbol-table entry entirely
+        // in favour of a direct root object header address.
+        let modern = version >= 2;
+        let (offset_size, length_size) = if modern {
+            (read_u8(bytes, 9)? as usize, read_u8(bytes, 10)? as usize)
+        } else {
+            (read_u8(bytes, 13)? as usize, read_u8(bytes, 14)? as usize)
+        };
         if !(4..=8).contains(&offset_size) || !(4..=8).contains(&length_size) {
             return Err(invalid(13, "unsupported HDF5 offset/length sizes"));
         }
-        // v0: fixed fields end at 24; v1 inserts 4 bytes (indexed-storage k).
-        let addr_block = if version == 0 { 24 } else { 28 };
-        // base, free-space, EOF, driver-info addresses; then the root group
-        // symbol table entry, whose object header address is field 2.
-        let root_entry = addr_block + 4 * offset_size;
-        let root_header = read_offset(bytes, root_entry + offset_size, offset_size)?;
+        let root_header = if modern {
+            // base, superblock-extension and EOF addresses, then the root
+            // group's object header address.
+            read_offset(bytes, 12 + 3 * offset_size, offset_size)?
+        } else {
+            // v0: fixed fields end at 24; v1 inserts 4 bytes (indexed-
+            // storage k). base, free-space, EOF, driver-info addresses;
+            // then the root group symbol table entry, whose object header
+            // address is field 2.
+            let addr_block = if version == 0 { 24 } else { 28 };
+            let root_entry = addr_block + 4 * offset_size;
+            read_offset(bytes, root_entry + offset_size, offset_size)?
+        };
         let mut file = Self {
             bytes,
             offset_size,
@@ -289,16 +387,180 @@ impl<'a> H5File<'a> {
 
     /// Read one attribute of the object at `path`.
     pub fn attr(&self, path: &str, name: &str) -> Option<H5Attr> {
-        let header = self.parse_object_header(*self.objects.get(path)?).ok()?;
-        for message in &header.messages {
-            if message.kind != 0x000C {
-                continue;
-            }
-            if let Ok(Some(attr)) = self.parse_attribute(&message.body, name) {
+        for body in self.attribute_messages(path).ok()? {
+            if let Ok(Some(attr)) = self.parse_attribute(&body, name) {
                 return Some(attr);
             }
         }
         None
+    }
+
+    /// Every attribute of the object at `path`, in the order the file
+    /// indexes them.
+    ///
+    /// Attributes this reader cannot decode are SKIPPED rather than fatal:
+    /// netCDF-4 hangs its own bookkeeping off attributes whose datatypes are
+    /// outside this parser's scope — `DIMENSION_LIST` is a variable-length
+    /// sequence of object references and `REFERENCE_LIST` is a compound —
+    /// and a caller enumerating a variable's CF attributes should not lose
+    /// `units` because `REFERENCE_LIST` sits next to it. The ones netCDF-4
+    /// bookkeeping actually needs have their own accessors below.
+    pub fn attrs(&self, path: &str) -> Vec<(String, H5Attr)> {
+        let Ok(messages) = self.attribute_messages(path) else {
+            return Vec::new();
+        };
+        messages
+            .iter()
+            .filter_map(|body| {
+                let raw = self.split_attribute(body).ok()?;
+                let value = self.decode_attribute(&raw).ok()?;
+                Some((raw.name.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Names of every attribute of the object at `path`, including the ones
+    /// [`Self::attrs`] cannot decode a value for.
+    pub fn attr_names(&self, path: &str) -> Vec<String> {
+        let Ok(messages) = self.attribute_messages(path) else {
+            return Vec::new();
+        };
+        messages
+            .iter()
+            .filter_map(|body| Some(self.split_attribute(body).ok()?.name))
+            .collect()
+    }
+
+    /// Decode an attribute holding a variable-length sequence of OBJECT
+    /// REFERENCES into the addresses it points at.
+    ///
+    /// This is exactly one attribute in practice: netCDF-4's
+    /// `DIMENSION_LIST`, which names a variable's dimensions by pointing at
+    /// the dimension-scale dataset for each axis. Nothing else in this
+    /// crate's world uses references, so the shape is read narrowly — a
+    /// rank-1 dataspace of vlen elements whose base type is an 8-byte
+    /// object reference — and anything else returns `None`.
+    /// An attribute this reader cannot even split is SKIPPED, exactly as in
+    /// [`Self::attrs`]: giving up on the whole search at the first one would
+    /// mean an object whose `DIMENSION_LIST` happens to sit after some other
+    /// undecodable attribute reports no dimensions at all — and a variable
+    /// with no dimension ids drops out of the field filter and vanishes from
+    /// the volume without an error anyone can see.
+    pub fn attr_object_references(&self, path: &str, name: &str) -> Option<Vec<Vec<u64>>> {
+        for body in self.attribute_messages(path).ok()? {
+            let Ok(raw) = self.split_attribute(body.as_slice()) else {
+                continue;
+            };
+            if raw.name != name {
+                continue;
+            }
+            return self.decode_reference_sequence(&raw).ok();
+        }
+        None
+    }
+
+    /// Dimension sizes of a dataset, without reading (or budgeting for) its
+    /// elements.
+    pub fn dataset_shape(&self, path: &str) -> Result<Vec<usize>> {
+        let address = *self
+            .objects
+            .get(path)
+            .ok_or_else(|| invalid(0, format!("HDF5 object '{path}' not found")))?;
+        for message in &self.parse_object_header(address)?.messages {
+            if message.kind == 0x0001 {
+                return self.parse_dataspace(&message.body);
+            }
+        }
+        Err(invalid(0, format!("dataset '{path}' has no dataspace")))
+    }
+
+    /// `true` when the object at `path` is a dataset: an array, so it
+    /// carries both a datatype and a dataspace.
+    ///
+    /// A group carries neither. A COMMITTED (named) datatype carries the
+    /// datatype ALONE, which is why the dataspace has to be part of the
+    /// test — see [`Self::is_committed_datatype`].
+    pub fn is_dataset(&self, path: &str) -> bool {
+        let (datatype, dataspace) = self.datatype_and_dataspace(path);
+        datatype && dataspace
+    }
+
+    /// `true` when the object at `path` is a committed (named) datatype: a
+    /// datatype message with no dataspace beside it.
+    ///
+    /// netCDF-4 writes one of these into the group for every user-defined
+    /// type a file declares — `nc_def_enum`, `nc_def_compound`,
+    /// `nc_def_vlen` — so an otherwise ordinary CfRadial file can carry one
+    /// next to its variables. It is not a variable and has no shape, and a
+    /// reader that treats it as one fails a whole file over an object it
+    /// never needed to read.
+    pub fn is_committed_datatype(&self, path: &str) -> bool {
+        let (datatype, dataspace) = self.datatype_and_dataspace(path);
+        datatype && !dataspace
+    }
+
+    /// Whether the object at `path` carries a datatype message (0x0003) and
+    /// a dataspace message (0x0001): the pair that tells a dataset, a group
+    /// and a committed datatype apart.
+    fn datatype_and_dataspace(&self, path: &str) -> (bool, bool) {
+        let Some(header) = self
+            .objects
+            .get(path)
+            .and_then(|address| self.parse_object_header(*address).ok())
+        else {
+            return (false, false);
+        };
+        let has = |kind: u16| header.messages.iter().any(|message| message.kind == kind);
+        (has(0x0003), has(0x0001))
+    }
+
+    /// Object header address of `path`, as [`Self::attr_object_references`]
+    /// reports the targets of a reference.
+    pub fn object_address(&self, path: &str) -> Option<u64> {
+        self.objects.get(path).copied()
+    }
+
+    /// Every attribute message body on the object at `path`, from compact
+    /// and dense storage alike.
+    ///
+    /// Compact attributes are 0x000C messages in the object header. Dense
+    /// ones — what an object gets past eight attributes, which is most
+    /// netCDF-4 root groups — live in a fractal heap announced by an
+    /// attribute info (0x0015) message, and are the same message bytes once
+    /// fetched.
+    fn attribute_messages(&self, path: &str) -> Result<Vec<Vec<u8>>> {
+        let address = *self
+            .objects
+            .get(path)
+            .ok_or_else(|| invalid(0, format!("HDF5 object '{path}' not found")))?;
+        let header = self.parse_object_header(address)?;
+        let mut bodies = Vec::new();
+        for message in &header.messages {
+            match message.kind {
+                0x000C => bodies.push(message.body.clone()),
+                0x0015 => {
+                    // The attribute info message's optional creation index
+                    // is 2 bytes wide, where a link info message's is 8.
+                    let Some((heap_address, name_btree)) =
+                        self.dense_storage_addresses(&message.body, 2)?
+                    else {
+                        continue;
+                    };
+                    let heap = self.fractal_heap(heap_address)?;
+                    for record in self.btree_v2_records(name_btree)? {
+                        // Attribute name record (type 8): the heap ID
+                        // FIRST, then message flags, creation order and the
+                        // name hash.
+                        let id = record.get(..heap.heap_id_len).ok_or_else(|| {
+                            invalid(0, "dense attribute record is shorter than its heap ID")
+                        })?;
+                        bodies.push(self.heap_object(&heap, id)?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(bodies)
     }
 
     /// Read the full dataset at `path`.
@@ -312,10 +574,31 @@ impl<'a> H5File<'a> {
         let mut dtype: Option<Datatype> = None;
         let mut layout: Option<Layout> = None;
         let mut filters: Vec<Filter> = Vec::new();
+        let mut fill: Option<Vec<u8>> = None;
         for message in &header.messages {
             match message.kind {
                 0x0001 => dims = Some(self.parse_dataspace(&message.body)?),
                 0x0003 => dtype = Some(self.parse_datatype(&message.body)?),
+                0x0004 | 0x0005 => {
+                    if let Some(value) = parse_fill_value(message.kind, &message.body)? {
+                        fill = Some(value);
+                    }
+                }
+                0x0007 => {
+                    // External storage: the elements live in files beside
+                    // this one, and the layout message that comes with it
+                    // is contiguous with an UNDEFINED address. Following
+                    // the reference is out of scope, and treating it as
+                    // never-written would hand back a plane of fill value
+                    // for a dataset whose data exists.
+                    return Err(invalid(
+                        0,
+                        format!(
+                            "dataset '{path}' keeps its elements in external data files, which \
+                             this reader does not follow"
+                        ),
+                    ));
+                }
                 0x0008 => layout = Some(self.parse_layout(&message.body)?),
                 0x000B => filters = self.parse_filter_pipeline(&message.body)?,
                 _ => {}
@@ -331,6 +614,23 @@ impl<'a> H5File<'a> {
             MAX_HDF5_DATASET_BYTES,
             "HDF5 dataset",
         )?;
+        // A fill value is stored in the dataset's own datatype, so it can
+        // only be repeated across a buffer if it is exactly one element
+        // wide. Anything else is a malformed file, and repeating it anyway
+        // would smear a pattern across element boundaries — the silent
+        // misread this module refuses to make.
+        if let Some(value) = &fill
+            && value.len() != dtype.size
+        {
+            return Err(invalid(
+                0,
+                format!(
+                    "dataset '{path}' declares a {}-byte fill value for a {}-byte datatype",
+                    value.len(),
+                    dtype.size
+                ),
+            ));
+        }
         // Charge the whole-file budget from the DECLARED size, before any of
         // the paths below allocate — including the never-written contiguous
         // one, which materialises a fill-value plane out of no input bytes.
@@ -339,7 +639,9 @@ impl<'a> H5File<'a> {
             Layout::Compact(data) => data,
             Layout::Contiguous { address, size } => {
                 if address == UNDEFINED_ADDR {
-                    vec![0u8; byte_len] // never written: fill value (zero)
+                    // Never written, so the file holds no bytes for it at
+                    // all: every element reads as the fill value.
+                    filled_buffer(byte_len, fill.as_deref())
                 } else {
                     self.slice(address, (size as usize).min(byte_len))?.to_vec()
                 }
@@ -347,7 +649,14 @@ impl<'a> H5File<'a> {
             Layout::Chunked {
                 btree_address,
                 chunk_dims,
-            } => self.read_chunked(btree_address, &chunk_dims, &dims, dtype.size, &filters)?,
+            } => self.read_chunked(
+                btree_address,
+                &chunk_dims,
+                &dims,
+                dtype.size,
+                &filters,
+                fill.as_deref(),
+            )?,
         };
         if raw.len() < byte_len {
             return Err(invalid(
@@ -374,31 +683,172 @@ impl<'a> H5File<'a> {
         if depth > MAX_GROUP_DEPTH {
             return Err(invalid(0, "HDF5 group nesting too deep"));
         }
-        for message in &header.messages {
-            if message.kind != 0x0011 {
-                continue;
+        for (name, child_address) in self.group_children(header)? {
+            let path = format!("{prefix}/{name}");
+            if self.objects.contains_key(&path) {
+                continue; // hard-link cycle guard
             }
-            // Symbol table message: v1 B-tree of SNOD leaves + local heap.
-            let btree = read_offset(&message.body, 0, self.offset_size)?;
-            let heap = read_offset(&message.body, self.offset_size, self.offset_size)?;
-            let heap_data = self.local_heap_data(heap)?;
-            let mut entries = Vec::new();
-            let mut visited_nodes = BTreeSet::new();
-            self.collect_group_entries(btree, &mut entries, &mut visited_nodes, 0)?;
-            for (name_offset, child_address) in entries {
-                let name = heap_string(self.bytes, heap_data, name_offset)?;
-                let path = format!("{prefix}/{name}");
-                if self.objects.contains_key(&path) {
-                    continue; // hard-link cycle guard
-                }
-                let child = self.parse_object_header(child_address)?;
-                self.objects.insert(path.clone(), child_address);
-                if visited_groups.insert(child_address) {
-                    self.walk_group(&path, &child, visited_groups, depth + 1)?;
-                }
+            let child = self.parse_object_header(child_address)?;
+            self.objects.insert(path.clone(), child_address);
+            if visited_groups.insert(child_address) {
+                self.walk_group(&path, &child, visited_groups, depth + 1)?;
             }
         }
         Ok(())
+    }
+
+    /// The (name, object header address) pairs one group links to, from
+    /// whichever of the three link storages it uses.
+    ///
+    /// * Symbol table message (0x0011) — the 1.6 "old style" group: a v1
+    ///   B-tree of SNOD leaves plus a local heap of names. ODIM writers
+    ///   emit this.
+    /// * Link messages (0x0006) — "new style" compact storage, used while a
+    ///   group stays under its max-compact threshold (eight links by
+    ///   default).
+    /// * Link info message (0x0002) — "new style" dense storage: the links
+    ///   live in a fractal heap indexed by a version 2 B-tree. Every
+    ///   netCDF-4 root group with more than eight variables is here, which
+    ///   is every CfRadial file.
+    fn group_children(&self, header: &ObjectHeader) -> Result<Vec<(String, u64)>> {
+        let mut children = Vec::new();
+        for message in &header.messages {
+            match message.kind {
+                0x0011 => {
+                    let btree = read_offset(&message.body, 0, self.offset_size)?;
+                    let heap = read_offset(&message.body, self.offset_size, self.offset_size)?;
+                    let heap_data = self.local_heap_data(heap)?;
+                    let mut entries = Vec::new();
+                    let mut visited_nodes = BTreeSet::new();
+                    self.collect_group_entries(btree, &mut entries, &mut visited_nodes, 0)?;
+                    for (name_offset, child_address) in entries {
+                        children.push((
+                            heap_string(self.bytes, heap_data, name_offset)?,
+                            child_address,
+                        ));
+                    }
+                }
+                0x0006 => {
+                    if let Some(link) = self.parse_link_message(&message.body)? {
+                        children.push(link);
+                    }
+                }
+                0x0002 => self.collect_dense_links(&message.body, &mut children)?,
+                _ => {}
+            }
+            if children.len() > MAX_GROUP_ENTRIES {
+                return Err(invalid(0, "HDF5 group has too many entries"));
+            }
+        }
+        Ok(children)
+    }
+
+    /// One "new style" link message: a name and, for a hard link, the
+    /// address of the object it names.
+    ///
+    /// Soft and external links return `None` — their link information is a
+    /// path or a filename, not an address in this file, and following one
+    /// is out of scope. They are skipped rather than refused so a group that
+    /// carries one alongside real datasets still opens.
+    fn parse_link_message(&self, body: &[u8]) -> Result<Option<(String, u64)>> {
+        let version = *body.first().ok_or_else(|| truncated(0, 1, 0))?;
+        if version != 1 {
+            return Err(invalid(
+                0,
+                format!("link message version {version} unsupported"),
+            ));
+        }
+        let flags = *body.get(1).ok_or_else(|| truncated(1, 1, body.len()))?;
+        let mut at = 2usize;
+        let link_type = if flags & 0x08 != 0 {
+            let kind = *body.get(at).ok_or_else(|| truncated(at, 1, body.len()))?;
+            at += 1;
+            kind
+        } else {
+            0 // hard link, the default when the field is absent
+        };
+        if flags & 0x04 != 0 {
+            at += 8; // creation order
+        }
+        if flags & 0x10 != 0 {
+            at += 1; // name character set
+        }
+        let name_length_size = 1usize << (flags & 0x03);
+        let name_len = usize::try_from(read_uint(body, at, name_length_size)?)
+            .map_err(|_| invalid(at, "HDF5 link name length overflows usize"))?;
+        if name_len > MAX_HDF5_NAME_BYTES {
+            return Err(invalid(
+                at,
+                format!("HDF5 link name is {name_len} bytes (limit {MAX_HDF5_NAME_BYTES})"),
+            ));
+        }
+        at = at
+            .checked_add(name_length_size)
+            .ok_or_else(|| invalid(at, "HDF5 link cursor overflow"))?;
+        let name = String::from_utf8_lossy(checked_range(body, at, name_len)?).into_owned();
+        if link_type != 0 {
+            return Ok(None);
+        }
+        at = at
+            .checked_add(name_len)
+            .ok_or_else(|| invalid(at, "HDF5 link cursor overflow"))?;
+        Ok(Some((name, read_offset(body, at, self.offset_size)?)))
+    }
+
+    /// Dense link storage: read the fractal heap and its name index.
+    fn collect_dense_links(&self, body: &[u8], out: &mut Vec<(String, u64)>) -> Result<()> {
+        let Some((heap_address, name_btree)) = self.dense_storage_addresses(body, 8)? else {
+            return Ok(());
+        };
+        let heap = self.fractal_heap(heap_address)?;
+        for record in self.btree_v2_records(name_btree)? {
+            // Link name record (type 5): a 4-byte hash of the name, then
+            // the link message's heap ID.
+            let id = record
+                .get(4..4 + heap.heap_id_len)
+                .ok_or_else(|| invalid(0, "dense link record is shorter than its heap ID"))?;
+            if let Some(link) = self.parse_link_message(&self.heap_object(&heap, id)?)? {
+                out.push(link);
+            }
+        }
+        Ok(())
+    }
+
+    /// The fractal heap and name-index addresses a link info (0x0002) or
+    /// attribute info (0x0015) message points at, or `None` when the object
+    /// keeps that kind of metadata in compact messages instead.
+    ///
+    /// The two messages share a shape: version, flags, an optional maximum
+    /// creation index whose WIDTH differs between them, then the heap and
+    /// the two B-tree addresses.
+    fn dense_storage_addresses(
+        &self,
+        body: &[u8],
+        creation_index_bytes: usize,
+    ) -> Result<Option<(u64, u64)>> {
+        let version = *body.first().ok_or_else(|| truncated(0, 1, 0))?;
+        if version != 0 {
+            return Err(invalid(
+                0,
+                format!("dense storage info message version {version} unsupported"),
+            ));
+        }
+        let flags = *body.get(1).ok_or_else(|| truncated(1, 1, body.len()))?;
+        let mut at = 2usize;
+        if flags & 0x01 != 0 {
+            at += creation_index_bytes;
+        }
+        let heap_address = read_offset(body, at, self.offset_size)?;
+        at = at
+            .checked_add(self.offset_size)
+            .ok_or_else(|| invalid(at, "dense storage cursor overflow"))?;
+        let name_btree = read_offset(body, at, self.offset_size)?;
+        if heap_address == UNDEFINED_ADDR || name_btree == UNDEFINED_ADDR {
+            // Undefined addresses mean this object has not gone dense: its
+            // links or attributes are compact messages in the header.
+            return Ok(None);
+        }
+        Ok(Some((heap_address, name_btree)))
     }
 
     fn collect_group_entries(
@@ -470,6 +920,429 @@ impl<'a> H5File<'a> {
         Ok(())
     }
 
+    // ----- fractal heaps ------------------------------------------------
+
+    /// Read a fractal heap header and resolve every managed direct block in
+    /// it to a file address.
+    ///
+    /// HDF5 1.8 moved "dense" link and attribute storage — what a group gets
+    /// once it outgrows compact messages, which for netCDF-4 means any group
+    /// with more than eight variables or eight attributes — into a fractal
+    /// heap indexed by a version 2 B-tree. Every netCDF-4 CfRadial file
+    /// surveyed stores BOTH its links and its global attributes this way, so
+    /// without this the root group reads as empty.
+    ///
+    /// The heap's managed space is a doubling table: `table_width` blocks per
+    /// row, rows 0 and 1 of `starting_block_size` and every row after that
+    /// twice the one before, addressed by a single linear offset that counts
+    /// block headers as well as object bytes. Resolving the blocks up front
+    /// turns a heap ID into a slice lookup.
+    fn fractal_heap(&self, address: u64) -> Result<FractalHeap> {
+        let (offset_size, length_size) = (self.offset_size, self.length_size);
+        // 22 fixed bytes, 12 "length" fields, 3 addresses — see the field
+        // list in the HDF5 spec, "Fractal Heap Header".
+        let header_len = 22 + 12 * length_size + 3 * offset_size;
+        let head = self.slice(address, header_len)?;
+        if &head[..4] != FRHP_SIGNATURE {
+            return Err(invalid(address as usize, "expected FRHP signature"));
+        }
+        if head[4] != 0 {
+            return Err(invalid(
+                address as usize,
+                format!("fractal heap version {} unsupported (need 0)", head[4]),
+            ));
+        }
+        let heap_id_len = usize::from(read_le_u16(head, 5)?);
+        let filter_len = usize::from(read_le_u16(head, 7)?);
+        let flags = head[9];
+        let max_managed_size = read_uint(head, 10, 4)?;
+        // Skip the huge/tiny/free-space bookkeeping: this reader only
+        // fetches managed and tiny objects, and never writes.
+        let mut at = 14 + 10 * length_size + 2 * offset_size;
+        let table_width = usize::from(read_le_u16(head, at)?);
+        at += 2;
+        let starting_block_size = read_uint(head, at, length_size)?;
+        at += length_size;
+        let max_direct_block_size = read_uint(head, at, length_size)?;
+        at += length_size;
+        let max_heap_bits = usize::from(read_le_u16(head, at)?);
+        // Skip the starting row count; the CURRENT row count is what the
+        // root block actually has.
+        at += 4;
+        let root_address = read_offset(head, at, offset_size)?;
+        at += offset_size;
+        let root_rows = usize::from(read_le_u16(head, at)?);
+
+        if filter_len != 0 {
+            // A filtered heap stores its direct blocks compressed, with the
+            // stored size and filter mask alongside each address. No netCDF
+            // or ODIM writer filters a metadata heap; saying so beats
+            // decoding the wrong bytes.
+            return Err(invalid(
+                address as usize,
+                "fractal heap with I/O filters on its direct blocks is unsupported",
+            ));
+        }
+        if table_width == 0 || starting_block_size == 0 || max_direct_block_size == 0 {
+            return Err(invalid(
+                address as usize,
+                "degenerate fractal heap geometry",
+            ));
+        }
+        if !starting_block_size.is_power_of_two() || !max_direct_block_size.is_power_of_two() {
+            return Err(invalid(
+                address as usize,
+                "fractal heap block sizes are not powers of two",
+            ));
+        }
+        if max_heap_bits == 0 || max_heap_bits > 64 {
+            return Err(invalid(
+                address as usize,
+                format!("fractal heap maximum heap size of {max_heap_bits} bits is out of range"),
+            ));
+        }
+        // Managed heap ID: one flags byte, then the object's offset in the
+        // heap's linear space, then its length. The offset field is as wide
+        // as the maximum heap size needs; the length field is as wide as the
+        // largest object the heap can hold in one block needs.
+        let id_offset_bytes = max_heap_bits.div_ceil(8);
+        // `H5HF_hdr_finish_init_phase1`: the length field is the narrower of
+        // what the largest direct block's offsets need and what the largest
+        // managed object's size needs. For the two heaps netCDF-4 uses —
+        // link storage (64 KiB blocks, 4 KiB objects) and attribute storage
+        // (the same) — that is 2 bytes, giving the 7- and 8-byte heap IDs
+        // their name and attribute B-tree records carry.
+        let id_length_bytes = log2_floor(max_direct_block_size)
+            .div_ceil(8)
+            .min(limit_enc_size(max_managed_size));
+        if heap_id_len < 1 + id_offset_bytes + id_length_bytes {
+            return Err(invalid(
+                address as usize,
+                format!("fractal heap ID length {heap_id_len} is too short for its own geometry"),
+            ));
+        }
+        // Rows at or past this index hold indirect blocks, not direct ones.
+        let max_direct_rows =
+            log2_floor(max_direct_block_size) - log2_floor(starting_block_size) + 2;
+
+        let mut heap = FractalHeap {
+            heap_id_len,
+            id_offset_bytes,
+            id_length_bytes,
+            checksummed_blocks: flags & 0x02 != 0,
+            table_width,
+            starting_block_size,
+            max_direct_rows,
+            blocks: Vec::new(),
+        };
+        if root_address != UNDEFINED_ADDR {
+            if root_rows == 0 {
+                // A heap small enough to have never doubled: the root block
+                // IS the first direct block.
+                heap.blocks.push(HeapBlock {
+                    heap_offset: 0,
+                    size: usize::try_from(starting_block_size)
+                        .map_err(|_| invalid(0, "fractal heap block size overflows usize"))?,
+                    address: root_address,
+                });
+            } else {
+                self.collect_heap_blocks(&mut heap, root_address, root_rows, 0, 0)?;
+            }
+        }
+        Ok(heap)
+    }
+
+    /// Walk one indirect block, recording its direct-block children and
+    /// descending into its indirect ones.
+    fn collect_heap_blocks(
+        &self,
+        heap: &mut FractalHeap,
+        address: u64,
+        rows: usize,
+        block_offset: u64,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_FRACTAL_HEAP_DEPTH {
+            return Err(invalid(
+                address_to_usize(address)?,
+                "fractal heap indirect blocks nested too deep",
+            ));
+        }
+        let offset_width = heap.id_offset_bytes;
+        let prefix = 5 + self.offset_size + offset_width;
+        if self.slice(address, 4)? != FHIB_SIGNATURE {
+            return Err(invalid(
+                address_to_usize(address)?,
+                "expected FHIB signature",
+            ));
+        }
+        let mut cursor = address_to_usize(address)?
+            .checked_add(prefix)
+            .ok_or_else(|| invalid(0, "fractal heap indirect block cursor overflow"))?;
+        let mut row_start = block_offset;
+        for row in 0..rows {
+            let row_block_size = heap.row_block_size(row)?;
+            for column in 0..heap.table_width {
+                let child_offset =
+                    row_start
+                        .checked_add((column as u64).checked_mul(row_block_size).ok_or_else(
+                            || invalid(cursor, "fractal heap column offset overflow"),
+                        )?)
+                        .ok_or_else(|| invalid(cursor, "fractal heap child offset overflow"))?;
+                let child = read_offset(self.bytes, cursor, self.offset_size)?;
+                cursor = cursor
+                    .checked_add(self.offset_size)
+                    .ok_or_else(|| invalid(cursor, "fractal heap entry cursor overflow"))?;
+                if child == UNDEFINED_ADDR {
+                    continue; // a block this heap has not needed yet
+                }
+                if heap.blocks.len() >= MAX_FRACTAL_HEAP_BLOCKS {
+                    return Err(invalid(
+                        address_to_usize(address)?,
+                        "fractal heap has too many blocks",
+                    ));
+                }
+                if row < heap.max_direct_rows {
+                    heap.blocks.push(HeapBlock {
+                        heap_offset: child_offset,
+                        size: usize::try_from(row_block_size).map_err(|_| {
+                            invalid(cursor, "fractal heap block size overflows usize")
+                        })?,
+                        address: child,
+                    });
+                } else {
+                    // A child indirect block spans `row_block_size` bytes;
+                    // its own row count follows from that span and the width
+                    // of the first row (HDF5 spec, "Fractal Heap Indirect
+                    // Block": nrows = log2(size) - log2(start * width) + 1).
+                    let span = log2_floor(row_block_size);
+                    let base = log2_floor(
+                        heap.starting_block_size
+                            .checked_mul(heap.table_width as u64)
+                            .ok_or_else(|| invalid(cursor, "fractal heap row span overflow"))?,
+                    );
+                    if span < base {
+                        return Err(invalid(
+                            cursor,
+                            "fractal heap child indirect block is short",
+                        ));
+                    }
+                    self.collect_heap_blocks(
+                        heap,
+                        child,
+                        span - base + 1,
+                        child_offset,
+                        depth + 1,
+                    )?;
+                }
+            }
+            row_start = row_start
+                .checked_add(
+                    row_block_size
+                        .checked_mul(heap.table_width as u64)
+                        .ok_or_else(|| invalid(cursor, "fractal heap row size overflow"))?,
+                )
+                .ok_or_else(|| invalid(cursor, "fractal heap row offset overflow"))?;
+        }
+        Ok(())
+    }
+
+    /// Fetch one object out of a fractal heap by its heap ID.
+    fn heap_object(&self, heap: &FractalHeap, id: &[u8]) -> Result<Vec<u8>> {
+        let flags = *id.first().ok_or_else(|| truncated(0, 1, 0))?;
+        match flags & 0x30 {
+            0x00 => {}
+            0x20 => {
+                // Tiny object: the data IS the heap ID, after the flags
+                // byte. The short form holds its length in the low nibble.
+                let len = usize::from(flags & 0x0F) + 1;
+                return Ok(checked_range(id, 1, len)?.to_vec());
+            }
+            other => {
+                return Err(invalid(
+                    0,
+                    format!("fractal heap object type {other:#04x} unsupported"),
+                ));
+            }
+        }
+        let offset = read_uint(id, 1, heap.id_offset_bytes)?;
+        let length = usize::try_from(read_uint(
+            id,
+            1 + heap.id_offset_bytes,
+            heap.id_length_bytes,
+        )?)
+        .map_err(|_| invalid(0, "fractal heap object length overflows usize"))?;
+        if length > MAX_HDF5_ATTRIBUTE_BYTES {
+            return Err(invalid(0, "fractal heap object is too large"));
+        }
+        let block = heap
+            .blocks
+            .iter()
+            .find(|block| {
+                offset >= block.heap_offset && offset - block.heap_offset < block.size as u64
+            })
+            .ok_or_else(|| invalid(0, format!("fractal heap offset {offset} is in no block")))?;
+        let within = usize::try_from(offset - block.heap_offset)
+            .map_err(|_| invalid(0, "fractal heap block offset overflows usize"))?;
+        // A managed heap offset counts the block's own header, so the block
+        // address plus the difference lands on the object directly.
+        let start = block
+            .address
+            .checked_add(within as u64)
+            .ok_or_else(|| invalid(0, "fractal heap object address overflow"))?;
+        if within
+            .checked_add(length)
+            .is_none_or(|end| end > block.size)
+        {
+            return Err(invalid(0, "fractal heap object runs past its block"));
+        }
+        // Objects begin after the direct block's own header, so an offset
+        // that lands inside it is a corrupt ID rather than a short object.
+        let block_header =
+            5 + self.offset_size + heap.id_offset_bytes + usize::from(heap.checksummed_blocks) * 4;
+        if within < block_header {
+            return Err(invalid(
+                address_to_usize(block.address)?,
+                "fractal heap object overlaps its block header",
+            ));
+        }
+        if self.slice(block.address, 4)? != FHDB_SIGNATURE {
+            return Err(invalid(
+                address_to_usize(block.address)?,
+                "expected FHDB signature",
+            ));
+        }
+        Ok(self.slice(start, length)?.to_vec())
+    }
+
+    // ----- version 2 B-trees --------------------------------------------
+
+    /// Collect every record in a version 2 B-tree, as raw record bytes.
+    ///
+    /// Dense link and attribute storage indexes its fractal heap with one of
+    /// these; each record carries the heap ID of one link or one attribute.
+    /// Only the heap IDs matter here, so records come back unparsed and the
+    /// caller slices out the field it needs.
+    fn btree_v2_records(&self, address: u64) -> Result<Vec<Vec<u8>>> {
+        let (offset_size, length_size) = (self.offset_size, self.length_size);
+        let header_len = 20 + offset_size + length_size;
+        let head = self.slice(address, header_len)?;
+        if &head[..4] != BTHD_SIGNATURE {
+            return Err(invalid(address as usize, "expected BTHD signature"));
+        }
+        if head[4] != 0 {
+            return Err(invalid(
+                address as usize,
+                format!("version 2 B-tree header version {} unsupported", head[4]),
+            ));
+        }
+        let node_size = usize::try_from(read_uint(head, 6, 4)?)
+            .map_err(|_| invalid(0, "B-tree node size overflows usize"))?;
+        let record_size = usize::from(read_le_u16(head, 10)?);
+        let depth = usize::from(read_le_u16(head, 12)?);
+        let root_address = read_offset(head, 16, offset_size)?;
+        let root_records = usize::from(read_le_u16(head, 16 + offset_size)?);
+        if record_size == 0 || node_size <= BTREE_V2_NODE_PREFIX {
+            return Err(invalid(address as usize, "degenerate version 2 B-tree"));
+        }
+        if depth > MAX_BTREE_V2_DEPTH {
+            return Err(invalid(
+                address as usize,
+                format!("version 2 B-tree depth {depth} exceeds {MAX_BTREE_V2_DEPTH}"),
+            ));
+        }
+        let mut records = Vec::new();
+        if root_address == UNDEFINED_ADDR || root_records == 0 {
+            return Ok(records);
+        }
+        let shape = BTreeV2Shape::new(node_size, record_size, depth, offset_size)?;
+        let mut visited = BTreeSet::new();
+        self.walk_btree_v2_node(
+            root_address,
+            depth,
+            root_records,
+            &shape,
+            &mut records,
+            &mut visited,
+        )?;
+        Ok(records)
+    }
+
+    fn walk_btree_v2_node(
+        &self,
+        address: u64,
+        depth: usize,
+        record_count: usize,
+        shape: &BTreeV2Shape,
+        out: &mut Vec<Vec<u8>>,
+        visited: &mut BTreeSet<u64>,
+    ) -> Result<()> {
+        if !visited.insert(address) {
+            return Err(invalid(
+                address_to_usize(address)?,
+                "cycle in version 2 B-tree",
+            ));
+        }
+        if visited.len() > MAX_BTREE_NODES {
+            return Err(invalid(0, "version 2 B-tree has too many nodes"));
+        }
+        let expected = if depth == 0 {
+            BTLF_SIGNATURE
+        } else {
+            BTIN_SIGNATURE
+        };
+        if self.slice(address, 4)? != expected {
+            return Err(invalid(
+                address_to_usize(address)?,
+                format!("expected {} signature", String::from_utf8_lossy(expected)),
+            ));
+        }
+        if record_count > shape.max_records_per_node {
+            return Err(invalid(
+                address_to_usize(address)?,
+                format!("version 2 B-tree node declares {record_count} records"),
+            ));
+        }
+        let mut cursor = address_to_usize(address)?
+            .checked_add(6)
+            .ok_or_else(|| invalid(0, "version 2 B-tree cursor overflow"))?;
+        for _ in 0..record_count {
+            if out.len() >= MAX_BTREE_V2_RECORDS {
+                return Err(invalid(0, "version 2 B-tree holds too many records"));
+            }
+            out.push(self.slice(cursor as u64, shape.record_size)?.to_vec());
+            cursor = cursor
+                .checked_add(shape.record_size)
+                .ok_or_else(|| invalid(cursor, "version 2 B-tree record cursor overflow"))?;
+        }
+        if depth == 0 {
+            return Ok(());
+        }
+        // Internal node: one more child pointer than it has records.
+        let child_nrec_size = shape.max_nrec_size;
+        let subtree_size = if depth > 1 {
+            shape.cumulative_nrec_size(depth - 1)?
+        } else {
+            0
+        };
+        for _ in 0..=record_count {
+            let child = read_offset(self.bytes, cursor, self.offset_size)?;
+            cursor = cursor
+                .checked_add(self.offset_size)
+                .ok_or_else(|| invalid(cursor, "version 2 B-tree child cursor overflow"))?;
+            let child_records = usize::try_from(read_uint(self.bytes, cursor, child_nrec_size)?)
+                .map_err(|_| invalid(cursor, "B-tree child record count overflows usize"))?;
+            cursor = cursor
+                .checked_add(child_nrec_size + subtree_size)
+                .ok_or_else(|| invalid(cursor, "version 2 B-tree child cursor overflow"))?;
+            if child == UNDEFINED_ADDR || child_records == 0 {
+                continue;
+            }
+            self.walk_btree_v2_node(child, depth - 1, child_records, shape, out, visited)?;
+        }
+        Ok(())
+    }
+
     fn local_heap_data(&self, address: u64) -> Result<u64> {
         let head = self.slice(address, 8 + 2 * self.length_size + self.offset_size)?;
         if &head[..4] != b"HEAP" {
@@ -537,6 +1410,12 @@ impl<'a> H5File<'a> {
                 let header = self.slice(cursor as u64, 8)?;
                 let kind = u16::from_le_bytes([header[0], header[1]]);
                 let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+                if header[4] & MESSAGE_FLAG_SHARED != 0 {
+                    return Err(invalid(
+                        cursor,
+                        format!("HDF5 shared object header message {kind:#06x} unsupported"),
+                    ));
+                }
                 let body_start = cursor
                     .checked_add(8)
                     .ok_or_else(|| invalid(cursor, "HDF5 message address overflow"))?;
@@ -679,6 +1558,12 @@ impl<'a> H5File<'a> {
                 let kind = u16::from(header[0]);
                 let size = u16::from_le_bytes([header[1], header[2]]) as usize;
                 // header[3] = message flags; header[4..6] = creation order.
+                if header[3] & MESSAGE_FLAG_SHARED != 0 {
+                    return Err(invalid(
+                        cursor,
+                        format!("HDF5 shared object header message {kind:#06x} unsupported"),
+                    ));
+                }
                 let body_start = cursor
                     .checked_add(message_header)
                     .ok_or_else(|| invalid(cursor, "HDF5 v2 message address overflow"))?;
@@ -960,6 +1845,23 @@ impl<'a> H5File<'a> {
     /// Parse one attribute message body; returns the value when the
     /// attribute's name matches.
     fn parse_attribute(&self, body: &[u8], wanted: &str) -> Result<Option<H5Attr>> {
+        let raw = self.split_attribute(body)?;
+        if raw.name != wanted {
+            return Ok(None);
+        }
+        self.decode_attribute(&raw).map(Some)
+    }
+
+    /// Split an attribute message into its name, datatype bytes, dimensions
+    /// and element bytes, without deciding whether the datatype is one this
+    /// reader can convert.
+    ///
+    /// Keeping the split separate from the conversion is what lets
+    /// [`Self::attrs`] enumerate an object whose attributes include a
+    /// datatype outside this parser's scope, and lets
+    /// [`Self::attr_object_references`] read one such datatype in its own
+    /// narrow way.
+    fn split_attribute<'b>(&self, body: &'b [u8]) -> Result<RawAttribute<'b>> {
         let version = *body.first().ok_or_else(|| truncated(0, 1, 0))?;
         if !(1..=3).contains(&version) {
             return Err(invalid(
@@ -1000,10 +1902,7 @@ impl<'a> H5File<'a> {
         cursor = cursor
             .checked_add(pad(name_size)?)
             .ok_or_else(|| invalid(cursor, "HDF5 attribute name cursor overflow"))?;
-        if name != wanted {
-            return Ok(None);
-        }
-        let dtype = self.parse_datatype(checked_range(body, cursor, dt_size)?)?;
+        let datatype = checked_range(body, cursor, dt_size)?;
         cursor = cursor
             .checked_add(pad(dt_size)?)
             .ok_or_else(|| invalid(cursor, "HDF5 attribute datatype cursor overflow"))?;
@@ -1011,17 +1910,88 @@ impl<'a> H5File<'a> {
         cursor = cursor
             .checked_add(pad(ds_size)?)
             .ok_or_else(|| invalid(cursor, "HDF5 attribute dataspace cursor overflow"))?;
-        let count = checked_product(&dims, "HDF5 attribute element count")?.max(1);
+        let data = body
+            .get(cursor..)
+            .ok_or_else(|| truncated(cursor, 0, body.len()))?;
+        Ok(RawAttribute {
+            name: name.into_owned(),
+            datatype,
+            dims,
+            data,
+        })
+    }
+
+    fn decode_attribute(&self, raw: &RawAttribute<'_>) -> Result<H5Attr> {
+        let dtype = self.parse_datatype(raw.datatype)?;
+        let count = checked_product(&raw.dims, "HDF5 attribute element count")?.max(1);
         checked_allocation_bytes(
             count,
             dtype.size,
             MAX_HDF5_ATTRIBUTE_BYTES,
             "HDF5 attribute",
         )?;
-        let data = body
-            .get(cursor..)
-            .ok_or_else(|| truncated(cursor, 0, body.len()))?;
-        self.attr_value(&dtype, count, data).map(Some)
+        self.attr_value(&dtype, count, raw.data)
+    }
+
+    /// Decode a variable-length sequence of object references, one sequence
+    /// per element of the attribute's dataspace.
+    ///
+    /// On disk each element is a length, then a global heap reference to the
+    /// sequence's bytes; the bytes are object header addresses, since an
+    /// HDF5 object reference IS the address of the object's header. A
+    /// zero-length sequence carries no heap reference and comes back empty.
+    fn decode_reference_sequence(&self, raw: &RawAttribute<'_>) -> Result<Vec<Vec<u64>>> {
+        let head = checked_range(raw.datatype, 0, 8)?;
+        if head[0] & 0x0F != 9 || head[1] & 0x0F != 0 {
+            return Err(invalid(0, "attribute is not a variable-length sequence"));
+        }
+        let descriptor_size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        let base = raw
+            .datatype
+            .get(8..)
+            .ok_or_else(|| truncated(8, 8, raw.datatype.len()))?;
+        let base_head = checked_range(base, 0, 8)?;
+        if base_head[0] & 0x0F != 7 {
+            return Err(invalid(
+                0,
+                "sequence element type is not an object reference",
+            ));
+        }
+        let reference_size =
+            u32::from_le_bytes([base_head[4], base_head[5], base_head[6], base_head[7]]) as usize;
+        if reference_size == 0 || reference_size > 8 {
+            return Err(invalid(0, "object reference size is out of range"));
+        }
+        if descriptor_size < 4 + self.offset_size + 4 {
+            return Err(invalid(0, "variable-length descriptor is too short"));
+        }
+        let count = checked_product(&raw.dims, "HDF5 attribute element count")?.max(1);
+        if count > MAX_DATASPACE_RANK {
+            return Err(invalid(0, "reference attribute has too many elements"));
+        }
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let element = checked_range(raw.data, index * descriptor_size, descriptor_size)?;
+            let length = usize::try_from(read_uint(element, 0, 4)?)
+                .map_err(|_| invalid(0, "reference sequence length overflows usize"))?;
+            let collection = read_offset(element, 4, self.offset_size)?;
+            if length == 0 || collection == 0 || collection == UNDEFINED_ADDR {
+                out.push(Vec::new());
+                continue;
+            }
+            if length > MAX_DATASPACE_RANK {
+                return Err(invalid(0, "reference sequence is implausibly long"));
+            }
+            let heap_index = u32::try_from(read_uint(element, 4 + self.offset_size, 4)?)
+                .map_err(|_| invalid(0, "global heap index overflows u32"))?;
+            let bytes = self.global_heap_object(collection, heap_index)?;
+            let mut addresses = Vec::with_capacity(length);
+            for slot in 0..length {
+                addresses.push(read_offset(&bytes, slot * reference_size, reference_size)?);
+            }
+            out.push(addresses);
+        }
+        Ok(out)
     }
 
     fn attr_value(&self, dtype: &Datatype, count: usize, data: &[u8]) -> Result<H5Attr> {
@@ -1106,6 +2076,14 @@ impl<'a> H5File<'a> {
 
     // ----- chunked data -------------------------------------------------
 
+    /// Assemble a chunked dataset.
+    ///
+    /// A chunk that was never written has no record in the index — HDF5
+    /// allocates chunks on first write — so the buffer starts as the fill
+    /// value everywhere and only the chunks the file actually carries are
+    /// copied over it. Starting from zero instead would return 0.0 for
+    /// every unallocated chunk, which for a radar moment is an echo the
+    /// file never recorded.
     fn read_chunked(
         &self,
         btree_address: u64,
@@ -1113,6 +2091,7 @@ impl<'a> H5File<'a> {
         dims: &[usize],
         element_size: usize,
         filters: &[Filter],
+        fill: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         if chunk_dims.len() != dims.len() {
             return Err(invalid(
@@ -1127,9 +2106,9 @@ impl<'a> H5File<'a> {
             MAX_HDF5_DATASET_BYTES,
             "HDF5 chunked dataset",
         )?;
-        let mut out = vec![0u8; total];
+        let mut out = filled_buffer(total, fill);
         if btree_address == UNDEFINED_ADDR {
-            return Ok(out); // dataset never written
+            return Ok(out); // dataset never written: fill value throughout
         }
         let mut chunks = Vec::new();
         let mut visited_nodes = BTreeSet::new();
@@ -1263,6 +2242,141 @@ impl<'a> H5File<'a> {
     }
 }
 
+/// Signature, version, type and checksum: the bytes of a version 2 B-tree
+/// node that are not records or child pointers.
+const BTREE_V2_NODE_PREFIX: usize = 10;
+
+/// One managed direct block of a fractal heap, resolved to a file address.
+struct HeapBlock {
+    /// Offset of the block's FIRST byte in the heap's linear address space.
+    /// That space counts block headers as well as object bytes, which is why
+    /// a heap ID's offset can be subtracted from this and added to
+    /// [`Self::address`] directly.
+    heap_offset: u64,
+    size: usize,
+    address: u64,
+}
+
+/// A fractal heap, read far enough to fetch objects by heap ID.
+struct FractalHeap {
+    /// Heap ID width in bytes, as the heap header declares it. Dense link
+    /// storage uses 7, dense attribute storage 8, so the record readers ask
+    /// the heap rather than assuming either.
+    heap_id_len: usize,
+    id_offset_bytes: usize,
+    id_length_bytes: usize,
+    checksummed_blocks: bool,
+    table_width: usize,
+    starting_block_size: u64,
+    /// First doubling-table row whose entries are indirect blocks.
+    max_direct_rows: usize,
+    blocks: Vec<HeapBlock>,
+}
+
+impl FractalHeap {
+    /// Block size of doubling-table row `row`: rows 0 and 1 are the starting
+    /// size and every row after doubles (HDF5 spec, "Fractal Heap Header",
+    /// Table Width / Starting Block Size).
+    fn row_block_size(&self, row: usize) -> Result<u64> {
+        if row < 2 {
+            return Ok(self.starting_block_size);
+        }
+        let shift =
+            u32::try_from(row - 1).map_err(|_| invalid(0, "fractal heap row index overflow"))?;
+        self.starting_block_size
+            .checked_shl(shift)
+            .filter(|size| *size >> shift == self.starting_block_size)
+            .ok_or_else(|| invalid(0, "fractal heap row size overflow"))
+    }
+}
+
+/// The per-depth field widths a version 2 B-tree's child pointers use.
+///
+/// HDF5 does not store these: it recomputes them from the node size, the
+/// record size and the tree depth, so a reader has to reproduce the same
+/// arithmetic or it will read child pointers at the wrong stride. This is
+/// `H5B2_hdr_init`'s `node_info` table (H5B2hdr.c), narrowed to the two
+/// widths a walk needs.
+struct BTreeV2Shape {
+    record_size: usize,
+    max_records_per_node: usize,
+    /// Width of a child's "number of records in this node" field.
+    max_nrec_size: usize,
+    /// Per depth, the width of a child's "records in this subtree" field.
+    cumulative: Vec<usize>,
+}
+
+impl BTreeV2Shape {
+    fn new(node_size: usize, record_size: usize, depth: usize, offset_size: usize) -> Result<Self> {
+        let leaf_max = (node_size - BTREE_V2_NODE_PREFIX) / record_size;
+        if leaf_max == 0 {
+            return Err(invalid(0, "version 2 B-tree leaf holds no records"));
+        }
+        let max_nrec_size = limit_enc_size(leaf_max as u64);
+        let mut cumulative = vec![limit_enc_size(leaf_max as u64)];
+        let mut cumulative_records = leaf_max as u64;
+        let mut max_records_per_node = leaf_max;
+        for _ in 1..=depth {
+            let per_child = record_size
+                .checked_add(offset_size)
+                .and_then(|value| value.checked_add(*cumulative.last().expect("seeded")))
+                .ok_or_else(|| invalid(0, "version 2 B-tree child stride overflow"))?;
+            let available = node_size
+                .checked_sub(BTREE_V2_NODE_PREFIX + max_nrec_size)
+                .filter(|available| *available >= per_child)
+                .ok_or_else(|| invalid(0, "version 2 B-tree internal node holds no records"))?;
+            let internal_max = available / per_child;
+            max_records_per_node = max_records_per_node.max(internal_max);
+            // Saturating on purpose: an absurd depth saturates the count,
+            // which pins the encoded width at its 8-byte maximum — exactly
+            // what HDF5's own `H5VM_limit_enc_size` does with a huge limit.
+            cumulative_records = (internal_max as u64)
+                .saturating_add(1)
+                .saturating_mul(cumulative_records)
+                .saturating_add(internal_max as u64);
+            cumulative.push(limit_enc_size(cumulative_records));
+        }
+        Ok(Self {
+            record_size,
+            max_records_per_node,
+            max_nrec_size,
+            cumulative,
+        })
+    }
+
+    fn cumulative_nrec_size(&self, depth: usize) -> Result<usize> {
+        self.cumulative
+            .get(depth)
+            .copied()
+            .ok_or_else(|| invalid(0, "version 2 B-tree depth outside its own shape"))
+    }
+}
+
+/// Bytes HDF5 uses to encode a count that cannot exceed `value`
+/// (`H5VM_limit_enc_size`).
+fn limit_enc_size(value: u64) -> usize {
+    (log2_floor(value) / 8) + 1
+}
+
+/// `floor(log2(value))`, with zero mapped to zero the way HDF5's
+/// `H5VM_log2_gen` does.
+fn log2_floor(value: u64) -> usize {
+    if value == 0 {
+        0
+    } else {
+        63 - value.leading_zeros() as usize
+    }
+}
+
+/// An attribute message split into its parts, before anything decides
+/// whether the datatype is one this reader converts.
+struct RawAttribute<'b> {
+    name: String,
+    datatype: &'b [u8],
+    dims: Vec<usize>,
+    data: &'b [u8],
+}
+
 struct ObjectHeader {
     messages: Vec<Message>,
 }
@@ -1292,6 +2406,12 @@ impl Datatype {
     fn convert(&self, raw: &[u8]) -> Result<H5Data> {
         match self.class {
             DtClass::Int { signed: false } if self.size == 1 => Ok(H5Data::U8(raw.to_vec())),
+            // netCDF-4 stores NC_CHAR as a one-byte fixed string, with the
+            // string length carried as the array's last dimension — so a
+            // CfRadial `sweep_mode(sweep, string_length_32)` arrives here as
+            // a (sweep x 32) array of size-1 strings. The bytes ARE the
+            // characters.
+            DtClass::FixedString if self.size == 1 => Ok(H5Data::Chars(raw.to_vec())),
             DtClass::Int { signed: false } if self.size == 2 => Ok(H5Data::U16(
                 raw.chunks_exact(2)
                     .map(|pair| {
@@ -1442,6 +2562,98 @@ fn apply_inverse_filters(
         ));
     }
     Ok(data)
+}
+
+/// The one element's worth of bytes a dataset reads back where the file
+/// wrote nothing, from its fill value message.
+///
+/// HDF5 stores the fill value in the dataset's OWN datatype and byte order
+/// (HDF5 File Format Specification v3.0, section IV.A.2.f "Fill Value
+/// (old)" and IV.A.2.g "Fill Value"), so the bytes returned here are an
+/// element pattern that can be repeated across a buffer as-is.
+///
+/// `None` means "no fill value in this file", and the HDF5 default applies:
+/// all zero bytes. That default is not a guess — it is what the library
+/// itself returns for `H5D_FILL_VALUE_DEFAULT` — and it is also what a
+/// dataset marked `H5D_FILL_VALUE_UNDEFINED` gets here, where HDF5 promises
+/// nothing about the contents and zero is as good an answer as any.
+///
+/// The three versions of message 0x0005 differ only in how they say whether
+/// a value follows:
+///
+/// * v1 always carries the size and the value.
+/// * v2 carries them only when its "fill value defined" byte is 1.
+/// * v3 replaces the three timing/defined bytes with one flags byte, and
+///   carries them only when bit 5 ("fill value defined") is set; bit 4 is
+///   the "undefined" marker.
+///
+/// The deprecated message 0x0004 is a bare size and value with no version
+/// byte at all. Nothing this decade writes it, but reading it costs two
+/// lines and not reading it would leave exactly one more way for a file to
+/// be silently misread as zeros.
+fn parse_fill_value(kind: u16, body: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Size (4 bytes) followed by that many value bytes.
+    fn sized_value(body: &[u8], at: usize) -> Result<Option<Vec<u8>>> {
+        let size = u32::from_le_bytes(checked_range(body, at, 4)?.try_into().expect("4 bytes"));
+        let size = usize::try_from(size).map_err(|_| invalid(at, "HDF5 fill value too large"))?;
+        if size == 0 {
+            return Ok(None); // declared, but empty: the default fill
+        }
+        if size > MAX_HDF5_ATTRIBUTE_BYTES {
+            return Err(invalid(
+                at,
+                format!("HDF5 fill value of {size} bytes is implausible"),
+            ));
+        }
+        Ok(Some(checked_range(body, at + 4, size)?.to_vec()))
+    }
+
+    if kind == 0x0004 {
+        return sized_value(body, 0);
+    }
+    match read_u8(body, 0)? {
+        1 => sized_value(body, 4),
+        2 => {
+            if read_u8(body, 3)? == 1 {
+                sized_value(body, 4)
+            } else {
+                Ok(None)
+            }
+        }
+        3 => {
+            const FILL_VALUE_DEFINED: u8 = 1 << 5;
+            if read_u8(body, 1)? & FILL_VALUE_DEFINED != 0 {
+                sized_value(body, 2)
+            } else {
+                Ok(None)
+            }
+        }
+        version => Err(invalid(
+            0,
+            format!("HDF5 fill value message version {version} unsupported"),
+        )),
+    }
+}
+
+/// A `byte_len` buffer holding `fill` repeated end to end, or zeros when the
+/// dataset defines no fill value.
+///
+/// `fill` is one element wide (the caller checks that against the datatype),
+/// so repeating it is exactly what HDF5 does when it materialises a plane
+/// the writer never touched.
+fn filled_buffer(byte_len: usize, fill: Option<&[u8]>) -> Vec<u8> {
+    let mut out = vec![0u8; byte_len];
+    let Some(pattern) = fill else {
+        return out;
+    };
+    if pattern.is_empty() || pattern.iter().all(|byte| *byte == 0) {
+        return out; // the zeros are already right
+    }
+    for element in out.chunks_mut(pattern.len()) {
+        let width = element.len().min(pattern.len());
+        element[..width].copy_from_slice(&pattern[..width]);
+    }
+    out
 }
 
 /// Inverse of the HDF5 shuffle filter: byte plane k holds byte k of every
@@ -1783,6 +2995,130 @@ mod tests {
         };
     }
 
+    /// An attribute this reader cannot split does not hide the ones after
+    /// it.
+    ///
+    /// `DIMENSION_LIST` is how a netCDF-4 variable names its axes, and a
+    /// variable that comes back with no dimension ids drops out of the
+    /// `(time, range)` field filter and vanishes from the volume — with no
+    /// error, because losing a field is not something the decode can see.
+    /// So the search past an undecodable attribute has to keep going, the
+    /// way [`H5File::attrs`] does.
+    #[test]
+    fn an_undecodable_attribute_does_not_hide_the_dimension_list_after_it() {
+        // A v1 object header with two attribute messages: one at an
+        // attribute version this reader refuses, then a well-formed
+        // DIMENSION_LIST holding one empty sequence.
+        let mut bytes = vec![0u8; 112];
+        bytes[0] = 1; // object header version
+        bytes[2..4].copy_from_slice(&2u16.to_le_bytes()); // message count
+        bytes[8..12].copy_from_slice(&96u32.to_le_bytes()); // block size
+
+        bytes[16..18].copy_from_slice(&0x000Cu16.to_le_bytes()); // attribute
+        bytes[18..20].copy_from_slice(&8u16.to_le_bytes());
+        bytes[24] = 9; // attribute version 9: unsplittable
+
+        bytes[32..34].copy_from_slice(&0x000Cu16.to_le_bytes()); // attribute
+        bytes[34..36].copy_from_slice(&72u16.to_le_bytes());
+        bytes[40] = 1; // attribute version
+        bytes[42..44].copy_from_slice(&15u16.to_le_bytes()); // name size
+        bytes[44..46].copy_from_slice(&16u16.to_le_bytes()); // datatype size
+        bytes[46..48].copy_from_slice(&16u16.to_le_bytes()); // dataspace size
+        bytes[48..63].copy_from_slice(b"DIMENSION_LIST\0");
+        bytes[64] = 9; // datatype class 9 = variable-length
+        bytes[65] = 0; // ... of sequences, not strings
+        bytes[68..72].copy_from_slice(&16u32.to_le_bytes()); // descriptor size
+        bytes[72] = 7; // base class 7 = object reference
+        bytes[76..80].copy_from_slice(&8u32.to_le_bytes()); // 8-byte addresses
+        bytes[80] = 1; // dataspace version
+        bytes[81] = 1; // rank
+        bytes[88..96].copy_from_slice(&1u64.to_le_bytes()); // one element
+        // The descriptor at [96..112] stays zero: a zero-length sequence,
+        // which needs no global heap behind it.
+
+        let mut file = parser(&bytes);
+        file.objects.insert("/var".to_owned(), 0);
+        assert_eq!(
+            file.attr_object_references("/var", "DIMENSION_LIST"),
+            Some(vec![Vec::new()]),
+            "the attribute before it must be skipped, not end the search"
+        );
+    }
+
+    /// A dataset whose elements live in OTHER files is refused, not read as
+    /// one the writer never allocated.
+    ///
+    /// External storage pairs an external data files message (0x0007) with a
+    /// contiguous layout whose address is UNDEFINED — the same marker a
+    /// never-written dataset carries. Without the 0x0007 check the two are
+    /// indistinguishable, and a dataset whose data exists, in a file beside
+    /// this one, would come back as a whole plane of fill value.
+    #[test]
+    fn external_data_storage_is_refused_not_read_as_fill() {
+        // A v1 object header with four messages: a rank-1 dataspace of two
+        // elements, an f4 datatype, external data files, and a contiguous
+        // layout at the undefined address.
+        let mut bytes = vec![0u8; 104];
+        bytes[0] = 1; // object header version
+        bytes[2..4].copy_from_slice(&4u16.to_le_bytes()); // message count
+        bytes[8..12].copy_from_slice(&88u32.to_le_bytes()); // block size
+
+        bytes[16..18].copy_from_slice(&0x0001u16.to_le_bytes()); // dataspace
+        bytes[18..20].copy_from_slice(&16u16.to_le_bytes());
+        bytes[24] = 1; // dataspace version
+        bytes[25] = 1; // rank
+        bytes[32..40].copy_from_slice(&2u64.to_le_bytes()); // dim 0
+
+        bytes[40..42].copy_from_slice(&0x0003u16.to_le_bytes()); // datatype
+        bytes[42..44].copy_from_slice(&8u16.to_le_bytes());
+        bytes[48] = 1; // class 1 = IEEE float
+        bytes[52..56].copy_from_slice(&4u32.to_le_bytes()); // 4 bytes wide
+
+        bytes[56..58].copy_from_slice(&0x0007u16.to_le_bytes()); // external
+        bytes[58..60].copy_from_slice(&8u16.to_le_bytes());
+
+        bytes[72..74].copy_from_slice(&0x0008u16.to_le_bytes()); // data layout
+        bytes[74..76].copy_from_slice(&24u16.to_le_bytes());
+        bytes[80] = 3; // layout version
+        bytes[81] = 1; // contiguous
+        bytes[82..90].copy_from_slice(&UNDEFINED_ADDR.to_le_bytes());
+        bytes[90..98].copy_from_slice(&8u64.to_le_bytes()); // stored size
+
+        let mut file = parser(&bytes);
+        file.objects.insert("/external".to_owned(), 0);
+        let Err(err) = file.dataset("/external") else {
+            panic!("external storage must not decode");
+        };
+        assert!(err.to_string().contains("external data files"), "{err}");
+    }
+
+    /// A message that says "my body is somewhere else" is refused, not read
+    /// where it lies.
+    ///
+    /// The shared flag means the body is a pointer into the file's
+    /// shared-message table. Reading it inline would hand
+    /// [`H5File::parse_datatype`] a heap address and get a plausible-looking
+    /// datatype out of it — the class and size fields would parse, they
+    /// would just be somebody else's bytes.
+    #[test]
+    fn a_shared_object_header_message_is_refused_not_read_inline() {
+        // A v1 object header carrying one message: a DATATYPE (0x0003) with
+        // the shared flag set and a 16-byte body.
+        let mut bytes = vec![0u8; 40];
+        bytes[0] = 1; // object header version
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes()); // message count
+        bytes[8..12].copy_from_slice(&24u32.to_le_bytes()); // block size
+        bytes[16..18].copy_from_slice(&0x0003u16.to_le_bytes()); // datatype
+        bytes[18..20].copy_from_slice(&16u16.to_le_bytes()); // body size
+        bytes[20] = MESSAGE_FLAG_SHARED;
+
+        let file = parser(&bytes);
+        let Err(err) = file.parse_object_header(0) else {
+            panic!("a shared message must fail");
+        };
+        assert!(err.to_string().contains("shared"), "{err}");
+    }
+
     #[test]
     fn v1_object_header_rejects_continuation_cycle() {
         let mut bytes = vec![0u8; 40];
@@ -1917,6 +3253,218 @@ mod tests {
             file.dataset(&format!("/dataset1/{plane}/data"))
                 .unwrap_or_else(|err| panic!("{plane} must decode: {err}"));
         }
+    }
+
+    /// The heap-ID field widths this parser derives are the ones HDF5 itself
+    /// uses for the two heaps netCDF-4 writes.
+    ///
+    /// These widths are never stored — every reader recomputes them from the
+    /// heap header — so getting them wrong reads each heap ID at the wrong
+    /// stride and fetches somebody else's bytes. HDF5 fixes the inputs in
+    /// `H5Gdense.c` (links: max index 32 bits, 64 KiB direct blocks, 4 KiB
+    /// managed objects) and `H5Apkg.h` (attributes: max index 40 bits, same
+    /// block and object sizes); the widths they imply are what give link
+    /// records their 7-byte heap IDs and attribute records their 8-byte
+    /// ones, which is checkable against any real file.
+    #[test]
+    fn heap_id_field_widths_match_hdf5s_own_link_and_attribute_heaps() {
+        let length_width = |max_direct: u64, max_managed: u64| {
+            log2_floor(max_direct)
+                .div_ceil(8)
+                .min(limit_enc_size(max_managed))
+        };
+        // Links: 1 flags byte + 4 offset bytes + 2 length bytes = 7.
+        assert_eq!(32usize.div_ceil(8), 4, "link heap offset field");
+        assert_eq!(
+            length_width(64 * 1024, 4 * 1024),
+            2,
+            "link heap length field"
+        );
+        // Attributes: 1 + 5 + 2 = 8.
+        assert_eq!(40usize.div_ceil(8), 5, "attribute heap offset field");
+        assert_eq!(
+            length_width(64 * 1024, 4 * 1024),
+            2,
+            "attribute heap length field"
+        );
+        // `limit_enc_size` is HDF5's `H5VM_limit_enc_size`: one byte per
+        // eight bits of the largest value, counting from one.
+        assert_eq!(limit_enc_size(0), 1);
+        assert_eq!(limit_enc_size(255), 1);
+        assert_eq!(limit_enc_size(256), 2);
+        assert_eq!(limit_enc_size(u64::MAX), 8);
+        assert_eq!(log2_floor(0), 0);
+        assert_eq!(log2_floor(1), 0);
+        assert_eq!(log2_floor(65_536), 16);
+    }
+
+    /// A fractal heap's doubling table: two rows at the starting size, then
+    /// double every row.
+    ///
+    /// Off by one row here shifts every block's place in the heap's linear
+    /// address space, so heap IDs resolve into the wrong block entirely.
+    #[test]
+    fn fractal_heap_rows_double_after_the_second() {
+        let heap = FractalHeap {
+            heap_id_len: 7,
+            id_offset_bytes: 4,
+            id_length_bytes: 2,
+            checksummed_blocks: true,
+            table_width: 4,
+            starting_block_size: 512,
+            max_direct_rows: 9,
+            blocks: Vec::new(),
+        };
+        let sizes: Vec<u64> = (0..6)
+            .map(|row| heap.row_block_size(row).unwrap())
+            .collect();
+        assert_eq!(sizes, [512, 512, 1_024, 2_048, 4_096, 8_192]);
+        // A row index that would shift past 64 bits is refused rather than
+        // wrapping to a small, plausible-looking size.
+        assert!(heap.row_block_size(64).is_err());
+    }
+
+    /// The version 2 B-tree child-pointer widths match HDF5's `node_info`
+    /// table for a real link-name index.
+    ///
+    /// Like the heap ID widths, these are recomputed rather than stored, and
+    /// they decide the stride of the child pointers in an internal node. A
+    /// wrong stride walks into the middle of an address and descends to a
+    /// garbage node — which, on a tree one level deep, is exactly the shape
+    /// a netCDF-4 root group with more than about forty variables has.
+    #[test]
+    fn btree_v2_child_pointer_widths_match_hdf5s_node_info() {
+        // A link-name B-tree: 512-byte nodes, 11-byte records (4-byte name
+        // hash + 7-byte heap ID), one level of internal nodes.
+        let shape = BTreeV2Shape::new(512, 11, 1, 8).expect("shape");
+        // Leaf: (512 - 10 prefix) / 11.
+        assert_eq!(shape.max_records_per_node, 45);
+        assert_eq!(shape.record_size, 11);
+        // 45 records needs one byte to count.
+        assert_eq!(shape.max_nrec_size, 1);
+        assert_eq!(shape.cumulative_nrec_size(0).unwrap(), 1);
+        // Internal: (512 - (10 + 1)) / (11 + 8 address + 1) = 25 records,
+        // so a subtree holds at most (25 + 1) * 45 + 25 = 1195 records,
+        // which needs two bytes.
+        assert_eq!(shape.cumulative_nrec_size(1).unwrap(), 2);
+        // A depth the tree never declared is an error, not a silent zero.
+        assert!(shape.cumulative_nrec_size(2).is_err());
+        // A node too small to hold one record is refused.
+        assert!(BTreeV2Shape::new(12, 11, 0, 8).is_err());
+    }
+
+    /// Every shape the fill value message comes in, against the layouts
+    /// the spec gives them.
+    ///
+    /// The versions differ only in how they announce that a value follows,
+    /// and reading the announcement wrong is the difference between the
+    /// file's own no-data marker and a plane of zeros that looks like data.
+    #[test]
+    fn fill_value_messages_are_read_at_every_version() {
+        let value = (-9999.0f32).to_le_bytes();
+        let mut body = Vec::new();
+
+        // Version 1: version, allocation time, write time, defined, then
+        // size and value unconditionally.
+        body.extend_from_slice(&[1, 2, 2, 1]);
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&value);
+        assert_eq!(
+            parse_fill_value(0x0005, &body).unwrap(),
+            Some(value.to_vec())
+        );
+
+        // Version 2 with the defined byte set, then cleared: the same
+        // header, but the second one carries nothing after it.
+        body[0] = 2;
+        assert_eq!(
+            parse_fill_value(0x0005, &body).unwrap(),
+            Some(value.to_vec())
+        );
+        assert_eq!(parse_fill_value(0x0005, &[2, 2, 2, 0]).unwrap(), None);
+
+        // Version 3: one flags byte, bit 5 = "fill value defined".
+        let mut v3 = vec![3, 0b0010_0000];
+        v3.extend_from_slice(&4u32.to_le_bytes());
+        v3.extend_from_slice(&value);
+        assert_eq!(parse_fill_value(0x0005, &v3).unwrap(), Some(value.to_vec()));
+        // Bit 4 is "undefined", and neither bit set is "the default" —
+        // both mean zeros here.
+        assert_eq!(parse_fill_value(0x0005, &[3, 0b0001_0000]).unwrap(), None);
+        assert_eq!(parse_fill_value(0x0005, &[3, 0]).unwrap(), None);
+
+        // The deprecated message: a bare size and value.
+        let mut old = 4u32.to_le_bytes().to_vec();
+        old.extend_from_slice(&value);
+        assert_eq!(
+            parse_fill_value(0x0004, &old).unwrap(),
+            Some(value.to_vec())
+        );
+        assert_eq!(parse_fill_value(0x0004, &0u32.to_le_bytes()).unwrap(), None);
+
+        // A version this reader does not know refuses rather than guessing
+        // which bytes are the value.
+        assert!(parse_fill_value(0x0005, &[9, 0, 0, 1]).is_err());
+        // A size field that overruns the message is truncation, not a fill
+        // value of whatever happens to follow in memory.
+        let mut short = vec![3, 0b0010_0000];
+        short.extend_from_slice(&64u32.to_le_bytes());
+        assert!(parse_fill_value(0x0005, &short).is_err());
+    }
+
+    #[test]
+    fn a_filled_buffer_repeats_one_element_and_defaults_to_zero() {
+        let fill = (-9999.0f32).to_le_bytes();
+        let buffer = filled_buffer(12, Some(&fill));
+        assert_eq!(buffer.len(), 12);
+        for element in buffer.chunks_exact(4) {
+            assert_eq!(f32::from_le_bytes(element.try_into().unwrap()), -9999.0);
+        }
+        // No fill value declared: the HDF5 default is zero, which is what
+        // ODIM's `undetect` planes have always relied on.
+        assert_eq!(filled_buffer(4, None), vec![0u8; 4]);
+        assert_eq!(filled_buffer(4, Some(&[0, 0])), vec![0u8; 4]);
+        assert!(filled_buffer(0, Some(&fill)).is_empty());
+    }
+
+    /// Storage HDF5 never allocated reads back as the dataset's declared
+    /// fill value, in both of the two ways a file can leave it out.
+    ///
+    /// `/reflectivity` is contiguous with an UNDEFINED data address and
+    /// `/velocity` is chunked with no chunk records at all; `/spectrum_width`
+    /// is chunked with one of its two chunks written, so it pins that the
+    /// seeded buffer is still overwritten where real data exists. Read with
+    /// netCDF4-python 1.7.4: 0 of 48, 0 of 48 and 24 of 48 gates written.
+    #[test]
+    fn unallocated_storage_reads_back_as_the_declared_fill_value() {
+        const FILL_FIXTURE: &[u8] =
+            include_bytes!("../tests/data/cfrad.unwritten_storage.netcdf4.nc");
+
+        let file = H5File::open(FILL_FIXTURE).expect("open the fill fixture");
+        let values = |path: &str| match file.dataset(path).expect("dataset").data {
+            H5Data::F32(values) => values,
+            other => panic!("{path} should be f4, not {other:?}"),
+        };
+
+        for path in ["/reflectivity", "/velocity"] {
+            let plane = values(path);
+            assert_eq!(plane.len(), 48, "{path}");
+            assert!(
+                plane.iter().all(|value| *value == -9999.0),
+                "{path} was never written, so every gate is the fill value"
+            );
+        }
+
+        let width = values("/spectrum_width");
+        assert_eq!(width.len(), 48);
+        // Rays 0-3 are the allocated chunk: 0.5, 1.0, ... 12.0.
+        for (index, value) in width[..24].iter().enumerate() {
+            assert_eq!(*value, (index + 1) as f32 * 0.5, "written gate {index}");
+        }
+        assert!(
+            width[24..].iter().all(|value| *value == -9999.0),
+            "the chunk the writer never allocated must not come back as data"
+        );
     }
 
     /// Jenkins lookup3 (hashlittle) known-answer vectors. The 30-byte

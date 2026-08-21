@@ -87,7 +87,15 @@ pub(crate) fn decode_odim_h5_volume_within_budget(
     bytes: &[u8],
     budget: usize,
 ) -> Result<RadarVolume> {
-    let file = H5File::open_within_budget(bytes, budget)?;
+    decode_odim_h5_file(&H5File::open_within_budget(bytes, budget)?)
+}
+
+/// [`decode_odim_h5_volume`] over an HDF5 file that is already open.
+///
+/// The routing layer opens an HDF5 container once to decide whether it is
+/// ODIM_H5 or a netCDF-4 CfRadial file, and decoding from that same view
+/// keeps the decision from costing a second walk of the object tree.
+pub(crate) fn decode_odim_h5_file(file: &H5File<'_>) -> Result<RadarVolume> {
     let object = file
         .attr("/what", "object")
         .and_then(|attr| attr.as_str().map(str::to_owned))
@@ -107,14 +115,14 @@ pub(crate) fn decode_odim_h5_volume_within_budget(
     // malforms it still decodes: the moments are what matter, and the UNIX
     // epoch is an obviously-wrong instant rather than a plausible-looking
     // fabricated one.
-    let volume_time = parse_datetime(&file, "/what").unwrap_or_else(|| Utc.timestamp_nanos(0));
-    let mut volume = RadarVolume::new(parse_site(&file), volume_time);
+    let volume_time = parse_datetime(file, "/what").unwrap_or_else(|| Utc.timestamp_nanos(0));
+    let mut volume = RadarVolume::new(parse_site(file), volume_time);
     volume.metadata.archive_version = file
         .attr("/what", "version")
         .and_then(|attr| attr.as_str().map(str::to_owned))
         .or(Some("ODIM_H5".to_owned()));
     volume.metadata.compression = Some("odim-h5".to_owned());
-    let root_nyquist = attr_f64(&file, "/how", "NI");
+    let root_nyquist = attr_f64(file, "/how", "NI");
 
     let mut dataset_names: Vec<String> = file
         .child_names("/")
@@ -130,7 +138,7 @@ pub(crate) fn decode_odim_h5_volume_within_budget(
     }
 
     for name in &dataset_names {
-        decode_sweep(&file, name, root_nyquist, &mut volume)?;
+        decode_sweep(file, name, root_nyquist, &mut volume)?;
     }
     volume
         .cuts
@@ -286,6 +294,15 @@ fn decode_sweep(
                 }
                 grid
             }
+            H5Data::Chars(_) => {
+                // A one-byte fixed STRING datatype, which is how netCDF-4
+                // writes NC_CHAR. ODIM stores every quantity as a numeric
+                // plane, so a character plane is a file that is not the
+                // thing it claims to be rather than a plane to reinterpret.
+                return Err(invalid(format!(
+                    "ODIM plane '/{dataset}/{plane_name}/data' holds characters, not moment values"
+                )));
+            }
             H5Data::F32(_) | H5Data::F64(_) => {
                 let physical = |raw: f64| -> f32 {
                     if Some(raw) == nodata || Some(raw) == undetect {
@@ -308,6 +325,11 @@ fn decode_sweep(
                     offset: 0.0,
                     nodata: None,
                     range_folded: None,
+                    // ODIM_H5 carries no NEXRAD generic data moment header,
+                    // so there is no censoring threshold or recombination
+                    // code here.
+                    snr_threshold_db: None,
+                    recombination: None,
                     radial_indices: Vec::new(),
                     storage: radar_core::MomentStorage::F32(Vec::new()),
                 };
@@ -923,6 +945,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: Vec::new(),
             storage: radar_core::MomentStorage::F32(Vec::new()),
         };

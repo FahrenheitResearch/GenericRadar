@@ -223,6 +223,10 @@ fn f32_grid_like(base: &MomentGrid, moment: MomentType, values: Vec<f32>) -> Mom
         offset: 0.0,
         nodata: None,
         range_folded: None,
+        // A column product fuses every tilt above this one, so no single
+        // sweep's censoring threshold describes it.
+        snr_threshold_db: None,
+        recombination: None,
         radial_indices: base.radial_indices.clone(),
         storage: MomentStorage::F32(values),
     }
@@ -243,7 +247,7 @@ struct ProfileSample {
     v: f32,
 }
 
-/// Interpolation policy per moment family:
+/// Interpolation policy per moment family (docs/xsection-3d-spec.md):
 /// reflectivity/ZDR blend linearly; CC must not blend through the melting
 /// layer (Giangrande, Krause & Ryzhkov 2008: the rho_hv minimum is the
 /// signature — blending fabricates intermediate values), so any bracket
@@ -598,8 +602,8 @@ pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
 /// are roughly 3200 m / 6400 m).
 /// MESH calibration: which SHI->size fit to apply.
 ///
-/// References (constants checked against the published corrigendum and the
-/// pyhail reference implementation):
+/// References (constants adversarially verified against the corrigendum and
+/// the pyhail reference implementation — see docs/hail-wind-algo-spec.md):
 /// - Witt et al. 1998, Wea. Forecasting 13, 286-303
 ///   (doi:10.1175/1520-0434(1998)013<0286:AEHDAF>2.0.CO;2): MESH = 2.54*SHI^0.5.
 ///   Still what operational MRMS ships (Smith et al. 2016, BAMS 97).
@@ -862,6 +866,8 @@ pub fn vil_density_grid(volume: &RadarVolume) -> Option<MomentGrid> {
         offset: 0.0,
         nodata: None,
         range_folded: None,
+        snr_threshold_db: None,
+        recombination: None,
         radial_indices: vil.radial_indices.clone(),
         storage: MomentStorage::F32(out),
     })
@@ -1442,6 +1448,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..az_count).collect(),
             storage: MomentStorage::F32(vec![dbz; az_count * gates]),
         };
@@ -1503,6 +1511,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..azimuths.len()).collect(),
             storage: MomentStorage::F32(values),
         };
@@ -1966,6 +1976,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..az_count).collect(),
             storage: MomentStorage::F32(vec![vel; az_count * gates]),
         };

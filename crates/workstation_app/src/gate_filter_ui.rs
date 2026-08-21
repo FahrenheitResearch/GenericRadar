@@ -55,10 +55,11 @@
 //!
 //! There used to be a fourth, and it was the loudest: a full-width bar in deep
 //! red across the top of every filtered pane, carrying the whole sentence and
-//! clearing every criterion when it was clicked. It is gone. A band that size
-//! spends the pane's most valuable strip on a state the analyst set
-//! deliberately and can already see, and a red one reads as an alarm about
-//! the weather rather than a note about the view.
+//! clearing every criterion when it was clicked. It is gone, and the reason
+//! is what a band that size in that colour means: an alarm. A gate filter
+//! switched on deliberately is not an alarm, and spending the loudest
+//! treatment in the interface on a state the analyst chose leaves nothing
+//! louder for a state they did not.
 //!
 //! That is a reduction in LOUDNESS and it was not allowed to become a
 //! reduction in HONESTY, so two things moved rather than disappearing. The

@@ -19,8 +19,14 @@
 pub mod cfradial;
 pub mod dorade;
 pub mod hdf5lite;
+pub mod iq;
+/// The Level 1 moment and Doppler-spectrum processor. Level II arrives with
+/// its moments already estimated; Level 1 arrives as pulses, so the estimator
+/// that the signal processor would have run lives here.
+pub mod iq_moments;
 pub mod mobile_archive;
 pub mod netcdf3;
+pub mod netcdf4;
 pub mod odim;
 
 use std::collections::btree_map::Entry;
@@ -34,7 +40,8 @@ use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, TimeZone, Utc};
 use flate2::read::GzDecoder;
 use radar_core::{
-    GateRange, MomentGrid, MomentType, RadarSite, RadarVolume, Radial, RadialStatus, VcpInfo,
+    GateRange, MomentGrid, MomentRecombination, MomentType, RadarSite, RadarVolume, Radial,
+    RadialStatus, VcpInfo,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -46,6 +53,19 @@ const RECORD_BYTES: usize = 2432;
 const MSG_1_HEADER_LEN: usize = 100;
 const MSG_31_HEADER_LEN: usize = 72;
 const GENERIC_DATA_BLOCK_LEN: usize = 28;
+/// Counts per dB in the SNR THRESHOLD halfword of a generic data moment
+/// header (NEXRAD ICD 2620002W, Build 22.0, 05 June 2023, Table XVII-B,
+/// bytes 16-17, Scaled SInteger*2, dB, range -12.0 to +20.0).
+///
+/// The ICD does not settle the scale on its own: that row's
+/// ACCURACY/PRECISION cell reads "0.1/0.125", which are different scales.
+/// Real Archive II volumes do settle it. A VCP 212 volume carries exactly two
+/// raw values, 16 on its contiguous-surveillance halves and 28 on its Doppler
+/// and batch cuts. At 0.125 dB per count those are 2.0 dB and 3.5 dB - round
+/// operational settings, and 2.0 dB is the value the ICD itself gives as
+/// typical. At 0.1 dB per count they would be 1.6 dB and 2.8 dB, which no
+/// operator would dial in. Hence 8 counts per dB.
+const SNR_THRESHOLD_COUNTS_PER_DB: f32 = 8.0;
 const VOLUME_CONSTANT_BLOCK_LEN: usize = 44;
 const RADIAL_CONSTANT_BLOCK_LEN: usize = 20;
 const HALF_DEGREE_RADIALS_PER_CUT: usize = 720;
@@ -97,6 +117,20 @@ pub enum NexradError {
         #[source]
         source: Box<NexradError>,
     },
+    /// A container that was recognised correctly and holds something other
+    /// than a radar volume.
+    ///
+    /// NEXRAD Level 1 / I/Q is the case this exists for. It is real radar
+    /// data, correctly identified, but it carries the transmitted pulses
+    /// rather than the estimated moments, so there is no volume for a volume
+    /// decoder to return. Saying that is far more use to whoever opened the
+    /// file than the Archive II decoder's complaint about a missing tape
+    /// identifier would be.
+    #[error("{format}: {detail}")]
+    NotAVolume {
+        format: &'static str,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,11 +168,17 @@ impl ArchiveCompression {
 ///   deployments ship a scan as a zipped bundle of sweepfiles.
 /// * [`Self::OdimH5`] — `\x89HDF\r\n\x1a\n`, the HDF5 superblock signature
 ///   (HDF5 File Format Specification, "Level 0A - Format Signature").
-///   Decoded as ODIM_H5 PVOL/SCAN per the EUMETNET OPERA Data Information
-///   Model for HDF5.
+///   HDF5 is a CONTAINER, and this workspace reads two radar formats out of
+///   it: ODIM_H5 PVOL/SCAN per the EUMETNET OPERA Data Information Model,
+///   and CfRadial 1.x in a netCDF-4 container. The signature cannot tell
+///   them apart — nothing in the first eight bytes can — so the decode arm
+///   opens the file and asks, and this variant means "an HDF5 radar
+///   container" rather than a promise of ODIM.
 /// * [`Self::CfRadial1`] — `CDF\x01` / `CDF\x02`, classic netCDF (NetCDF
 ///   Classic Format Specification), decoded per the NCAR CfRadial 1.x
-///   convention.
+///   convention. `CDF\x05` (CDF-5, 64-bit data) is routed here too — not
+///   because it decodes, but because the netCDF reader's refusal names the
+///   format and the conversion, and the Archive II fallthrough's does not.
 /// * [`Self::Dorade`] — a leading `COMM`/`SSWB`/`VOLD`/`RADD` descriptor
 ///   name followed by a block length that is valid in at least one byte
 ///   order (NCAR/EOL DORADE sweepfile format). DORADE has no file-level
@@ -147,9 +187,17 @@ impl ArchiveCompression {
 /// * [`Self::NexradLevel2`] — `AR2V` or `ARCHIVE2` tape identifiers
 ///   (ICD 2620002 Archive II volume header), or a whole-file `\x1f\x8b`
 ///   gzip / `BZh` bzip2 wrapper around one.
+/// * [`Self::NexradLevel1TimeSeries`] — a leading `rvp8PulseInfo start` or
+///   `rvptsPulseInfo start` line (Vaisala RVP8/RVP900 TS record, the format
+///   NEXRAD Level 1 / I/Q is archived in). Recognised so it can be REPORTED
+///   as what it is; it holds pulses rather than moments, so it is not a
+///   radar volume and [`decode_supported_volumes_bytes`] declines it in
+///   those words rather than letting the Archive II decoder call it corrupt.
+///   [`iq`] is the reader for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportedVolumeFormat {
     NexradLevel2,
+    NexradLevel1TimeSeries,
     OdimH5,
     Dorade,
     CfRadial1,
@@ -161,12 +209,30 @@ impl SupportedVolumeFormat {
     pub fn label(self) -> &'static str {
         match self {
             Self::NexradLevel2 => "NEXRAD Archive II",
+            Self::NexradLevel1TimeSeries => "NEXRAD Level 1 time series (RVP8/RVP900)",
             Self::OdimH5 => "ODIM_H5",
             Self::Dorade => "DORADE",
             Self::CfRadial1 => "CfRadial 1.x",
             Self::MobileDeploymentZip => "mobile deployment zip",
         }
     }
+}
+
+/// The two tape identifiers an Archive II volume may open with.
+///
+/// `AR2V` is the modern one (ICD 2620002 "Archive II volume header record",
+/// `AR2Vnnnn.mmm`); `ARCHIVE2` is what pre-2008 NCDC tapes carry. BOTH are
+/// Archive II and both decode, so every sniff in this crate has to test the
+/// pair — the router did while [`mobile_archive`]'s member sniff tested only
+/// `AR2V`, which silently dropped a legacy volume out of a deployment zip.
+/// One shared constant is what keeps those two readings identical.
+pub(crate) const ARCHIVE_II_MAGICS: [&[u8]; 2] = [b"AR2V", b"ARCHIVE2"];
+
+/// `true` when the buffer opens with either Archive II tape identifier.
+pub(crate) fn starts_with_archive_ii_magic(bytes: &[u8]) -> bool {
+    ARCHIVE_II_MAGICS
+        .iter()
+        .any(|magic| bytes.starts_with(magic))
 }
 
 /// The four ASCII descriptor names a DORADE sweepfile may open with.
@@ -195,14 +261,21 @@ pub fn sniff_supported_volume_format(head: &[u8]) -> Option<SupportedVolumeForma
     if head.starts_with(b"\x89HDF\r\n\x1a\n") {
         return Some(SupportedVolumeFormat::OdimH5);
     }
-    if head.len() >= 4 && &head[..3] == b"CDF" && matches!(head[3], 1 | 2) {
+    // The netCDF reader owns which `CDF` versions it recognises, INCLUDING
+    // the CDF-5 it can only refuse: routing a narrower set here left a
+    // CDF-5 file falling through to the Archive II arm, which reported a
+    // netCDF file as a truncated NEXRAD volume header while the decoder's
+    // own "convert with `nccopy -k classic`" message sat unreachable.
+    if netcdf3::looks_like_netcdf3_bytes(head) {
         return Some(SupportedVolumeFormat::CfRadial1);
+    }
+    if iq::looks_like_iq_time_series(head) {
+        return Some(SupportedVolumeFormat::NexradLevel1TimeSeries);
     }
     if looks_like_dorade_head(head) {
         return Some(SupportedVolumeFormat::Dorade);
     }
-    if head.starts_with(b"AR2V")
-        || head.starts_with(b"ARCHIVE2")
+    if starts_with_archive_ii_magic(head)
         || head.starts_with(&[0x1f, 0x8b])
         || head.starts_with(b"BZh")
     {
@@ -304,16 +377,55 @@ pub fn decode_supported_volumes_bytes(raw: &[u8]) -> Result<Vec<RadarVolume>> {
         raw
     };
 
+    if format == SupportedVolumeFormat::OdimH5 {
+        // Two different radar formats share the HDF5 signature, so which one
+        // this is can only be settled by looking inside.
+        return hdf5_container_volume(body).map(|volume| vec![volume]);
+    }
     let decoded = match format {
         SupportedVolumeFormat::NexradLevel2 => unreachable!("handled above"),
-        SupportedVolumeFormat::OdimH5 => odim::decode_odim_h5_volume(body),
+        SupportedVolumeFormat::OdimH5 => unreachable!("handled above"),
         SupportedVolumeFormat::CfRadial1 => cfradial::decode_cfradial1_volume(body),
         SupportedVolumeFormat::Dorade => dorade::decode_dorade_sweep(body),
         SupportedVolumeFormat::MobileDeploymentZip => return deployment_volumes(format, body),
+        // Correctly identified, and deliberately not decoded here: a time
+        // series has no moments to put in a volume. `iq::decode_iq_time_series`
+        // is the reader for it.
+        SupportedVolumeFormat::NexradLevel1TimeSeries => {
+            return Err(time_series_not_a_volume(format, body));
+        }
     };
     decoded
         .map(|volume| vec![volume])
         .map_err(|source| named(format, source))
+}
+
+/// Decode an HDF5 container as whichever radar format it turns out to hold.
+///
+/// `\x89HDF\r\n\x1a\n` says "this is HDF5", not what is stored in it, and
+/// this workspace reads two formats that use it: ODIM_H5, and CfRadial 1.x
+/// in a netCDF-4 container. The file is opened ONCE and the decoders read
+/// from that same view, so the question costs one walk of the object tree
+/// rather than two.
+///
+/// The error names the format the file was taken for, exactly as the rest of
+/// the router does: a netCDF-4 CfRadial file that fails should not be
+/// reported as a broken ODIM volume, which is what routing every HDF5 file
+/// to ODIM used to do — and, before this, what it did to every CfRadial file
+/// including the ones that were perfectly fine.
+fn hdf5_container_volume(body: &[u8]) -> Result<RadarVolume> {
+    let file = hdf5lite::H5File::open(body).map_err(|source| {
+        // The container is HDF5 either way; below the superblock is where
+        // the two formats part company, so a file that will not even open
+        // is named for the signature it does carry.
+        named(SupportedVolumeFormat::OdimH5, source)
+    })?;
+    if netcdf4::looks_like_netcdf4(&file) {
+        return netcdf4::Nc4File::from_hdf5(file)
+            .and_then(|source| cfradial::decode_cfradial1_source(&source))
+            .map_err(|source| named(SupportedVolumeFormat::CfRadial1, source));
+    }
+    odim::decode_odim_h5_file(&file).map_err(|source| named(SupportedVolumeFormat::OdimH5, source))
 }
 
 /// Unpack a deployment archive into plain volumes, keeping the member label.
@@ -339,6 +451,34 @@ fn deployment_volumes(format: SupportedVolumeFormat, body: &[u8]) -> Result<Vec<
         ));
     }
     Ok(members.into_iter().map(|member| member.volume).collect())
+}
+
+/// Explain that a correctly identified time-series record is not a volume.
+///
+/// The record's own header is read for the message, so an analyst who dropped
+/// a Level 1 file on a viewer is told which site and acquisition they have and
+/// why nothing is drawn — rather than being told the file is broken, which it
+/// is not. If even the header will not parse, the reason for that is reported
+/// instead.
+fn time_series_not_a_volume(format: SupportedVolumeFormat, body: &[u8]) -> NexradError {
+    let detail = match iq::peek_iq_time_series(body) {
+        Ok(summary) => format!(
+            "{} {} holds {} pulses of I/Q time series (iMajorMode {}, {} gates, \
+             {} channel(s)), not estimated moments; compute moments from it with the \
+             `iq` reader",
+            summary.site,
+            summary.task_name,
+            summary.pulse_count,
+            summary.major_mode,
+            summary.gate_count,
+            summary.channels_recorded,
+        ),
+        Err(error) => format!("holds I/Q time series, not estimated moments ({error})"),
+    };
+    NexradError::NotAVolume {
+        format: format.label(),
+        detail,
+    }
 }
 
 /// Put the container's name in front of its decoder's complaint.
@@ -1104,6 +1244,8 @@ struct MomentBlock<'a> {
     gate_range: GateRange,
     scale: f32,
     offset: f32,
+    snr_threshold_db: f32,
+    recombination: MomentRecombination,
     row: MomentPayload<'a>,
 }
 
@@ -1783,6 +1925,13 @@ fn select_cut_for_radial(
 }
 
 /// Fetch or create the 8-bit grid a legacy moment accumulates into.
+///
+/// Message 1 predates the generic data moment header, so it carries neither
+/// an SNR threshold nor control flags (NEXRAD ICD 2620002W Table XVII-B
+/// describes the Message 31 block; the Message 1 digital radial data header
+/// of Table XVII has no counterpart). The grid's `snr_threshold_db` and
+/// `recombination` therefore stay `None` here, and the display shows nothing
+/// rather than inventing a threshold the file never stated.
 fn legacy_u8_grid(
     cut: &mut radar_core::ElevationCut,
     moment: MomentType,
@@ -1912,36 +2061,40 @@ fn parse_message_31(
             gate_range,
             scale,
             offset,
+            snr_threshold_db,
+            recombination,
             row,
         } = moment;
         let grid = match cut.moments.entry(moment) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => match &row {
-                MomentPayload::U8(_) => {
-                    let mut grid = MomentGrid::new_u8(
+            Entry::Vacant(entry) => {
+                let mut grid = match &row {
+                    MomentPayload::U8(_) => MomentGrid::new_u8(
                         entry.key().clone(),
                         gate_range.clone(),
                         scale,
                         offset,
                         Some(0),
                         Some(1),
-                    );
-                    grid.reserve_rows(expected_radials);
-                    entry.insert(grid)
-                }
-                MomentPayload::U16(_) => {
-                    let mut grid = MomentGrid::new_u16(
+                    ),
+                    MomentPayload::U16(_) => MomentGrid::new_u16(
                         entry.key().clone(),
                         gate_range.clone(),
                         scale,
                         offset,
                         Some(0),
                         Some(1),
-                    );
-                    grid.reserve_rows(expected_radials);
-                    entry.insert(grid)
-                }
-            },
+                    ),
+                };
+                // Taken from this sweep's first radial, the same way scale and
+                // offset already are: the RDA sets both per moment for the
+                // whole cut, so the first block that opens the grid describes
+                // every radial that follows it.
+                grid.snr_threshold_db = Some(snr_threshold_db);
+                grid.recombination = Some(recombination);
+                grid.reserve_rows(expected_radials);
+                entry.insert(grid)
+            }
         };
         match row {
             MomentPayload::U8(row) => grid.push_u8_row_slice(radial_index, row)?,
@@ -2050,6 +2203,13 @@ fn parse_generic_moment_block(bytes: &[u8], offset: usize) -> Result<MomentBlock
     let gate_count = usize::from(be_u16(header, 8));
     let first_gate_m = i32::from(be_i16(header, 10));
     let gate_spacing_m = i32::from(be_i16(header, 12));
+    // ICD 2620002W Table XVII-B: bytes 16-17 SNR THRESHOLD (the SNR below
+    // which the processor censored gates out of this moment before the file
+    // was written), byte 18 CONTROL FLAGS (what, if anything, was
+    // recombined). Both are per moment, per radial, and both are read here
+    // for the first time - the parser used to step over them.
+    let snr_threshold_db = f32::from(be_i16(header, 16)) / SNR_THRESHOLD_COUNTS_PER_DB;
+    let recombination = MomentRecombination::from_control_flags(header[18]);
     let word_size = header[19];
     let scale = be_f32(header, 20);
     let offset_value = be_f32(header, 24);
@@ -2087,6 +2247,8 @@ fn parse_generic_moment_block(bytes: &[u8], offset: usize) -> Result<MomentBlock
         },
         scale,
         offset: offset_value,
+        snr_threshold_db,
+        recombination,
         row,
     })
 }
@@ -2441,6 +2603,43 @@ mod tests {
         }
     }
 
+    /// A CDF-5 file gets the netCDF decoder's own explanation, not the
+    /// Archive II decoder's.
+    ///
+    /// [`netcdf3::looks_like_netcdf3_bytes`] accepts `CDF\x05` on purpose,
+    /// so that [`netcdf3::Nc3File::open`] can say "CDF-5 (64-bit data)
+    /// netCDF is unsupported; convert with `nccopy -k classic`". The router
+    /// used to test `1 | 2` alone, so the sniff returned `None` and the
+    /// bytes fell through to the Archive II arm — where a perfectly
+    /// identifiable netCDF file was reported as a short NEXRAD volume
+    /// header. The message existed; nothing could reach it.
+    #[test]
+    fn a_cdf5_file_reaches_the_netcdf_decoders_own_message() {
+        let mut bytes = b"CDF\x05".to_vec();
+        bytes.resize(512, 0);
+
+        assert_eq!(
+            sniff_supported_volume_format(&bytes),
+            Some(SupportedVolumeFormat::CfRadial1),
+            "CDF-5 is a netCDF container, whatever this crate can do with it"
+        );
+
+        let error = decode_supported_volume_bytes(&bytes).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with("CfRadial 1.x"),
+            "the container should be named, got {message}"
+        );
+        assert!(
+            message.contains("CDF-5"),
+            "the CDF-5 message is the whole point, got {message}"
+        );
+        assert!(
+            !message.contains("Archive II"),
+            "a netCDF file must not be reported as a NEXRAD volume, got {message}"
+        );
+    }
+
     #[test]
     fn sniffs_dorade_only_when_the_block_length_is_credible() {
         // `COMM` followed by a block length that fits the buffer.
@@ -2589,6 +2788,19 @@ mod tests {
         assert_eq!(spectrum_width.scaled_value(0, 2), Some(4.0));
     }
 
+    /// Message 1 predates the generic data moment header, so it states no SNR
+    /// threshold and no control flags. Both must stay `None` rather than
+    /// decode as a 0.0 dB threshold on an un-recombined sweep, which is what a
+    /// non-`Option` field would have implied about a file that says nothing.
+    #[test]
+    fn legacy_message_1_states_no_censoring_facts() {
+        let volume = decode_volume_from_bytes(&synthetic_legacy_archive()).unwrap();
+        for (moment, grid) in &volume.cuts[0].moments {
+            assert_eq!(grid.snr_threshold_db, None, "{moment}");
+            assert_eq!(grid.recombination, None, "{moment}");
+        }
+    }
+
     #[test]
     fn legacy_nyquist_comes_from_halfword_31_not_the_reserved_field() {
         // Halfword 24 is reserved for RDA internal use. The fixture puts a
@@ -2698,7 +2910,11 @@ mod tests {
 
     /// A one-record Archive II volume whose single message is a legacy
     /// Message Type 1 radial carrying all three legacy moments.
-    fn synthetic_legacy_archive() -> Vec<u8> {
+    ///
+    /// `pub(crate)` so `mobile_archive`'s tests can put a pre-2008 tape
+    /// inside a zip and prove the archive reader accepts the same tape
+    /// identifiers the top-level router does.
+    pub(crate) fn synthetic_legacy_archive() -> Vec<u8> {
         let mut body = vec![0u8; MSG_1_HEADER_LEN];
         let put_u16 = |body: &mut Vec<u8>, offset: usize, value: u16| {
             body[offset..offset + 2].copy_from_slice(&value.to_be_bytes());

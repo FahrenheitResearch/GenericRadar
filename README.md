@@ -11,9 +11,9 @@ API keys, no telemetry.
 - Files routed by content rather than by extension: NEXRAD Archive II,
   including the legacy Message 1 that every volume before 2008 is written in;
   ODIM_H5 polar volumes; DORADE sweepfiles and mobile deployment zips
-  (DOW, COW, RaXPol, NOXP); CfRadial 1.x in classic netCDF containers
-  (`nccopy -k classic` converts a netCDF-4 one); GR2Analyst-style `.msg31`
-  exports
+  (DOW, COW, RaXPol, NOXP); CfRadial 1.x in either container, classic
+  netCDF or netCDF-4/HDF5; GR2Analyst-style `.msg31` exports; and Vaisala
+  RVP8/RVP900 Level 1 time series
 - Up to four linked panes: reflectivity, velocity (dealiased and
   storm-relative), spectrum width, ZDR, CC, PHI, KDP, and derived products
   (CREF, ET, VIL, VILD, MESH, POH/POSH)
@@ -38,6 +38,14 @@ API keys, no telemetry.
   import/export, and named profiles to switch between
 - Distance, altitude, time zone and clock format chosen once and applied to
   every readout
+- Level 1 (I/Q) time series processed in the application: reflectivity,
+  velocity, spectrum width and RhoHV estimated from the pulses themselves by
+  pulse-pair processing, with the dwell length, the window (rectangular, von
+  Hann, Hamming, Blackman) and the SNR threshold under the analyst's control,
+  and a Doppler spectrum for a chosen gate
+- A file browser drawn in the application's own chrome, on every platform,
+  which identifies each file by reading it rather than by its name - so a
+  volume stored with no extension still says what it is
 - VROT sampling, NWS warning polygons
 
 ## Build
@@ -57,14 +65,22 @@ Adding a data provider, a derived product or an overlay: see
 GenericRadar --live KTLX
 ```
 
-or open a radar file from the File menu; the format is read from its contents.
+or open a radar file from the File menu - browse for it, type its path, or
+drop it on the window. The format is read from the file's contents, never
+from its name.
 
 ## Data sources
 
-- NEXRAD Level II: NOAA National Weather Service
-- Warnings and site metadata: api.weather.gov
+- NEXRAD Level II: NOAA/NWS, read from the Unidata-hosted
+  `unidata-nexrad-level2` and `unidata-nexrad-level2-chunks` buckets
+- Warnings and site metadata: NOAA/NWS api.weather.gov
 - Imagery: USGS The National Map (public domain);
-  © OpenStreetMap contributors (openstreetmap.org/copyright)
+  © OpenStreetMap contributors, under the Open Database License (ODbL)
+
+This repository also redistributes real radar files as decoder test fixtures,
+including material used under CC BY 4.0 from EUMETNET OPERA / AEMET, EUMETNET
+OPERA / SMHI and NOAA. Every one of them, and the terms it is carried under,
+is listed in [`DATA-SOURCES.md`](DATA-SOURCES.md).
 
 ## License
 

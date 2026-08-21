@@ -158,11 +158,62 @@ pub mod keys {
         pub const LIVE_CACHE_LIMIT_MB: &str = "live_cache_limit_mb";
         pub const TILE_CACHE_LIMIT_MB: &str = "tile_cache_limit_mb";
         pub const LOOP_FRAME_MS: &str = "loop_frame_ms";
+        /// The folder `File > Open…` starts in. Written by the browser
+        /// itself every time a folder is read successfully, which is what
+        /// makes it a memory rather than a preference nobody would set.
+        pub const OPEN_FOLDER: &str = "open_folder";
     }
     pub mod xsection {
         pub const CATEGORY: &str = "xsection";
         pub const TOP_KM: &str = "top_km";
     }
+    /// NEXRAD Level 1 (time series / I/Q).
+    ///
+    /// Unlike every other page here, these are not display preferences. A
+    /// Level II volume arrives with its moments already estimated and these
+    /// choices already made, unrecorded, by the signal processor; a Level 1
+    /// record arrives as pulses, and what is on screen is whatever these
+    /// choices say it is. Changing one is changing the measurement, not the
+    /// picture of it.
+    pub mod timeseries {
+        pub const CATEGORY: &str = "timeseries";
+        pub const DWELL_PULSES: &str = "dwell_pulses";
+        pub const WINDOW: &str = "window";
+        pub const SNR_MIN_DB: &str = "snr_min_db";
+        pub const SPECTRUM_CHANNEL: &str = "spectrum_channel";
+    }
+}
+
+/// The Level 1 page's numbers, mirrored by hand from `crate::iq_session` and
+/// `nexrad_io::iq_moments`.
+///
+/// Mirrored rather than imported for the reason the `vol3d` numbers are: this
+/// file is also compiled by the `settings` crate's UI harness, which has
+/// neither the binary crate nor `nexrad_io` on its dependency list. The
+/// equality is pinned by a test in `workstation_app` that CAN see both, so the
+/// mirror cannot drift without something going red.
+pub mod timeseries_limits {
+    /// Pulses per dwell: `iq_session::MIN_DWELL_PULSES` and `MAX_DWELL_PULSES`,
+    /// with `nexrad_io::iq_moments::DwellPlan::default`'s count as the default.
+    pub const MIN_DWELL: i64 = 8;
+    pub const MAX_DWELL: i64 = 512;
+    pub const DEFAULT_DWELL: i64 = 64;
+    /// The SNR censor, in dB. The floor means *off* - no threshold at all - on
+    /// the same principle as the gate filter's four criteria, and the default
+    /// is the operational WSR-88D threshold
+    /// (`nexrad_io::iq_moments::estimator::SnrCensor::OPERATIONAL`) so that a
+    /// first look at a Level 1 file shows the population of gates the Level II
+    /// product of the same scan would.
+    pub const OFF_SNR_DB: f64 = -10.0;
+    pub const MAX_SNR_DB: f64 = 20.0;
+    pub const DEFAULT_SNR_DB: f64 = 2.0;
+    /// Window ids, matching `nexrad_io::iq_moments::taper::Taper`.
+    pub const WINDOW_RECTANGULAR: &str = "rectangular";
+    pub const WINDOW_VON_HANN: &str = "von_hann";
+    pub const WINDOW_HAMMING: &str = "hamming";
+    pub const WINDOW_BLACKMAN: &str = "blackman";
+    pub const CHANNEL_HORIZONTAL: &str = "h";
+    pub const CHANNEL_VERTICAL: &str = "v";
 }
 
 /// Ranges for the gate filter's four numeric criteria, and the value each one
@@ -278,6 +329,7 @@ pub fn register_into(registry: &mut SettingsRegistry) {
     registry.register(network_category());
     registry.register(annotation_category());
     registry.register(xsection_category());
+    registry.register(timeseries_category());
     // Last, because it is the page about the other pages: a named snapshot of
     // everything above it, including the four categories registered here by
     // the audit.
@@ -938,6 +990,36 @@ fn data_category() -> SettingsCategory {
             // a tile-config seam.
             .pending_wiring()
             .group("Caches on disk"),
+            // Not a preference in the ordinary sense: the file browser
+            // writes this every time it reads a folder, so what is stored is
+            // wherever the last session was looking. It is on the page
+            // anyway - and last, where a memory belongs rather than a knob -
+            // because an analyst who keeps one archive can type it once and
+            // stop navigating, and because a setting nobody can see is a
+            // setting nobody can clear.
+            //
+            // `max_len` is generous on purpose. Windows extended paths reach
+            // 32 767 characters and a deep archive tree on a mapped share
+            // gets long; the truncation in `SettingKind::sanitize` cuts on a
+            // character boundary, so an over-long stored path degrades to a
+            // shorter path (which simply fails to read, and says so) rather
+            // than to a panic.
+            SettingSpec::new(
+                k::OPEN_FOLDER,
+                "Open folder",
+                SettingKind::Text {
+                    default: String::new(),
+                    placeholder: "D:/radar/archive".to_owned(),
+                    max_len: 4096,
+                },
+            )
+            .help(
+                "Where File > Open… starts looking. It follows the browser: walk into another \
+                 folder and this becomes that folder, so the next session opens where the last \
+                 one left off. A folder that could not be read is never stored. Empty means \
+                 the folder the application was started from.",
+            )
+            .group("Opening files"),
         ],
     )
 }
@@ -1299,6 +1381,116 @@ fn xsection_category() -> SettingsCategory {
     )
 }
 
+/// The Level 1 (time series / I/Q) page.
+///
+/// The one page in this window whose knobs are part of the measurement rather
+/// than part of its presentation, and the page is written that way: every help
+/// line says what the choice DOES to the numbers, not what it looks like.
+///
+/// The page is offered whether or not a time-series file is open, like every
+/// other page here - a settings window whose contents changed depending on what
+/// was loaded would be a window an analyst could not learn.
+fn timeseries_category() -> SettingsCategory {
+    use keys::timeseries as k;
+    use timeseries_limits as limit;
+    let windows = vec![
+        ChoiceOption::new(limit::WINDOW_RECTANGULAR, "Rectangular (none)").describe(
+            "No window. The narrowest main lobe, so the least width bias and the most \
+             independent samples - and -13 dB sidelobes, which strong ground clutter \
+             smears across the whole spectrum. This is the estimator the published \
+             pulse-pair formulas describe.",
+        ),
+        ChoiceOption::new(limit::WINDOW_VON_HANN, "Von Hann").describe(
+            "-31 dB sidelobes falling 18 dB per octave. The usual choice for reading a \
+             Doppler spectrum, and what to reach for first when clutter is in the way.",
+        ),
+        ChoiceOption::new(limit::WINDOW_HAMMING, "Hamming").describe(
+            "-43 dB first sidelobe but only 6 dB per octave beyond it: better than von \
+             Hann close in to the signal, worse far out from it.",
+        ),
+        ChoiceOption::new(limit::WINDOW_BLACKMAN, "Blackman").describe(
+            "-58 dB sidelobes, at the cost of the widest main lobe. For weather beside \
+             clutter 50 dB stronger than it.",
+        ),
+    ];
+    let channels = vec![
+        ChoiceOption::new(limit::CHANNEL_HORIZONTAL, "Horizontal"),
+        ChoiceOption::new(limit::CHANNEL_VERTICAL, "Vertical")
+            .describe("Single-polarisation records have no vertical channel to show."),
+    ];
+    SettingsCategory::new(
+        k::CATEGORY,
+        "Level 1 (I/Q)",
+        vec![
+            SettingSpec::new(
+                k::DWELL_PULSES,
+                "Pulses per dwell",
+                integer(
+                    limit::MIN_DWELL,
+                    limit::MAX_DWELL,
+                    limit::DEFAULT_DWELL,
+                    "pulses",
+                ),
+            )
+            .help(
+                "How many transmitted pulses are averaged into one radial. This is the \
+                 trade the radar made once, at scan time, and never wrote down. A long \
+                 dwell averages more pulses, so the moments are steadier and the \
+                 spectrum is finer in velocity, over a wider smear of azimuth; a short \
+                 one resolves the storm's own changes and gives more radials, from \
+                 noisier estimates. Dwells do not overlap, so the radial count is the \
+                 pulse count divided by this.",
+            ),
+            SettingSpec::new(
+                k::WINDOW,
+                "Window",
+                choice(windows, limit::WINDOW_RECTANGULAR),
+            )
+            .help(
+                "The taper applied across each dwell before the transform. It decides how \
+                 far a strong echo leaks into the velocity bins around it, which is what \
+                 makes weak weather next to ground clutter readable or not. Every window \
+                 trades sidelobe suppression for a wider main lobe, so a spectrum width \
+                 read through one is broadened by it.",
+            ),
+            SettingSpec::new(
+                k::SNR_MIN_DB,
+                "Hide gates below",
+                SettingKind::Slider {
+                    min: limit::OFF_SNR_DB,
+                    max: limit::MAX_SNR_DB,
+                    default: limit::DEFAULT_SNR_DB,
+                    decimals: 1,
+                    unit: "dB SNR".to_owned(),
+                    // Leftmost means no threshold at all, and a stored number
+                    // this build cannot read falls back to the operational 2 dB
+                    // rather than to either end. See `settings::SliderFloor`.
+                    floor: SliderFloor::Off,
+                },
+            )
+            .help(
+                "Signal-to-noise floor. Gates below it are left blank instead of being \
+                 drawn from noise. 2 dB is the operational WSR-88D threshold, so a file \
+                 opened without touching this shows the same population of gates the \
+                 Level II product of the same scan would - which is what makes the two \
+                 comparable. All the way left applies no threshold, which is the only way \
+                 to see what the operational one was throwing away. Gates with no power \
+                 above the receiver noise stay blank either way: that is a measurement, \
+                 not a threshold.",
+            ),
+            SettingSpec::new(
+                k::SPECTRUM_CHANNEL,
+                "Spectrum channel",
+                choice(channels, limit::CHANNEL_HORIZONTAL),
+            )
+            .help(
+                "Which receiver channel the spectrum readout under the cursor is taken \
+                 from. The moments use both channels whatever this says.",
+            ),
+        ],
+    )
+}
+
 /// The Profiles page.
 ///
 /// Almost all of this page is not a knob and is not declared here: the list of
@@ -1444,9 +1636,12 @@ mod tests {
         // "RF" arrived with the gate filter: it is the name a colour table
         // paints on a range-folded gate, so the help text that offers to hide
         // those gates has to be able to say which colour it means.
-        const ACRONYMS: [&str; 13] = [
+        // "WSR" arrived with the Level 1 page: the threshold that page
+        // defaults to is the operational WSR-88D one, and naming the radar it
+        // came from is what makes the number checkable rather than arbitrary.
+        const ACRONYMS: [&str; 14] = [
             "UTC", "AM", "PM", "MSL", "ARL", "USGS", "GPU", "MiB", "GB", "VCP", "NEXRAD", "II",
-            "RF",
+            "RF", "WSR",
         ];
         for category in registry().categories() {
             for setting in &category.settings {

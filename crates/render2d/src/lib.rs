@@ -3805,6 +3805,9 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
         offset: DEALIASED_VELOCITY_OFFSET,
         nodata: Some(DEALIASED_VELOCITY_NODATA),
         range_folded: None,
+        // Unfolding rewrites values, not which gates survived censoring.
+        snr_threshold_db: source.snr_threshold_db,
+        recombination: source.recombination,
         radial_indices: source.radial_indices.clone(),
         storage: MomentStorage::U16(corrected),
     }
@@ -4679,6 +4682,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: vec![0],
             storage: MomentStorage::F32(vec![0.0, 5.0, 9.0, -9.0, -7.0]),
         };
@@ -5569,6 +5574,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..cut.radials.len()).collect(),
             storage: MomentStorage::F32(rows.into_iter().flatten().collect()),
         };

@@ -58,6 +58,16 @@ same history identity.
 - typed generation guards for source, frame, pane, view and palette state, and
   byte- and count-bounded immutable volume history.
 
+## Data sources
+
+The application reads NOAA/NWS NEXRAD Level II from the Unidata-hosted
+`unidata-nexrad-level2` and `unidata-nexrad-level2-chunks` buckets, NOAA/NWS
+`api.weather.gov`, and basemap imagery from USGS The National Map and
+OpenStreetMap. The decoder fixtures under `crates/nexrad_io/tests/data` are
+real files from other operators, some under CC BY 4.0. Everything this
+software reads or redistributes is credited in
+[`DATA-SOURCES.md`](../../DATA-SOURCES.md) at the repository root.
+
 ## Architectural rules
 
 - `main.rs` is startup only.

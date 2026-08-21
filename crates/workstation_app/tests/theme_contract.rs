@@ -1,9 +1,10 @@
 //! Behaviour pins for the workstation theme (`src/theme.rs`).
 //!
-//! The theme sources are included directly (`#[path]`) so this contract is a
-//! compile of the theme modules in their own right, independent of the
-//! binary that links them. Delete the `#[path]` shim only if the tests move
-//! into the crate itself.
+//! The theme sources are included directly (`#[path]`) so this contract runs
+//! before `mod theme;` is wired into `main.rs` — the module has no other
+//! compilation path until a human applies that one-line integration. Once it
+//! is wired, this file keeps running unchanged; delete the `#[path]` shim
+//! only if the tests move into the crate itself.
 //!
 //! What is pinned here and why:
 //! * the WCAG 2.2 contrast floors (W3C Recommendation, 2023: SC 1.4.3 text

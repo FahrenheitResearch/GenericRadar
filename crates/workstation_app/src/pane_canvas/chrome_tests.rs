@@ -65,6 +65,7 @@ fn painted(map: &PaneMap) -> Vec<egui::Shape> {
         let output = context.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 let overlay = PaneOverlay {
+                    spectrum: None,
                     legend: None,
                     table: None,
                     product_name: "REF",
@@ -595,6 +596,7 @@ fn painted_hovered(map: &PaneMap, probe: Option<&str>) -> Vec<egui::Shape> {
         let output = context.run_ui(input, |ui| {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 let overlay = PaneOverlay {
+                    spectrum: None,
                     legend: None,
                     table: None,
                     product_name: "REF",
@@ -980,8 +982,8 @@ mod the_picker_itself {
 ///
 /// This module used to audit a full-width FILTERED band as well: its deep-red
 /// ground against its near-white ink, and the invariance of that pair across
-/// the catalog. The band is gone, so those two audits have no subject and are
-/// gone with it; the claims they made - "the
+/// the catalog. That band no longer exists, so those two audits have no
+/// subject and are gone; the claims they made - "the
 /// indicator that says gates are hidden is readable" and "it does not follow
 /// the theme" - are re-pointed here onto the pane header, which is where the
 /// statement now lives and which, unlike the colour legend, no setting can
@@ -1119,6 +1121,7 @@ mod the_filter_indicators_across_every_theme {
                 let output = context.run_ui(egui::RawInput::default(), |ui| {
                     egui::CentralPanel::default().show_inside(ui, |ui| {
                         let overlay = PaneOverlay {
+                            spectrum: None,
                             legend: None,
                             table: None,
                             product_name: "REF",
@@ -1216,6 +1219,7 @@ mod the_filter_indicators_across_every_theme {
             let output = context.run_ui(egui::RawInput::default(), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     let overlay = PaneOverlay {
+                        spectrum: None,
                         legend: None,
                         table: None,
                         product_name: "REF",

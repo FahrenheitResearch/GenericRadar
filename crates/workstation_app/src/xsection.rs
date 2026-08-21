@@ -931,6 +931,8 @@ mod build {
                         offset: 0.0,
                         nodata: None,
                         range_folded: None,
+                        snr_threshold_db: None,
+                        recombination: None,
                         radial_indices: vec![0],
                         storage: MomentStorage::F32(vec![30.0; 4]),
                     },

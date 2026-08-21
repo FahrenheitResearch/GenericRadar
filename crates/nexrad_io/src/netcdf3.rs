@@ -10,7 +10,14 @@
 //! (byte, char, short, int, float, double), fixed-size variables, and
 //! record variables (unlimited dimension) including the single-record-
 //! variable no-padding special case. netCDF-4/HDF5 files never reach this
-//! module (they carry the HDF5 magic, not `CDF`).
+//! module (they carry the HDF5 magic, not `CDF`); [`crate::netcdf4`] reads
+//! those.
+//!
+//! This module also holds the netCDF DATA MODEL both containers share —
+//! [`NcValue`], [`NcArray`], [`NcVar`] and the [`NcSource`] trait — because
+//! the model is the classic format's and netCDF-4 is a second way of
+//! storing it. Everything above the containers (that is, [`crate::cfradial`])
+//! is written against [`NcSource`] and never learns which one it has.
 //!
 //! This is a dependency-free reader: it walks the header with a bounds-checked
 //! cursor and slices moment arrays straight out of the caller's byte buffer.
@@ -120,14 +127,18 @@ impl NcArray {
     }
 }
 
+/// One variable's metadata, independent of the container it came from.
+///
+/// The classic reader below and the netCDF-4 reader in [`crate::netcdf4`]
+/// both produce these, which is what lets [`crate::cfradial`] hold one
+/// decode for both containers rather than two that can drift apart. Where
+/// the bytes live is the container's own business and stays there.
 #[derive(Clone, Debug)]
 pub struct NcVar {
     pub name: String,
-    /// Dimension indices into [`Nc3File::dims`].
+    /// Dimension indices into [`NcSource::dims`].
     pub dim_ids: Vec<usize>,
     pub attrs: BTreeMap<String, NcValue>,
-    nc_type: u32,
-    begin: u64,
 }
 
 impl NcVar {
@@ -140,6 +151,46 @@ impl NcVar {
     }
 }
 
+/// The read-only netCDF surface a CfRadial decode needs.
+///
+/// CfRadial 1.x is written into two different containers — classic netCDF
+/// and netCDF-4, which is HDF5 — that share one data model and one set of
+/// conventions. This trait is that shared model: everything above it reads
+/// dimensions, attributes and arrays without knowing which container it is
+/// standing on, so a CfRadial rule is written once and applies to both.
+pub trait NcSource {
+    /// (name, length) — a classic file's record dimension reports its
+    /// per-file length (`numrecs`), not zero.
+    fn dims(&self) -> &[(String, usize)];
+    fn vars(&self) -> &BTreeMap<String, NcVar>;
+    fn gattrs(&self) -> &BTreeMap<String, NcValue>;
+    /// Read the full data array of `name`, in row-major order.
+    fn read_var(&self, name: &str) -> Result<NcArray>;
+
+    fn gattr_str(&self, name: &str) -> Option<&str> {
+        self.gattrs().get(name).and_then(NcValue::as_str)
+    }
+
+    fn gattr_f64(&self, name: &str) -> Option<f64> {
+        self.gattrs().get(name).and_then(NcValue::as_f64)
+    }
+
+    /// Resolved dimension lengths of a variable.
+    fn var_dims(&self, var: &NcVar) -> Vec<usize> {
+        let dims = self.dims();
+        var.dim_ids
+            .iter()
+            .map(|id| dims.get(*id).map(|(_, len)| *len).unwrap_or(0))
+            .collect()
+    }
+}
+
+/// Where one classic-netCDF variable's bytes are and how to read them.
+struct Nc3Storage {
+    nc_type: u32,
+    begin: u64,
+}
+
 /// Parsed header of a classic netCDF file plus the backing bytes.
 pub struct Nc3File<'a> {
     bytes: &'a [u8],
@@ -150,6 +201,7 @@ pub struct Nc3File<'a> {
     pub numrecs: usize,
     pub gattrs: BTreeMap<String, NcValue>,
     pub vars: BTreeMap<String, NcVar>,
+    storage: BTreeMap<String, Nc3Storage>,
 }
 
 struct Cursor<'a> {
@@ -379,6 +431,7 @@ impl<'a> Nc3File<'a> {
             ));
         }
         let mut vars = BTreeMap::new();
+        let mut storage = BTreeMap::new();
         for _ in 0..var_count {
             let name = cursor.name()?;
             let ndims = cursor.u32()? as usize;
@@ -403,20 +456,20 @@ impl<'a> Nc3File<'a> {
             let nc_type = cursor.u32()?;
             let _vsize = cursor.u32()?; // recomputed below; unreliable for big vars
             let begin = cursor.offset()?;
+            storage.insert(name.clone(), Nc3Storage { nc_type, begin });
             vars.insert(
                 name.clone(),
                 NcVar {
                     name,
                     dim_ids,
                     attrs,
-                    nc_type,
-                    begin,
                 },
             );
         }
 
         Ok(Self {
             bytes,
+            storage,
             dims,
             record_dim,
             numrecs,
@@ -425,20 +478,10 @@ impl<'a> Nc3File<'a> {
         })
     }
 
-    pub fn gattr_str(&self, name: &str) -> Option<&str> {
-        self.gattrs.get(name).and_then(NcValue::as_str)
-    }
-
-    pub fn gattr_f64(&self, name: &str) -> Option<f64> {
-        self.gattrs.get(name).and_then(NcValue::as_f64)
-    }
-
-    /// Resolved dimension lengths of a variable (record dim → numrecs).
-    pub fn var_dims(&self, var: &NcVar) -> Vec<usize> {
-        var.dim_ids
-            .iter()
-            .map(|id| self.dims.get(*id).map(|(_, len)| *len).unwrap_or(0))
-            .collect()
+    fn storage_for(&self, name: &str) -> Result<&Nc3Storage> {
+        self.storage
+            .get(name)
+            .ok_or_else(|| invalid(0, format!("netCDF variable '{name}' not found")))
     }
 
     fn is_record_var(&self, var: &NcVar) -> bool {
@@ -448,7 +491,7 @@ impl<'a> Nc3File<'a> {
     /// Per-record slab size in bytes for a record variable (or the full
     /// size for a fixed variable), before padding.
     fn slab_bytes(&self, var: &NcVar) -> Result<usize> {
-        let elem = type_size(var.nc_type, 0)?;
+        let elem = type_size(self.storage_for(&var.name)?.nc_type, 0)?;
         let skip_record = usize::from(self.is_record_var(var));
         let count = var.dim_ids[skip_record..]
             .iter()
@@ -483,6 +526,7 @@ impl<'a> Nc3File<'a> {
             .vars
             .get(name)
             .ok_or_else(|| invalid(0, format!("netCDF variable '{name}' not found")))?;
+        let storage = self.storage_for(name)?;
         let slab = self.slab_bytes(var)?;
         let raw: Vec<u8> = if self.is_record_var(var) {
             // recsize = sum over record vars of their padded slabs; the
@@ -523,7 +567,7 @@ impl<'a> Nc3File<'a> {
                 ));
             }
             let mut raw = reserve_vec(total, "netCDF record variable")?;
-            let begin = usize::try_from(var.begin)
+            let begin = usize::try_from(storage.begin)
                 .map_err(|_| invalid(0, "netCDF variable offset overflows usize"))?;
             for record in 0..self.numrecs {
                 let record_offset = record
@@ -543,7 +587,7 @@ impl<'a> Nc3File<'a> {
             }
             raw
         } else {
-            let start = usize::try_from(var.begin)
+            let start = usize::try_from(storage.begin)
                 .map_err(|_| invalid(0, "netCDF variable offset overflows usize"))?;
             let end = start
                 .checked_add(slab)
@@ -556,7 +600,25 @@ impl<'a> Nc3File<'a> {
             raw.extend_from_slice(bytes);
             raw
         };
-        decode_array(&raw, var.nc_type)
+        decode_array(&raw, storage.nc_type)
+    }
+}
+
+impl NcSource for Nc3File<'_> {
+    fn dims(&self) -> &[(String, usize)] {
+        &self.dims
+    }
+
+    fn vars(&self) -> &BTreeMap<String, NcVar> {
+        &self.vars
+    }
+
+    fn gattrs(&self) -> &BTreeMap<String, NcValue> {
+        &self.gattrs
+    }
+
+    fn read_var(&self, name: &str) -> Result<NcArray> {
+        Nc3File::read_var(self, name)
     }
 }
 

@@ -394,6 +394,10 @@ pub fn upsample_moment_grid(cut: &ElevationCut, grid: &MomentGrid) -> Option<Int
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            // Resampling one sweep does not un-censor it: the source's
+            // threshold and recombination code still describe these values.
+            snr_threshold_db: grid.snr_threshold_db,
+            recombination: grid.recombination,
             radial_indices,
             storage: MomentStorage::F32(values),
         },
@@ -446,6 +450,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..azimuths.len()).collect(),
             storage: MomentStorage::F32(data),
         };
@@ -1727,6 +1733,8 @@ mod real_data_tests {
                 offset: 0.0,
                 nodata: None,
                 range_folded: None,
+                snr_threshold_db: None,
+                recombination: None,
                 radial_indices: (0..coarse_rows)
                     .map(|row| grid.radial_indices[row * 2])
                     .collect(),

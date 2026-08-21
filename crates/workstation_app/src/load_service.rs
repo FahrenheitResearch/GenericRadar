@@ -19,6 +19,14 @@ pub struct LoadRequest {
     pub origin: FrameOrigin,
     pub final_stage: FrameStage,
     pub source_label: String,
+    /// The estimator settings a NEXRAD Level 1 (time series) file is to be
+    /// processed with, if this turns out to be one.
+    ///
+    /// Carried on the request rather than read by the worker because the
+    /// worker has no settings store, and defaulted rather than optional
+    /// because a caller that forgot would otherwise get a silently different
+    /// picture from the one the settings page is showing.
+    pub iq_controls: crate::iq_session::IqControls,
 }
 
 /// The decoded file itself is preserved on `volume.metadata.source_path`;
@@ -31,6 +39,12 @@ pub struct LoadedVolume {
     pub stage: FrameStage,
     pub volume: Arc<RadarVolume>,
     pub elapsed_ms: f32,
+    /// Present only for a NEXRAD Level 1 (time series) file: the pulses the
+    /// volume above was estimated FROM, so the knobs can re-run the estimator
+    /// and the spectrum readout can transform a gate without the file being
+    /// read again. `None` for every ordinary volume, which arrives with its
+    /// moments already made.
+    pub iq: Option<Box<crate::iq_session::IqSession>>,
 }
 
 pub enum LoadUpdate {
@@ -104,6 +118,7 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
                 &path,
                 origin,
                 &source_label,
+                request.iq_controls,
                 started,
                 sender,
                 context,
@@ -111,7 +126,7 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
         });
 
     match result {
-        Ok(mut volume) => {
+        Ok(Decoded { mut volume, iq }) => {
             // Normally the file is the whole answer. A deployment archive is
             // not: its reader has already written which member this scan came
             // from, and that half is the informative one, so the file name is
@@ -127,6 +142,7 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
                 stage: final_stage,
                 volume: Arc::new(volume),
                 elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
+                iq,
             }));
         }
         Err(message) => {
@@ -140,6 +156,19 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
     context.request_repaint();
 }
 
+/// What a decode produced: a volume, and for a time-series record the pulses it
+/// was estimated from.
+struct Decoded {
+    volume: RadarVolume,
+    iq: Option<Box<crate::iq_session::IqSession>>,
+}
+
+impl From<RadarVolume> for Decoded {
+    fn from(volume: RadarVolume) -> Self {
+        Self { volume, iq: None }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_with_previews(
     raw: &[u8],
@@ -147,10 +176,11 @@ fn decode_with_previews(
     path: &Path,
     origin: FrameOrigin,
     source_label: &str,
+    iq_controls: crate::iq_session::IqControls,
     started: Instant,
     sender: &SyncSender<LoadUpdate>,
     context: &egui::Context,
-) -> Result<RadarVolume, String> {
+) -> Result<Decoded, String> {
     let publish_preview = |mut preview: RadarVolume| {
         preview.metadata.source_path = Some(path.display().to_string());
         let update = LoadUpdate::Volume(LoadedVolume {
@@ -160,6 +190,7 @@ fn decode_with_previews(
             stage: FrameStage::Preview,
             volume: Arc::new(preview),
             elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
+            iq: None,
         });
         if sender.try_send(update).is_ok() {
             context.request_repaint();
@@ -175,12 +206,42 @@ fn decode_with_previews(
         // error message is the useful one for a file that is not radar data
         // at all, and it is what this path did before the seam existed.
         Some(SupportedVolumeFormat::NexradLevel2) | None => {
-            decode_level2_with_previews(raw, publish_preview)
+            decode_level2_with_previews(raw, publish_preview).map(Decoded::from)
+        }
+        // NEXRAD Level 1 is the one container that holds no moments to decode.
+        // It carries the transmitted pulses, so the moments on screen are the
+        // ones this application estimates from them - which is why the sweep
+        // travels back beside the volume rather than being dropped here.
+        Some(SupportedVolumeFormat::NexradLevel1TimeSeries) => {
+            decode_time_series(raw, source_label, iq_controls)
         }
         // Progressive preview is a property of the Archive II record stream;
         // the other containers decode whole or not at all.
-        Some(_) => nexrad_io::decode_supported_volume_bytes(raw).map_err(|error| error.to_string()),
+        Some(_) => nexrad_io::decode_supported_volume_bytes(raw)
+            .map_err(|error| error.to_string())
+            .map(Decoded::from),
     }
+}
+
+/// Decode a NEXRAD Level 1 record and estimate its moments.
+///
+/// The site the record names is carried through with no position on it. Filling
+/// one in is the application's job, not this worker's: the record states a
+/// signal-processor name and no coordinates, and the two catalogs that know
+/// where `KOUN` is - the station directory and the sourced research table -
+/// both live on the UI side. A guess made here would be a guess nobody could
+/// see.
+fn decode_time_series(
+    raw: &[u8],
+    source_label: &str,
+    controls: crate::iq_session::IqControls,
+) -> Result<Decoded, String> {
+    let session = crate::iq_session::IqSession::open(raw, source_label, controls)?;
+    let volume = session.volume(radar_core::RadarSite::new(session.site_id()));
+    Ok(Decoded {
+        volume,
+        iq: Some(Box::new(session)),
+    })
 }
 
 /// The Archive II path, which can hand the UI a first displayable cut before
@@ -206,6 +267,27 @@ fn decode_level2_with_previews(
     }
 }
 
+/// The io crate's real-data fixtures.
+///
+/// The load path under test is the app's, but the bytes belong to the
+/// decoders: copying a megabyte of real radar into a second directory to
+/// test the same bytes twice would waste it, and the two copies would
+/// drift apart the first time a fixture was refreshed.
+///
+/// At module level, and `pub(crate)`, because the load path is no longer the
+/// only test that wants a real volume of a named format: `app` draws the
+/// toolbar over these same files to check what each format can and cannot
+/// tell an analyst. One spelling of where the fixtures live.
+#[cfg(test)]
+pub(crate) fn io_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("nexrad_io")
+        .join("tests")
+        .join("data")
+        .join(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +299,11 @@ mod tests {
     /// window, so this exercises the shipped function rather than a copy of
     /// its logic.
     fn decode(raw: &[u8]) -> Result<RadarVolume, String> {
+        decode_all(raw).map(|decoded| decoded.volume)
+    }
+
+    /// The whole decode, including a time series' pulses.
+    fn decode_all(raw: &[u8]) -> Result<Decoded, String> {
         let (sender, receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
         let context = egui::Context::default();
         let result = decode_with_previews(
@@ -225,6 +312,7 @@ mod tests {
             Path::new("fixture"),
             FrameOrigin::Local,
             "fixture",
+            crate::iq_session::IqControls::default(),
             Instant::now(),
             &sender,
             &context,
@@ -305,21 +393,6 @@ mod tests {
     // io crate's own tests.
     // -----------------------------------------------------------------
 
-    /// The io crate's real-data fixtures.
-    ///
-    /// The load path under test is the app's, but the bytes belong to the
-    /// decoders: copying a megabyte of real radar into a second directory to
-    /// test the same bytes twice would waste it, and the two copies would
-    /// drift apart the first time a fixture was refreshed.
-    fn io_fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("nexrad_io")
-            .join("tests")
-            .join("data")
-            .join(name)
-    }
-
     /// Drive one file through the load path exactly as a drop does.
     ///
     /// The drop handler picks the file out of what was dropped, the load
@@ -333,6 +406,7 @@ mod tests {
         let source_label = chosen.display().to_string();
         process_request(
             LoadRequest {
+                iq_controls: crate::iq_session::IqControls::default(),
                 generation: Generation::default(),
                 path: chosen,
                 origin: FrameOrigin::Local,

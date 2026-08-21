@@ -1,17 +1,33 @@
 //! Open the real master settings window and photograph it.
 //!
-//! `cargo run --release -p settings --example settings_preview -- <out.png> [category]`
+//! `cargo run --release -p settings --example settings_preview -- <out.png> [category] --window`
 //!
-//! This exists so the settings window can be LOOKED at without launching the
-//! whole workstation: it opens the same source file the workstation compiles,
-//! drawing the real catalog over a real store, rather than trusting that
-//! compiling code draws a usable dialog. The
+//! This exists because the settings window's `mod` wiring into the
+//! workstation binary is human-owned: until it lands, this example is the
+//! only way to LOOK at the real window - the same source file the
+//! workstation will compile, drawing the real catalog over a real store -
+//! rather than trusting that compiling code draws a usable dialog. The
 //! screenshot is taken through eframe's own viewport command a few frames
 //! after startup (so layout has settled) and the process exits by itself.
+//!
+//! `--window` is not optional, and it is not decoration. The dialog is drawn
+//! by a real `eframe` viewport, and `eframe` maps that window onto the display
+//! as soon as the first frame is painted - so running this puts a real,
+//! focused window on whatever screen it is started on, and nothing in this
+//! workspace can prevent that. Without the flag the harness refuses to start
+//! rather than taking over a display somebody else is using. See
+//! `../../workstation_app/src/harness_window.rs` for why the flag is the whole
+//! of the remedy.
 //!
 //! With a second argument it opens that category page (`vol3d`, `data`, ...)
 //! by simulating what a click on the category list stores, so every page can
 //! be photographed.
+
+// The one place a harness decides whether it may take over a display. Shared
+// with the workstation's own photograph harnesses so the rule is written once.
+#[allow(dead_code)]
+#[path = "../../workstation_app/src/harness_window.rs"]
+mod harness_window;
 
 #[allow(dead_code)]
 #[path = "../../workstation_app/src/settings_ui.rs"]
@@ -95,8 +111,17 @@ impl eframe::App for Preview {
     }
 }
 
+/// The line the refusal tells an operator to type. One string, so the
+/// documented invocation and the refusal cannot drift apart.
+const USAGE: &str = "settings_preview <out.png> [category] --window";
+
 fn main() -> eframe::Result {
-    let mut args = std::env::args().skip(1);
+    // Before anything is built: this harness cannot photograph without putting
+    // a window on the display, so it does not start unless the operator asked
+    // for one.
+    harness_window::require_window_or_exit("settings_preview", USAGE);
+
+    let mut args = harness_window::positional_arguments().into_iter();
     let shot_path = PathBuf::from(
         args.next()
             .unwrap_or_else(|| "settings_preview.png".to_owned()),

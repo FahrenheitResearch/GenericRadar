@@ -2370,11 +2370,11 @@ mod tests {
         );
     }
 
-    // -- tests written to break the module, not to describe it --------------
+    // -- adversarial review, second pass -----------------------------------
     //
-    // Everything below this line was written against the finished module
-    // rather than alongside it. Each test names the input that failed before
-    // the fix beside it.
+    // Everything below this line was written against the finished module rather
+    // than alongside it, to break it rather than to describe it. Each test names
+    // the input that failed before the fix beside it.
 
     /// A sweep of one chosen moment, scale and offset, so a test can hand the
     /// two layers grids that a caller could really get them confused over.

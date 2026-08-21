@@ -79,6 +79,9 @@ pub fn smooth_moment_grid(grid: &MomentGrid) -> MomentGrid {
         offset: 0.0,
         nodata: None,
         range_folded: None,
+        // Smoothing one sweep does not un-censor it.
+        snr_threshold_db: grid.snr_threshold_db,
+        recombination: grid.recombination,
         radial_indices: grid.radial_indices.clone(),
         storage: MomentStorage::F32(values),
     }
@@ -101,6 +104,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..rows).collect(),
             storage: MomentStorage::F32(data),
         }

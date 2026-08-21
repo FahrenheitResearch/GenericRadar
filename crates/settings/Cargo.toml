@@ -9,10 +9,10 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Dev-only. The workstation's settings window (`workstation_app/src/settings_ui.rs`)
-# is also compiled and unit-tested here through `tests/workstation_settings_ui.rs`
-# (a `#[path]` include), so the module is exercised against this crate's own
-# public API and not only through the binary that links it. The same include
-# drives `examples/settings_preview`,
+# is compiled and unit-tested here through `tests/workstation_settings_ui.rs`
+# (a `#[path]` include) until the human-owned wiring lands in `workstation_app`,
+# because unreferenced source files are not compiled at all and an unverified
+# UI module is worth nothing. The same include drives `examples/settings_preview`,
 # which opens the real window and photographs it. None of these reach the
 # shipped `settings` library: the firewall in `workstation_app/tests/architecture.rs`
 # reads only `[dependencies]`, and this section is not it.

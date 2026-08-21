@@ -1427,6 +1427,8 @@ mod tests {
                 offset: 0.0,
                 nodata: None,
                 range_folded: None,
+                snr_threshold_db: None,
+                recombination: None,
                 radial_indices: (0..radial_count).collect(),
                 storage: radar_core::MomentStorage::U8(vec![64; radial_count * 4]),
             },

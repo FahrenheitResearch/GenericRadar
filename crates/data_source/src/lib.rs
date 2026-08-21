@@ -20,7 +20,6 @@ pub const LEVEL2_CHUNKS_BUCKET: &str = "unidata-nexrad-level2-chunks";
 const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(8);
 const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(45);
-const HTTP_USER_AGENT: &str = "GenericRadar/0.1 local-desktop";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 // The chunk batch size, the per-object attempt count and the pause between
@@ -2200,9 +2199,33 @@ fn download_http_client() -> reqwest::blocking::Client {
         .clone()
 }
 
+/// `GenericRadar/<version> (+<repository>)`, the identity this crate presents
+/// to every public endpoint it calls: the Unidata-hosted NEXRAD Level II
+/// buckets and `api.weather.gov`.
+///
+/// The version is read from the manifest at compile time and is deliberately
+/// not written out by hand here, because a hand-written one rots silently and
+/// then lies to the people running those services. It already had: this
+/// string announced `0.1` while the application shipped as 0.2, 0.3, 0.4 and
+/// 0.5, so an operator reading their access logs could not tell which build
+/// was calling them and could not have asked a stale one to stop.
+///
+/// The shape is `basemap_tiles::default_user_agent`'s, deliberately. The
+/// fallback URL exists because `CARGO_PKG_REPOSITORY` is empty unless the
+/// manifest declares or inherits it, and `GenericRadar/0.5.0 (+)` names
+/// nobody to contact.
+#[must_use]
+pub fn http_user_agent() -> String {
+    let repository = match env!("CARGO_PKG_REPOSITORY") {
+        "" => "https://github.com/FahrenheitResearch/GenericRadar",
+        declared => declared,
+    };
+    format!("GenericRadar/{} (+{repository})", env!("CARGO_PKG_VERSION"))
+}
+
 fn build_http_client(timeout: StdDuration) -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
-        .user_agent(HTTP_USER_AGENT)
+        .user_agent(http_user_agent())
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(timeout)
         .build()?)
@@ -2350,6 +2373,40 @@ const FALLBACK_SITE_IDS: &[&str] = &[
 mod tests {
     use super::*;
     use chrono::{SecondsFormat, TimeZone};
+
+    /// The User-Agent must carry the version this build actually is.
+    ///
+    /// Every request this crate makes to the Unidata NEXRAD Level II buckets
+    /// and to `api.weather.gov` announces this string, and for four releases
+    /// it announced `0.1`. Comparing against `CARGO_PKG_VERSION` rather than
+    /// against a literal is the whole point: a literal here would need the
+    /// same hand-edit at release that the string itself was missing, so this
+    /// test would rot in step with the bug it is meant to catch.
+    #[test]
+    fn the_user_agent_announces_the_version_this_build_actually_is() {
+        let agent = http_user_agent();
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            agent.contains(version),
+            "User-Agent {agent:?} does not carry the crate version {version:?}"
+        );
+        assert!(agent.starts_with("GenericRadar/"), "{agent}");
+    }
+
+    /// ...and a way to reach whoever is running it. A public data provider
+    /// that wants a misbehaving client to stop has only the User-Agent to go
+    /// on, so a version with no contact behind it is half an identity.
+    #[test]
+    fn the_user_agent_names_a_contact() {
+        let agent = http_user_agent();
+        assert!(
+            agent.contains("(+https://"),
+            "User-Agent {agent:?} names nowhere to report a problem"
+        );
+        // A library default is what these providers block; ours must not
+        // collapse into one.
+        assert!(!agent.to_ascii_lowercase().contains("reqwest"), "{agent}");
+    }
 
     #[test]
     fn site_can_carry_location() {

@@ -3,8 +3,16 @@
 //!
 //! ```text
 //! cargo run --release -p workstation_app --example xsection_proof -- \
-//!     <level2-file> <out.png> [preset]
+//!     <level2-file> <out.png> [preset] --window
 //! ```
+//!
+//! `--window` is not optional, and it is not decoration. This photographs
+//! through a real `eframe` viewport, and `eframe` maps that window onto the
+//! display as soon as the first frame is painted - so running this puts a
+//! real, focused window on whatever screen it is started on, and nothing in
+//! this workspace can prevent that. Without the flag the harness refuses to
+//! start rather than taking over a display somebody else is using. See
+//! `../src/harness_window.rs` for why the flag is the whole of the remedy.
 //!
 //! `examples/pane_proof.rs` exists because "the setting reaches the picture"
 //! is a claim about pixels. This exists because of a narrower and more
@@ -27,6 +35,13 @@
 //!   readout must agree with each other and with the settings.
 //! * `metres` - kilometres and metres, a 12 km top. A shallower slice, to see
 //!   the ladder re-choose its own step.
+
+// The one place a harness decides whether it may take over a display. Held
+// apart from the `source` block below because it is policy for the harness,
+// not application code the harness is photographing.
+#[allow(dead_code)]
+#[path = "../src/harness_window.rs"]
+mod harness_window;
 
 // The application, compiled exactly as `src/main.rs` compiles it. Only the
 // modules `xsection` actually reaches: it is a deliberately narrow module -
@@ -64,10 +79,19 @@ const LINE: SectionLine = SectionLine {
     b_km: (60.0, 40.0),
 };
 
+/// The line the refusal tells an operator to type, and the line the usage
+/// error prints. One string, so they cannot drift apart.
+const USAGE: &str = "xsection_proof <level2-file> <out.png> [default|imperial|metres] --window";
+
 fn main() -> eframe::Result {
-    let mut arguments = std::env::args().skip(1);
+    // Before anything is decoded: this harness cannot photograph without
+    // putting a window on the display, so it does not start unless the
+    // operator asked for one.
+    harness_window::require_window_or_exit("xsection_proof", USAGE);
+
+    let mut arguments = harness_window::positional_arguments().into_iter();
     let Some(volume_path) = arguments.next().map(PathBuf::from) else {
-        eprintln!("usage: xsection_proof <level2-file> <out.png> [default|imperial|metres]");
+        eprintln!("usage: {USAGE}");
         std::process::exit(2);
     };
     let shot_path = arguments

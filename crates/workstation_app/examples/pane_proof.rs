@@ -3,8 +3,16 @@
 //!
 //! ```text
 //! cargo run --release -p workstation_app --example pane_proof -- \
-//!     <level2-file> <out.png> [preset]
+//!     <level2-file> <out.png> [preset] --window
 //! ```
+//!
+//! `--window` is not optional, and it is not decoration. This photographs
+//! through a real `eframe` viewport, and `eframe` maps that window onto the
+//! display as soon as the first frame is painted - so running this puts a
+//! real, focused window on whatever screen it is started on, and nothing in
+//! this workspace can prevent that. Without the flag the harness refuses to
+//! start rather than taking over a display somebody else is using. See
+//! `../src/harness_window.rs` for why the flag is the whole of the remedy.
 //!
 //! This exists because "the setting reaches the picture" is a claim about
 //! pixels. The unit tests read the shapes `draw_pane` emitted and assert on
@@ -26,6 +34,13 @@
 //! * `sparse` - the corner readout off, big markers, big labels. What an
 //!   analyst working on a projector asks for.
 
+// The one place a harness decides whether it may take over a display. Held
+// apart from the `source` block below because it is policy for the harness,
+// not application code the harness is photographing.
+#[allow(dead_code)]
+#[path = "../src/harness_window.rs"]
+mod harness_window;
+
 // The application, compiled exactly as `src/main.rs` compiles it. The
 // directory `#[path]` is what makes each module's own child files resolve, and
 // the re-export is what makes the `crate::` paths inside them resolve here.
@@ -35,8 +50,11 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
+    pub mod iq_session;
+    pub mod iq_spectrum_ui;
     pub mod legend;
     pub mod live_service;
     pub mod load_service;
@@ -52,6 +70,7 @@ mod source {
     pub mod product_availability;
     pub mod product_picker;
     pub mod render_service;
+    pub mod research_sites;
     pub mod settings_ui;
     pub mod sites_service;
     pub mod sweep;
@@ -66,10 +85,11 @@ mod source {
 
 #[allow(unused_imports)]
 pub(crate) use source::{
-    annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
-    product, product_availability, product_picker, render_service, settings_ui, sites_service,
-    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
+    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
+    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
+    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
+    units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
 
 use std::path::PathBuf;
@@ -100,10 +120,19 @@ const NEIGHBOURS: &[(&str, f64, f64)] = &[
     ("KEAX", 38.810_278, -94.264_444),
 ];
 
+/// The line the refusal tells an operator to type, and the line the usage
+/// error prints. One string, so they cannot drift apart.
+const USAGE: &str = "pane_proof <level2-file> <out.png> [default|miles|rings|sparse] --window";
+
 fn main() -> eframe::Result {
-    let mut arguments = std::env::args().skip(1);
+    // Before anything is decoded: this harness cannot photograph without
+    // putting a window on the display, so it does not start unless the
+    // operator asked for one.
+    harness_window::require_window_or_exit("pane_proof", USAGE);
+
+    let mut arguments = harness_window::positional_arguments().into_iter();
     let Some(volume_path) = arguments.next().map(PathBuf::from) else {
-        eprintln!("usage: pane_proof <level2-file> <out.png> [default|miles|rings|sparse]");
+        eprintln!("usage: {USAGE}");
         std::process::exit(2);
     };
     let shot_path = arguments
@@ -321,6 +350,7 @@ impl eframe::App for Proof {
                     egui::vec2(PANE_POINTS, PANE_POINTS),
                 );
                 let overlay = PaneOverlay {
+                    spectrum: None,
                     legend: None,
                     table: None,
                     product_name: "REF",

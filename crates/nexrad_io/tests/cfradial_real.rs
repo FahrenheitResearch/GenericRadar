@@ -1,17 +1,27 @@
 //! CfRadial 1.x decoder tests.
 //!
-//! The real-data fixture is `tests/data/cfrad.xsapr_sgp_ppi_20110520.classic.nc`:
-//! ARM X-SAPR (X-band Scanning ARM Precipitation Radar) PPI at the Southern
-//! Great Plains site, 2011-05-20 10:54:16 UTC, 40 rays x 42 gates,
-//! `reflectivity_horizontal`. Source: ARM-DOE/pyart
+//! The real-data fixture is ARM X-SAPR (X-band Scanning ARM Precipitation
+//! Radar) PPI at the Southern Great Plains site, 2011-05-20 10:54:16 UTC,
+//! 40 rays x 42 gates, `reflectivity_horizontal`. Source: ARM-DOE/pyart
 //! `pyart/testing/data/example_cfradial_ppi.nc` (BSD-3-Clause; itself
 //! ray/gate-decimated from the full X-SAPR file by Py-ART's
-//! `make_small_cfradial_ppi.py`). CONTAINER CONVERSION: the published file is
-//! netCDF-4; it is stored here in the NETCDF3_CLASSIC (CDF-1) container after
-//! a variable-for-variable copy that applies no mask and no scaling, so the
-//! data values are the published ones and only the container differs.
-//! CfRadial 1.x in the wild is netCDF-4-dominant today; the classic container
-//! is what early Radx wrote and is what this decoder reads.
+//! `make_small_cfradial_ppi.py`).
+//!
+//! It is stored TWICE, in both netCDF containers, because CfRadial 1.x is
+//! written into both and this decoder reads both:
+//!
+//! * `cfrad.xsapr_sgp_ppi_20110520.netcdf4.nc` — the published file, byte
+//!   for byte, in the netCDF-4 (HDF5) container that CfRadial 1 in the wild
+//!   is dominantly written in.
+//! * `cfrad.xsapr_sgp_ppi_20110520.classic.nc` — the same file copied
+//!   variable-for-variable into the NETCDF3_CLASSIC (CDF-1) container with
+//!   no mask and no scaling applied, so the values are the published ones
+//!   and only the container differs. Classic is what early Radx wrote.
+//!
+//! netCDF4-python compares every variable of the two as equal, so the pair
+//! is a container-difference and nothing else — which is what makes
+//! `the_netcdf4_and_classic_containers_of_one_volume_decode_identically` a
+//! test of the readers rather than of the data.
 //!
 //! Every golden number below was read with netCDF4-python 1.7.4, an
 //! independent reader, not with this crate.
@@ -26,9 +36,34 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use nexrad_io::cfradial::{decode_cfradial1_volume, looks_like_netcdf3_bytes};
-use radar_core::{GateRange, MomentType};
+use radar_core::{GateRange, MomentStorage, MomentType};
 
 const XSAPR_PPI: &[u8] = include_bytes!("data/cfrad.xsapr_sgp_ppi_20110520.classic.nc");
+/// The same volume in the container it was PUBLISHED in. See
+/// `the_netcdf4_and_classic_containers_of_one_volume_decode_identically`.
+const XSAPR_PPI_NETCDF4: &[u8] = include_bytes!("data/cfrad.xsapr_sgp_ppi_20110520.netcdf4.nc");
+/// A five-variable netCDF-4 CfRadial volume, small enough that netCDF-C
+/// keeps its links in COMPACT storage. Written by netCDF-C itself; see
+/// `tests/data/gen_cfradial_nc4_compact.py` for the generator and the
+/// values it declares.
+const TINY_COMPACT_LINKS: &[u8] = include_bytes!("data/cfrad.tiny_compact_links.netcdf4.nc");
+/// A volume whose fields were DECLARED and (mostly) never written, in both
+/// containers. `_FillValue` is -9999.0 on all three fields; `reflectivity`
+/// (contiguous) and `velocity` (chunked) hold no bytes at all, and
+/// `spectrum_width` (chunked) has only its first four rays. See
+/// `tests/data/gen_cfradial_unwritten_storage.py`.
+const UNWRITTEN_NETCDF4: &[u8] = include_bytes!("data/cfrad.unwritten_storage.netcdf4.nc");
+const UNWRITTEN_CLASSIC: &[u8] = include_bytes!("data/cfrad.unwritten_storage.classic.nc");
+/// Rays of the unwritten-storage fixture, and how many of them `spectrum_width`
+/// actually carries.
+const UNWRITTEN_RAYS: usize = 8;
+const UNWRITTEN_GATES: usize = 6;
+const UNWRITTEN_WRITTEN_RAYS: usize = 4;
+/// An ODIM_H5 polar volume: the OTHER radar format that carries the HDF5
+/// signature, used to pin that the router still tells the two apart.
+/// Belgian Wideumont PVOL, already in this crate's fixtures for the ODIM
+/// tests (EUMETNET OPERA / RMI Belgium sample).
+const ODIM_PVOL: &[u8] = include_bytes!("data/20130429043000.rad.bewid.pvol.dbzh.scan1.hdf");
 
 #[track_caller]
 fn assert_close(actual: f32, expected: f32, tolerance: f32, what: &str) {
@@ -1338,6 +1373,368 @@ fn put_attrs(out: &mut Vec<u8>, attrs: &[(String, Attr)]) {
         }
         out.resize(pad4(out.len()), 0);
     }
+}
+
+/// The SAME volume in both netCDF containers decodes to the same volume.
+///
+/// `cfrad.xsapr_sgp_ppi_20110520.netcdf4.nc` is Py-ART's published file
+/// exactly as ARM-DOE ships it — a netCDF-4 (HDF5) container. The `.classic`
+/// fixture beside it is that file copied variable-for-variable into a
+/// CDF-1 container with no masking and no scaling applied, so the two hold
+/// identical values (confirmed with netCDF4-python: every variable compares
+/// equal). Anything that differs between the two decodes is therefore a
+/// container-reading bug and nothing else.
+///
+/// Before netCDF-4 support existed this file did not open AT ALL:
+/// [`nexrad_io::hdf5lite`] refused its version 2 superblock, and the router
+/// sent every HDF5 file to the ODIM decoder, which answered "not ODIM_H5".
+/// The README advertised CfRadial 1.x while the dominant CfRadial 1
+/// container silently failed.
+#[test]
+fn the_netcdf4_and_classic_containers_of_one_volume_decode_identically() {
+    let netcdf4 = decode_cfradial1_volume(XSAPR_PPI_NETCDF4).expect("decode netCDF-4 X-SAPR PPI");
+    let classic = decode_cfradial1_volume(XSAPR_PPI).expect("decode classic X-SAPR PPI");
+
+    assert!(
+        XSAPR_PPI_NETCDF4.starts_with(b"\x89HDF\r\n\x1a\n"),
+        "the netCDF-4 fixture should be an HDF5 container"
+    );
+    assert!(
+        !looks_like_netcdf3_bytes(XSAPR_PPI_NETCDF4),
+        "a netCDF-4 file carries no CDF magic, which is why it needs its own reader"
+    );
+
+    assert_same_volume(&netcdf4, &classic);
+}
+
+/// Every part of one volume, compared across the two containers it was
+/// written into: geometry, timing and every gate of every moment.
+///
+/// This is a helper rather than one test's body because the claim it makes
+/// — the container is not supposed to be observable — has to hold for more
+/// than one volume. A volume whose gates were all WRITTEN cannot catch a
+/// reader that invents values for the ones that were not.
+#[track_caller]
+fn assert_same_volume(netcdf4: &radar_core::RadarVolume, classic: &radar_core::RadarVolume) {
+    assert_eq!(netcdf4.site.id, classic.site.id);
+    assert_eq!(netcdf4.site.name, classic.site.name);
+    assert_eq!(netcdf4.site.latitude_deg, classic.site.latitude_deg);
+    assert_eq!(netcdf4.site.longitude_deg, classic.site.longitude_deg);
+    assert_eq!(netcdf4.site.elevation_m, classic.site.elevation_m);
+    assert_eq!(netcdf4.volume_time, classic.volume_time);
+    assert_eq!(
+        netcdf4.metadata.decoded_radial_count,
+        classic.metadata.decoded_radial_count
+    );
+    assert_eq!(netcdf4.cuts.len(), classic.cuts.len());
+
+    for (cut_index, (left, right)) in netcdf4.cuts.iter().zip(&classic.cuts).enumerate() {
+        assert_eq!(left.elevation_deg, right.elevation_deg, "cut {cut_index}");
+        assert_eq!(left.radials.len(), right.radials.len(), "cut {cut_index}");
+        for (ray, (a, b)) in left.radials.iter().zip(&right.radials).enumerate() {
+            assert_eq!(a.azimuth_deg, b.azimuth_deg, "cut {cut_index} ray {ray} az");
+            assert_eq!(
+                a.elevation_deg, b.elevation_deg,
+                "cut {cut_index} ray {ray} el"
+            );
+            assert_eq!(
+                a.time_offset_ms, b.time_offset_ms,
+                "cut {cut_index} ray {ray} t"
+            );
+            assert_eq!(
+                a.gate_range, b.gate_range,
+                "cut {cut_index} ray {ray} gates"
+            );
+            assert_eq!(
+                a.nyquist_velocity_mps, b.nyquist_velocity_mps,
+                "cut {cut_index} ray {ray} nyquist"
+            );
+        }
+        assert_eq!(
+            left.moments.keys().collect::<Vec<_>>(),
+            right.moments.keys().collect::<Vec<_>>(),
+            "cut {cut_index} moments"
+        );
+        for (moment, grid) in &left.moments {
+            let other = &right.moments[moment];
+            let (MomentStorage::F32(mine), MomentStorage::F32(theirs)) =
+                (&grid.storage, &other.storage)
+            else {
+                panic!("CfRadial fields decode to f32 storage");
+            };
+            assert_eq!(
+                mine.len(),
+                theirs.len(),
+                "cut {cut_index} {moment:?} length"
+            );
+            // NaN is the fill value on both sides, so compare bit patterns
+            // rather than values: `==` would call every masked gate unequal.
+            for (gate, (a, b)) in mine.iter().zip(theirs).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cut {cut_index} {moment:?} gate {gate}: {a} != {b}"
+                );
+            }
+        }
+    }
+}
+
+/// Storage the writer never allocated reads back as the field's own
+/// `_FillValue`, not as zero.
+///
+/// HDF5 writes nothing for a variable that was never written — a contiguous
+/// dataset gets the undefined data address, a chunked one gets no chunk
+/// records — and the value those regions stand for is the dataset's Fill
+/// Value message, which is where netCDF puts `_FillValue`. A reader that
+/// conjures zeros instead hands the display 0.0 dBZ over ground the file
+/// says was never measured: not a gap, but weak echo, drawn in the same
+/// colours as real returns. That is the failure this pins.
+///
+/// Every number below came from netCDF4-python 1.7.4 reading the same file:
+/// 0 of 48 reflectivity gates written, 0 of 48 velocity, and exactly the
+/// first four rays of `spectrum_width`, running 0.5 to 12.0 m/s.
+#[test]
+fn unwritten_netcdf4_storage_reads_as_fill_not_as_zero() {
+    let volume = decode_cfradial1_volume(UNWRITTEN_NETCDF4).expect("decode netCDF-4 fill fixture");
+    assert_eq!(volume.cuts.len(), 1);
+    let cut = &volume.cuts[0];
+    assert_eq!(cut.radials.len(), UNWRITTEN_RAYS);
+
+    // Contiguous, undefined data address.
+    let reflectivity = cut
+        .moments
+        .get(&MomentType::Reflectivity)
+        .expect("reflectivity is declared");
+    // Chunked, no chunk records at all.
+    let velocity = cut
+        .moments
+        .get(&MomentType::Velocity)
+        .expect("velocity is declared");
+    for ray in 0..UNWRITTEN_RAYS {
+        for gate in 0..UNWRITTEN_GATES {
+            for (name, moment) in [("reflectivity", reflectivity), ("velocity", velocity)] {
+                let value = moment.scaled_value(ray, gate).expect("gate in range");
+                assert!(
+                    value.is_nan(),
+                    "{name}[{ray},{gate}] was never written, so it must be no-data, not {value}"
+                );
+            }
+        }
+    }
+
+    // Chunked and HALF written: the allocated chunk keeps its values and the
+    // absent one must not be invented.
+    let width = cut
+        .moments
+        .get(&MomentType::SpectrumWidth)
+        .expect("spectrum_width is declared");
+    for ray in 0..UNWRITTEN_RAYS {
+        for gate in 0..UNWRITTEN_GATES {
+            let value = width.scaled_value(ray, gate).expect("gate in range");
+            if ray < UNWRITTEN_WRITTEN_RAYS {
+                let expected = (ray * UNWRITTEN_GATES + gate + 1) as f32 * 0.5;
+                assert_close(value, expected, 1e-6, &format!("width[{ray},{gate}]"));
+            } else {
+                assert!(
+                    value.is_nan(),
+                    "width[{ray},{gate}] is in the chunk the writer never allocated, not {value}"
+                );
+            }
+        }
+    }
+}
+
+/// A user-defined type declared beside the variables costs the file nothing.
+///
+/// netCDF stores every user-defined type — enum, compound, vlen — as an HDF5
+/// committed (named) datatype in the group next to the variables. It carries
+/// a datatype message and no dataspace, so a reader that calls "has a
+/// datatype" a dataset asks it for a shape it does not have and fails the
+/// WHOLE file: `dataset '/gate_class_t' has no dataspace`, on a file whose
+/// every moment is a plain float array it could read. Skipping it is the
+/// only thing the decoder needs to do about it.
+#[test]
+fn a_committed_datatype_beside_the_variables_is_skipped_not_read() {
+    let file = nexrad_io::hdf5lite::H5File::open(UNWRITTEN_NETCDF4).expect("open the fixture");
+    assert!(
+        file.is_committed_datatype("/gate_class_t"),
+        "the fixture must actually carry the committed type this pins"
+    );
+    assert!(!file.is_dataset("/gate_class_t"));
+    assert!(file.is_dataset("/reflectivity"), "a real variable still is");
+
+    let volume = decode_cfradial1_volume(UNWRITTEN_NETCDF4).expect("decode past the type");
+    assert_eq!(volume.cuts.len(), 1);
+    assert_eq!(volume.cuts[0].moments.len(), 3, "all three fields survive");
+}
+
+/// The container-equivalence claim, made on a volume that can break it.
+///
+/// [`the_netcdf4_and_classic_containers_of_one_volume_decode_identically`]
+/// compares a volume whose every gate was written, which no fill-value bug
+/// can disturb. This one compares the volume that was mostly NOT written,
+/// where classic netCDF stores `_FillValue` for every unwritten gate and
+/// netCDF-4 stores nothing at all — so the two containers agree only if the
+/// HDF5 reader knows what "nothing" means.
+#[test]
+fn the_two_containers_of_an_unwritten_volume_decode_identically() {
+    let netcdf4 = decode_cfradial1_volume(UNWRITTEN_NETCDF4).expect("decode netCDF-4 fill fixture");
+    let classic = decode_cfradial1_volume(UNWRITTEN_CLASSIC).expect("decode classic fill fixture");
+    assert!(UNWRITTEN_NETCDF4.starts_with(b"\x89HDF\r\n\x1a\n"));
+    assert!(looks_like_netcdf3_bytes(UNWRITTEN_CLASSIC));
+    assert_same_volume(&netcdf4, &classic);
+}
+
+/// The top-level router opens a netCDF-4 CfRadial file.
+///
+/// The HDF5 signature says "HDF5", not "ODIM_H5", and the router used to
+/// read it as the latter — so a CfRadial file dropped on the app came back
+/// as "ODIM_H5: HDF5 file has no /what 'object' attribute". This is the pin
+/// that the router looks INSIDE an HDF5 container before deciding what it
+/// is, and that the ODIM path still gets ODIM files.
+#[test]
+fn the_router_opens_a_netcdf4_cfradial_file_as_cfradial() {
+    assert_eq!(
+        nexrad_io::sniff_supported_volume_bytes(XSAPR_PPI_NETCDF4),
+        Some(nexrad_io::SupportedVolumeFormat::OdimH5),
+        "the head bytes can only say 'HDF5 container'"
+    );
+    let volume =
+        nexrad_io::decode_supported_volume_bytes(XSAPR_PPI_NETCDF4).expect("router decodes");
+    assert_eq!(volume.site.id, "xsapr-sgp");
+    assert_eq!(volume.cuts.len(), 1);
+    assert_eq!(volume.cuts[0].radials.len(), 40);
+    assert!(
+        volume.cuts[0]
+            .moments
+            .contains_key(&MomentType::Reflectivity)
+    );
+
+    // The other HDF5 radar format still routes to its own decoder.
+    let odim = nexrad_io::decode_supported_volume_bytes(ODIM_PVOL).expect("ODIM still decodes");
+    assert!(
+        !odim.cuts.is_empty(),
+        "an ODIM volume must not be mistaken for netCDF-4"
+    );
+}
+
+/// An attribute this reader cannot decode does not take its neighbours with
+/// it.
+///
+/// netCDF-4 hangs its own bookkeeping off HDF5 attributes with datatypes
+/// outside a minimal parser's scope: `DIMENSION_LIST` is a variable-length
+/// sequence of object references and `REFERENCE_LIST` is a compound. They
+/// sit in the SAME attribute list as `scale_factor` and `add_offset`, so an
+/// enumeration that gave up at the first one it could not convert would
+/// silently return an unpacked field — right-shaped, wrong values, no error
+/// anywhere. This is the pin that says the skip is per attribute.
+#[test]
+fn an_undecodable_attribute_does_not_hide_the_cf_packing_beside_it() {
+    let file = nexrad_io::hdf5lite::H5File::open(XSAPR_PPI_NETCDF4).expect("open");
+    let field = "/reflectivity_horizontal";
+    let names = file.attr_names(field);
+    assert!(
+        names.iter().any(|name| name == "DIMENSION_LIST"),
+        "the fixture should carry the bookkeeping attribute this guards, got {names:?}"
+    );
+    let decoded = file.attrs(field);
+    assert!(
+        !decoded.iter().any(|(name, _)| name == "DIMENSION_LIST"),
+        "an undecodable datatype should be skipped, not invented"
+    );
+    for wanted in ["_FillValue", "units", "standard_name"] {
+        assert!(
+            decoded.iter().any(|(name, _)| name == wanted),
+            "'{wanted}' must survive the attribute this reader skips, got {:?}",
+            decoded.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A netCDF-4 group small enough to keep its links COMPACT still opens.
+///
+/// HDF5 stores a group's links two ways and netCDF-4 uses both: compact link
+/// messages inside the object header while the group stays under its
+/// max-compact threshold (eight links), dense fractal-heap storage past it.
+/// Every published CfRadial file is dense — dozens of variables — so the
+/// real fixture cannot reach the compact branch, and a reader that only ever
+/// saw dense storage would report a small netCDF-4 file as having no
+/// variables at all: no error, just an empty root.
+///
+/// The fixture is written by the netCDF-C library itself (see
+/// `tests/data/gen_cfradial_nc4_compact.py`), so this is that library's own
+/// compact layout and not a guess at it. The expected values come from the
+/// generator's declared packing — `physical = raw * 0.5 + 1.0` with `-9999`
+/// masked — so a packing slip fails here as an arithmetic error, not as a
+/// container one.
+#[test]
+fn a_netcdf4_group_with_compact_link_storage_decodes() {
+    let volume = decode_cfradial1_volume(TINY_COMPACT_LINKS).expect("decode compact-link netCDF-4");
+
+    assert_eq!(volume.site.id, "TINY");
+    assert_eq!(
+        volume.volume_time,
+        Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()
+    );
+    assert_eq!(volume.cuts.len(), 1);
+    let cut = &volume.cuts[0];
+    assert_close(cut.elevation_deg, 0.5, 1e-6, "fixed angle");
+    assert_eq!(cut.radials.len(), 3);
+    assert_close(cut.radials[0].azimuth_deg, 10.0, 1e-6, "az0");
+    assert_close(cut.radials[2].azimuth_deg, 30.0, 1e-6, "az2");
+    assert_eq!(
+        cut.radials[0].gate_range,
+        GateRange {
+            first_gate_m: 100,
+            gate_spacing_m: 100,
+            gate_count: 4,
+        }
+    );
+
+    let MomentStorage::F32(values) = &cut.moments[&MomentType::Reflectivity].storage else {
+        panic!("CfRadial fields decode to f32 storage");
+    };
+    // Three rays of four gates: raw * 0.5 + 1.0, with the `-9999` gate of
+    // ray 1 masked by `_FillValue`.
+    let expected = [
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, f32::NAN, 8.0],
+        [9.0, 10.0, 11.0, 12.0],
+    ]
+    .concat();
+    assert_eq!(values.len(), expected.len());
+    for (gate, (actual, want)) in values.iter().zip(expected).enumerate() {
+        if want.is_nan() {
+            assert!(actual.is_nan(), "gate {gate} should be the fill value");
+        } else {
+            assert_close(*actual, want, 1e-6, &format!("gate {gate}"));
+        }
+    }
+}
+
+/// A grouped netCDF-4 radar file is named, not reported as a broken one.
+///
+/// CfRadial 2 puts each sweep in its own group. Reading its root would find
+/// no `(time, range)` field and complain about a missing dimension, which
+/// sends the reader looking for a corrupt file rather than for
+/// `RadxConvert`. Any grouped HDF5 file exercises the same guard, so the
+/// ODIM fixture — `/what`, `/where`, `/datasetN` — stands in for one.
+#[test]
+fn a_grouped_netcdf4_file_is_named_as_cfradial2_rather_than_misread() {
+    let file = nexrad_io::hdf5lite::H5File::open(ODIM_PVOL).expect("ODIM opens as HDF5");
+    let error = nexrad_io::netcdf4::Nc4File::from_hdf5(file)
+        .err()
+        .expect("a grouped file is not CfRadial 1");
+    let message = error.to_string();
+    assert!(
+        message.contains("CfRadial 2"),
+        "the message should name the convention, got {message}"
+    );
+    assert!(
+        message.contains("RadxConvert"),
+        "the message should name the way out, got {message}"
+    );
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {

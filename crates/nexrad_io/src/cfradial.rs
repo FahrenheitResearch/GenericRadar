@@ -1,10 +1,10 @@
-//! CfRadial 1.x decoder (classic-netCDF radar moments).
+//! CfRadial 1.x decoder (netCDF radar moments, either container).
 //!
 //! Format reference: M. Dixon and W.-C. Lee, "CfRadial Data File Format —
 //! CF-compliant netCDF Format for Moments Data for RADAR and LIDAR",
 //! NCAR/EOL, version 1.4 (2016-08-01) (versions 1.1–1.4 share the layout
 //! read here; 1.5/1.6 add attributes this decoder simply ignores).
-//! CfRadial 1 files are classic netCDF (`CDF\x01`/`CDF\x02`) with:
+//! CfRadial 1 files carry:
 //! - dimensions `time` (rays, usually the unlimited dimension) and `range`
 //!   (gates),
 //! - per-ray `azimuth(time)`, `elevation(time)`, `time(time)` and an
@@ -17,12 +17,18 @@
 //!   `scale_factor`/`add_offset` and flagged with `_FillValue`
 //!   (CF packing: physical = raw * scale_factor + add_offset).
 //!
-//! CfRadial 2 is netCDF-4, i.e. an HDF5 container, and never reaches this
-//! module: it carries the HDF5 signature rather than the `CDF` magic, so
-//! [`looks_like_netcdf3_bytes`] rejects it and the routing layer sends it
-//! elsewhere. The same is true of CfRadial *1* files written into a
-//! netCDF-4 container, which is the common case in the wild today;
-//! `nccopy -k classic` converts one for this decoder.
+//! BOTH netCDF containers are read, because CfRadial 1 is written into
+//! both. Classic netCDF (`CDF\x01`/`CDF\x02`) is what early Radx wrote;
+//! netCDF-4 — HDF5 with netCDF's conventions layered on it — is what
+//! essentially every CfRadial 1 file published today is, ARM's and CSWR's
+//! and Py-ART's own samples included. [`crate::netcdf3`] and
+//! [`crate::netcdf4`] read the two containers into one data model and
+//! [`decode_cfradial1_source`] applies the convention to whichever arrives,
+//! so the two containers of the same volume decode to the same volume.
+//!
+//! CfRadial 2 is a different convention, not a different container: it puts
+//! each sweep in its own netCDF-4 group. [`crate::netcdf4`] recognises the
+//! group layout and names it rather than reporting a missing dimension.
 //!
 //! Fields decode into F32 moment grids, where NaN is the fill value, because
 //! CfRadial's own packing is already `scale_factor`/`add_offset` in the
@@ -56,7 +62,8 @@ use radar_core::{
 };
 
 pub use crate::netcdf3::looks_like_netcdf3_bytes;
-use crate::netcdf3::{Nc3File, NcArray, NcVar};
+use crate::netcdf3::{Nc3File, NcArray, NcSource, NcVar};
+use crate::netcdf4::Nc4File;
 use crate::{NexradError, Result};
 
 /// Hard ceiling on how many sweeps one volume may declare.
@@ -69,26 +76,44 @@ use crate::{NexradError, Result};
 const MAX_SWEEPS: usize = 4096;
 
 /// Decode a CfRadial 1.x byte buffer into the shared radar model.
+///
+/// Both containers are accepted and read identically: an HDF5 superblock
+/// routes to [`crate::netcdf4`], `CDF` magic to [`crate::netcdf3`], and from
+/// there one [`decode_cfradial1_source`] applies every CfRadial rule.
 pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
-    let file = Nc3File::open(bytes)?;
-    let dim = |name: &str| file.dims.iter().position(|(dim_name, _)| dim_name == name);
+    if crate::hdf5lite::looks_like_hdf5_bytes(bytes) {
+        return decode_cfradial1_source(&Nc4File::open(bytes)?);
+    }
+    decode_cfradial1_source(&Nc3File::open(bytes)?)
+}
+
+/// Decode CfRadial 1.x out of an already-opened netCDF source.
+///
+/// This is where every rule in this module lives, so the classic and
+/// netCDF-4 containers cannot decode the same file to different volumes.
+pub fn decode_cfradial1_source(file: &dyn NcSource) -> Result<RadarVolume> {
+    let dim = |name: &str| {
+        file.dims()
+            .iter()
+            .position(|(dim_name, _)| dim_name == name)
+    };
     let (Some(time_dim), Some(range_dim)) = (dim("time"), dim("range")) else {
         return Err(invalid(
             "netCDF file lacks time/range dimensions — not CfRadial 1.x",
         ));
     };
-    let n_rays = file.dims[time_dim].1;
-    let n_gates = file.dims[range_dim].1;
+    let n_rays = file.dims()[time_dim].1;
+    let n_gates = file.dims()[range_dim].1;
     if n_rays == 0 || n_gates == 0 {
         return Err(invalid("CfRadial volume has no rays or gates"));
     }
 
-    let azimuth = read_f64s(&file, "azimuth")?;
-    let elevation = read_f64s(&file, "elevation")?;
+    let azimuth = read_f64s(file, "azimuth")?;
+    let elevation = read_f64s(file, "elevation")?;
     if azimuth.len() < n_rays || elevation.len() < n_rays {
         return Err(invalid("azimuth/elevation shorter than the time dimension"));
     }
-    let nyquist = read_f64s(&file, "nyquist_velocity").ok();
+    let nyquist = read_f64s(file, "nyquist_velocity").ok();
 
     // Gate geometry: range(range) holds gate CENTERS in metres (spec §5.5,
     // "Range to center of each bin"). The `meters_to_center_of_first_gate` /
@@ -108,7 +133,7 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     // half a gate too close to the radar, and because that lookup rounds
     // half away from zero, a pixel at a gate's true center would read the
     // NEXT gate out.
-    let range = read_f64s(&file, "range")?;
+    let range = read_f64s(file, "range")?;
     if range.len() < 2 {
         return Err(invalid("range coordinate needs at least two gates"));
     }
@@ -120,9 +145,9 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     };
 
     // Sweep index ranges; a missing sweep dimension means one sweep.
-    let fixed_angles = read_f64s(&file, "fixed_angle").unwrap_or_default();
-    let sweep_starts = read_f64s(&file, "sweep_start_ray_index").unwrap_or_default();
-    let sweep_ends = read_f64s(&file, "sweep_end_ray_index").unwrap_or_default();
+    let fixed_angles = read_f64s(file, "fixed_angle").unwrap_or_default();
+    let sweep_starts = read_f64s(file, "sweep_start_ray_index").unwrap_or_default();
+    let sweep_ends = read_f64s(file, "sweep_end_ray_index").unwrap_or_default();
     // `fixed_angle(sweep)` is mandatory in the spec, so on a conformant file
     // it alone sets the sweep count. The ray-index arrays are consulted too so
     // that a file which omits `fixed_angle` still splits into its real sweeps
@@ -147,7 +172,7 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     // touch a conformant file — the deepest real volume checked here has 31
     // sweeps against 6,646 rays.
     let sweep_count = declared_sweeps.min(n_rays).min(MAX_SWEEPS);
-    let sweep_modes = read_sweep_modes(&file, sweep_count);
+    let sweep_modes = read_sweep_modes(file, sweep_count);
 
     // `time_coverage_start` is mandatory (§4.4) and is the volume time on
     // every conformant file. A file that omits it falls back to the epoch
@@ -159,11 +184,11 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     // units epoch keeps the ray offsets exactly the raw `time` values —
     // which is what the file's own coordinate says — and leaves the absolute
     // instant as close as a file without `time_coverage_start` allows.
-    let time_epoch = time_units_epoch(&file);
-    let volume_time = parse_time_coverage_start(&file)
+    let time_epoch = time_units_epoch(file);
+    let volume_time = parse_time_coverage_start(file)
         .or(time_epoch)
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
-    let mut volume = RadarVolume::new(parse_site(&file), volume_time);
+    let mut volume = RadarVolume::new(parse_site(file), volume_time);
     volume.metadata.archive_version = Some(
         file.gattr_str("version")
             .map(str::to_owned)
@@ -188,14 +213,14 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     // write something unparseable, keep the old reading — offsets straight
     // from `time_coverage_start` — which is also exactly what a conformant
     // file where the two epochs agree produces.
-    let ray_seconds = read_f64s(&file, "time").ok();
+    let ray_seconds = read_f64s(file, "time").ok();
     let time_epoch_shift_ms = time_epoch
         .map(|epoch| (epoch - volume_time).num_milliseconds() as f64)
         .unwrap_or(0.0);
 
     // Field variables: anything shaped (time, range).
     let fields: Vec<&NcVar> = file
-        .vars
+        .vars()
         .values()
         .filter(|var| var.dim_ids.as_slice() == [time_dim, range_dim])
         .collect();
@@ -292,7 +317,7 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             Some(moment) if canonical_fields.insert(moment.clone()) => moment,
             _ => MomentType::Unknown(field.name.clone()),
         };
-        let values = read_field_physical(&file, field)?;
+        let values = read_field_physical(file, field)?;
         if values.len() < expected_values {
             return Err(invalid(format!(
                 "CfRadial field '{}' has {} values; expected at least {expected_values}",
@@ -308,6 +333,10 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
                 offset: 0.0,
                 nodata: None,
                 range_folded: None,
+                // CfRadial carries no NEXRAD generic data moment header, so
+                // there is no censoring threshold or recombination code here.
+                snr_threshold_db: None,
+                recombination: None,
                 radial_indices: Vec::new(),
                 storage: MomentStorage::F32(Vec::new()),
             };
@@ -388,8 +417,8 @@ fn sweep_mode_from_str(mode: &str) -> SweepMode {
 }
 
 /// `sweep_mode(sweep, string_length)` char matrix → per-sweep scan modes.
-fn read_sweep_modes(file: &Nc3File<'_>, sweep_count: usize) -> Vec<Option<SweepMode>> {
-    let Some(var) = file.vars.get("sweep_mode") else {
+fn read_sweep_modes(file: &dyn NcSource, sweep_count: usize) -> Vec<Option<SweepMode>> {
+    let Some(var) = file.vars().get("sweep_mode") else {
         return vec![None; sweep_count];
     };
     let dims = file.var_dims(var);
@@ -613,7 +642,7 @@ fn match_moment_stem(stem: &str) -> Option<MomentType> {
 
 /// Apply CF packing (physical = raw·scale_factor + add_offset) and
 /// `_FillValue`/`missing_value` masking; everything lands in f32.
-fn read_field_physical(file: &Nc3File<'_>, var: &NcVar) -> Result<Vec<f32>> {
+fn read_field_physical(file: &dyn NcSource, var: &NcVar) -> Result<Vec<f32>> {
     let scale = var.attr_f64("scale_factor").unwrap_or(1.0);
     let offset = var.attr_f64("add_offset").unwrap_or(0.0);
     let fill = var
@@ -633,7 +662,7 @@ fn read_field_physical(file: &Nc3File<'_>, var: &NcVar) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn read_f64s(file: &Nc3File<'_>, name: &str) -> Result<Vec<f64>> {
+fn read_f64s(file: &dyn NcSource, name: &str) -> Result<Vec<f64>> {
     let raw = file.read_var(name)?;
     let count = raw.len();
     let mut out = Vec::with_capacity(count);
@@ -646,7 +675,7 @@ fn read_f64s(file: &Nc3File<'_>, name: &str) -> Result<Vec<f64>> {
     Ok(out)
 }
 
-fn parse_site(file: &Nc3File<'_>) -> RadarSite {
+fn parse_site(file: &dyn NcSource) -> RadarSite {
     // latitude/longitude/altitude are scalars at a fixed site and (time)
     // arrays on a mobile platform; element 0 is the right answer either way.
     let scalar = |name: &str| -> Option<f32> {
@@ -679,7 +708,7 @@ fn parse_site(file: &Nc3File<'_>) -> RadarSite {
     }
 }
 
-fn parse_time_coverage_start(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
+fn parse_time_coverage_start(file: &dyn NcSource) -> Option<DateTime<Utc>> {
     // Either a char variable or a global attribute, ISO8601 "...Z".
     let text = match file.read_var("time_coverage_start") {
         Ok(NcArray::Char(chars)) => {
@@ -698,8 +727,8 @@ fn parse_time_coverage_start(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
 /// something other than seconds, or does not parse; the caller then reads
 /// ray times as offsets from `time_coverage_start`, which is what the
 /// attribute says on every file where the two epochs agree.
-fn time_units_epoch(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
-    let units = file.vars.get("time")?.attr_str("units")?;
+fn time_units_epoch(file: &dyn NcSource) -> Option<DateTime<Utc>> {
+    let units = file.vars().get("time")?.attr_str("units")?;
     let (unit, epoch) = units.split_once(" since ")?;
     if !matches!(
         unit.trim().to_ascii_lowercase().as_str(),

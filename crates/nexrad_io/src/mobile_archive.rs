@@ -6,7 +6,7 @@
 //! several radars in one archive (a Goodland deployment zip carries
 //! `DORADE/DOW7/...` next to `DORADE/COW2/...`). This module discovers radar
 //! members, groups DORADE sweeps into volume scans, and decodes everything
-//! into [`radar_core::RadarVolume`]s. `.msg31`/`AR2V` members are routed back
+//! into [`radar_core::RadarVolume`]s. `.msg31`/Archive II members (either tape identifier) are routed back
 //! through this crate's Level II decoder.
 //!
 //! Sibling-directory grouping for loose (non-zip) sweepfiles lives here too:
@@ -96,8 +96,6 @@ use crate::dorade::{
 use crate::{NexradError, Result, decode_volume_from_bytes};
 
 const ZIP_LOCAL_FILE_MAGIC: &[u8; 4] = b"PK\x03\x04";
-/// Archive II volume-header magic; `.msg31` deployment twins carry it.
-const VOLUME_HEADER_MAGIC: &[u8; 4] = b"AR2V";
 /// Mobile deployments can contain hundreds of real sweeps, but retaining an
 /// unbounded archive before parallel decode lets a zip bomb or an accidental
 /// multi-day tree exhaust memory. These ceilings are deliberately much larger
@@ -135,7 +133,7 @@ pub struct MobileVolume {
 ///
 /// This is the crate entry point for deployment archives. DORADE members
 /// group per instrument into ascending fixed-angle runs (see the module
-/// docs); `.msg31`/`AR2V` members decode one volume each through the Level II
+/// docs); `.msg31`/Archive II members decode one volume each through the Level II
 /// decoder. Non-radar members are ignored; a corrupt radar member fails the
 /// whole load with a descriptive error, because a deployment archive with
 /// undecodable scans should be visible rather than silently thinner.
@@ -143,7 +141,8 @@ pub fn decode_deployment_zip(bytes: &[u8]) -> Result<Vec<MobileVolume>> {
     let members = read_zip_radar_members(bytes, "zip archive")?;
     if members.is_empty() {
         return Err(invalid_archive(
-            "zip archive contains no radar members (swp.* or .msg31/AR2V)".to_owned(),
+            "zip archive contains no radar members (swp.* sweepfiles or .msg31/Archive II volumes)"
+                .to_owned(),
         ));
     }
     decode_members(None, members)
@@ -156,7 +155,7 @@ pub fn decode_deployment_zip_from_path(path: &Path) -> Result<Vec<MobileVolume>>
     let members = read_zip_radar_members(&bytes, &label)?;
     if members.is_empty() {
         return Err(invalid_archive(format!(
-            "zip archive {label} contains no radar members (swp.* or .msg31/AR2V)"
+            "zip archive {label} contains no radar members (swp.* sweepfiles or .msg31/Archive II volumes)"
         )));
     }
     decode_members(Some(&label), members)
@@ -174,7 +173,7 @@ pub fn decode_mobile_dir_from_path(dir: &Path) -> Result<Vec<MobileVolume>> {
     collect_dir_members(dir, dir, &mut members, &mut budget, 0)?;
     if members.is_empty() {
         return Err(invalid_archive(format!(
-            "folder {} contains no radar files (swp.* sweepfiles or .msg31/AR2V)",
+            "folder {} contains no radar files (swp.* sweepfiles or .msg31/Archive II volumes)",
             dir.display()
         )));
     }
@@ -232,9 +231,16 @@ struct RadarMember {
 }
 
 /// Content sniff: the name pre-filter only narrows the candidates.
+///
+/// The Archive II arm tests [`crate::ARCHIVE_II_MAGICS`] — the SAME pair the
+/// top-level router tests — so a pre-2008 `ARCHIVE2` tape inside a
+/// deployment zip decodes exactly as it does loose on disk. Testing only
+/// `AR2V` here dropped such a member without a word: `decode_deployment_zip`
+/// keeps what this returns `true` for and never sees the rest, so a legacy
+/// volume did not fail to decode, it failed to EXIST.
 fn looks_like_radar_member(bytes: &[u8]) -> bool {
     looks_like_dorade_bytes(bytes)
-        || bytes.starts_with(VOLUME_HEADER_MAGIC)
+        || crate::starts_with_archive_ii_magic(bytes)
         || bytes.starts_with(&[0x1f, 0x8b])
         || bytes.starts_with(b"BZh")
 }
@@ -1243,6 +1249,41 @@ mod tests {
         assert_eq!(
             volumes[0].volume.metadata.decoded_radial_count, loose.metadata.decoded_radial_count,
             "the archive member and the loose file are the same decode"
+        );
+    }
+
+    /// A pre-2008 `ARCHIVE2` tape inside a deployment zip decodes, exactly
+    /// as the same bytes do loose on disk.
+    ///
+    /// [`crate::sniff_supported_volume_format`] accepts BOTH Archive II tape
+    /// identifiers — `AR2V` and the pre-2008 `ARCHIVE2` — so a legacy volume
+    /// dropped on the app opens. The archive member sniff used to test only
+    /// `AR2V`, which silently dropped a legacy member from a deployment zip:
+    /// no error, no skip count, just a volume that was not there. The two
+    /// sniffs share [`crate::ARCHIVE_II_MAGICS`] now so they cannot drift.
+    #[test]
+    fn a_legacy_archive2_member_decodes_inside_a_deployment_zip() {
+        let tape = crate::tests::synthetic_legacy_archive();
+        assert!(
+            tape.starts_with(b"ARCHIVE2"),
+            "fixture should be a pre-2008 tape, not an AR2V volume"
+        );
+        let archive = build_zip(&[("DOW7/KTLX_19940604_120000.raw", tape.clone(), METHOD_STORE)]);
+
+        let volumes = decode_deployment_zip(&archive).expect("archive decodes");
+        assert_eq!(volumes.len(), 1, "one legacy member, one volume");
+        assert_eq!(volumes[0].member_label, "DOW7/KTLX_19940604_120000.raw");
+
+        // The same bytes loose on disk decode identically, so the archive
+        // path is not a second, weaker reader.
+        let loose = crate::decode_volume_from_bytes(&tape).expect("loose tape decodes");
+        assert_eq!(
+            volumes[0].volume.metadata.decoded_radial_count, loose.metadata.decoded_radial_count,
+            "the archive member and the loose file are the same decode"
+        );
+        assert!(
+            volumes[0].volume.metadata.decoded_radial_count > 0,
+            "a legacy tape should yield radials, not an empty volume"
         );
     }
 

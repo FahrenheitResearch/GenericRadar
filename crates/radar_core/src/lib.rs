@@ -240,7 +240,93 @@ impl From<MomentType> for ProductId {
     }
 }
 
+/// What the signal processor recombined before the moment was written.
+///
+/// Decoded from the CONTROL FLAGS byte of the generic data moment header
+/// (NEXRAD ICD 2620002W, Build 22.0, 05 June 2023, Table XVII-B, "Data Block
+/// (Descriptor of Generic Data Moment Type)", byte 18, Code*1). The ICD gives
+/// four codes: 0 none, 1 recombined azimuthal radials, 2 recombined range
+/// gates, 3 recombined radials and range gates to legacy resolution.
+///
+/// Recombination is not the same thing as a coarse sweep. A cut collected
+/// natively at 1.0 degree azimuth reports code 0, because nothing was
+/// combined - it was never finer. Only the codes above mean the data on disk
+/// is coarser than what the radar measured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum MomentRecombination {
+    /// Code 0: gates and radials are as collected.
+    None,
+    /// Code 1: azimuthal radials were recombined.
+    AzimuthalRadials,
+    /// Code 2: range gates were recombined.
+    RangeGates,
+    /// Code 3: radials and range gates were recombined to legacy resolution.
+    RadialsAndRangeGates,
+    /// A code the ICD does not define, carried through rather than guessed at.
+    Unknown(u8),
+}
+
+impl MomentRecombination {
+    /// Decode the CONTROL FLAGS byte (ICD 2620002W Table XVII-B, byte 18).
+    pub fn from_control_flags(code: u8) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::AzimuthalRadials,
+            2 => Self::RangeGates,
+            3 => Self::RadialsAndRangeGates,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// True when the ICD code says the stored data is coarser than what was
+    /// collected. An undefined code is not claimed to mean anything.
+    pub fn reduces_resolution(&self) -> bool {
+        matches!(
+            self,
+            Self::AzimuthalRadials | Self::RangeGates | Self::RadialsAndRangeGates
+        )
+    }
+
+    /// What was recombined, in words, for display beside the sweep's facts.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "not recombined",
+            Self::AzimuthalRadials => "azimuthal radials recombined",
+            Self::RangeGates => "range gates recombined",
+            Self::RadialsAndRangeGates => "radials and range gates recombined to legacy resolution",
+            Self::Unknown(_) => "undocumented control flag",
+        }
+    }
+}
+
+/// Print an SNR threshold without rounding a real setting into a wrong one.
+///
+/// The field is quantized to 0.125 dB (NEXRAD ICD 2620002W, Build 22.0,
+/// 05 June 2023, Table XVII-B), so three decimals are lossless and any fewer
+/// can misreport an operator's choice - 2.125 dB would print as "2.1". Three
+/// decimals with the padding zeros trimmed gives "2.0", "3.5", and "2.125"
+/// alike.
+///
+/// It lives here, beside the value it prints and beside
+/// [`MomentRecombination::label`], rather than inside whichever application
+/// happens to draw it. A number an analyst reads off one screen and quotes on
+/// another has to be spelled the same both times; two copies of this rounding
+/// rule is exactly how the two spellings would drift apart.
+pub fn format_snr_threshold_db(threshold_db: f32) -> String {
+    let mut text = format!("{threshold_db:.3}");
+    while text.ends_with('0') && !text.ends_with(".0") {
+        text.pop();
+    }
+    text
+}
+
 /// Compact moment grid for one sweep. Rows are linked back to radial indices.
+///
+/// `snr_threshold_db` and `recombination` describe what the operational
+/// processor did to this moment before the file was written. They are
+/// `Option` because only the NEXRAD generic data moment header carries them:
+/// a Message 1 volume, or any of the other formats this workspace reads, has
+/// no equivalent field and must show nothing rather than a made-up zero.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MomentGrid {
     pub moment: MomentType,
@@ -249,6 +335,11 @@ pub struct MomentGrid {
     pub offset: f32,
     pub nodata: Option<u16>,
     pub range_folded: Option<u16>,
+    /// Signal-to-noise ratio, in dB, below which the processor censored gates
+    /// out of this moment. An adaptable site parameter, not a constant.
+    pub snr_threshold_db: Option<f32>,
+    /// Whether this moment's gates or radials were combined before writing.
+    pub recombination: Option<MomentRecombination>,
     pub radial_indices: Vec<usize>,
     pub storage: MomentStorage,
 }
@@ -269,6 +360,8 @@ impl MomentGrid {
             offset,
             nodata: nodata.map(u16::from),
             range_folded: range_folded.map(u16::from),
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: Vec::new(),
             storage: MomentStorage::U8(Vec::new()),
         }
@@ -289,6 +382,8 @@ impl MomentGrid {
             offset,
             nodata,
             range_folded,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: Vec::new(),
             storage: MomentStorage::U16(Vec::new()),
         }
@@ -590,6 +685,113 @@ pub struct VolumeMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every CONTROL FLAGS code in NEXRAD ICD 2620002W Table XVII-B, and the
+    /// words each one turns into. Codes 1-3 are pinned here because no real
+    /// volume this workspace has decoded uses them - a VCP 212 file is code 0
+    /// on all 46,440 of its moment blocks, including its natively 1.0-degree
+    /// batch cuts - so the mapping has no other proof.
+    #[test]
+    fn control_flags_map_to_recombination_text() {
+        assert_eq!(
+            MomentRecombination::from_control_flags(0),
+            MomentRecombination::None
+        );
+        assert_eq!(
+            MomentRecombination::from_control_flags(1),
+            MomentRecombination::AzimuthalRadials
+        );
+        assert_eq!(
+            MomentRecombination::from_control_flags(2),
+            MomentRecombination::RangeGates
+        );
+        assert_eq!(
+            MomentRecombination::from_control_flags(3),
+            MomentRecombination::RadialsAndRangeGates
+        );
+        assert_eq!(
+            MomentRecombination::from_control_flags(4),
+            MomentRecombination::Unknown(4)
+        );
+        assert_eq!(
+            MomentRecombination::from_control_flags(255),
+            MomentRecombination::Unknown(255)
+        );
+
+        assert!(!MomentRecombination::None.reduces_resolution());
+        assert!(MomentRecombination::AzimuthalRadials.reduces_resolution());
+        assert!(MomentRecombination::RangeGates.reduces_resolution());
+        assert!(MomentRecombination::RadialsAndRangeGates.reduces_resolution());
+        // An undefined code is not evidence of anything, so it must not be
+        // reported as a resolution loss.
+        assert!(!MomentRecombination::Unknown(7).reduces_resolution());
+
+        assert_eq!(MomentRecombination::None.label(), "not recombined");
+        assert_eq!(
+            MomentRecombination::AzimuthalRadials.label(),
+            "azimuthal radials recombined"
+        );
+        assert_eq!(
+            MomentRecombination::RangeGates.label(),
+            "range gates recombined"
+        );
+        assert_eq!(
+            MomentRecombination::RadialsAndRangeGates.label(),
+            "radials and range gates recombined to legacy resolution"
+        );
+        assert_eq!(
+            MomentRecombination::Unknown(9).label(),
+            "undocumented control flag"
+        );
+    }
+
+    /// The words an SNR threshold is read out in. 0.125 dB is the field's
+    /// quantum, so every value it can hold has to survive the trip through
+    /// the string rather than being rounded into a setting no operator dialled
+    /// in.
+    #[test]
+    fn snr_threshold_text_keeps_one_decimal_and_loses_nothing() {
+        assert_eq!(format_snr_threshold_db(2.0), "2.0");
+        assert_eq!(format_snr_threshold_db(3.5), "3.5");
+        assert_eq!(format_snr_threshold_db(2.125), "2.125");
+        assert_eq!(format_snr_threshold_db(0.25), "0.25");
+        assert_eq!(format_snr_threshold_db(20.0), "20.0");
+        assert_eq!(format_snr_threshold_db(-12.0), "-12.0");
+        assert_eq!(format_snr_threshold_db(0.0), "0.0");
+    }
+
+    /// A grid built by either constructor starts with no censoring facts, so
+    /// a decoder that cannot supply them cannot accidentally imply a 0.0 dB
+    /// threshold or an un-recombined sweep.
+    #[test]
+    fn new_moment_grids_claim_no_censoring_facts() {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 250,
+            gate_count: 1,
+        };
+        let u8_grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range.clone(),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        let u16_grid = MomentGrid::new_u16(
+            MomentType::DifferentialPhase,
+            gate_range,
+            2.8361,
+            2.0,
+            Some(0),
+            Some(1),
+        );
+
+        assert_eq!(u8_grid.snr_threshold_db, None);
+        assert_eq!(u8_grid.recombination, None);
+        assert_eq!(u16_grid.snr_threshold_db, None);
+        assert_eq!(u16_grid.recombination, None);
+    }
 
     #[test]
     fn moment_grid_scales_compact_u8_rows() {

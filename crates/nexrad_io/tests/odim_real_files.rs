@@ -23,8 +23,9 @@
 //!   under a v0 superblock and old-style groups, and float64 gzip-chunked
 //!   data planes. Fetched 2026-07-07 from the OPERA ORD 24h bucket
 //!   (`.../2026/07/07/ES/espdg/PVOL/espdg@20260707T1927@0.5_1.5@
-//!   DBZH_VRADH.h5`) — the object that first required `hdf5lite` to learn
-//!   the v2 header dialect, and the only fixture here that covers it.
+//!   DBZH_VRADH.h5`, CC BY 4.0 — EUMETNET OPERA / AEMET) — the object that
+//!   first required `hdf5lite` to learn the v2 header dialect, and the only
+//!   fixture here that covers it.
 //! - `tests/data/seang.scan.20260820.dbzh_th_vradh.h5`: SMHI Sweden
 //!   Ängelholm SCAN, 2026-08-20 00:00 UTC, one 0.5° sweep of DBZH + TH +
 //!   VRADH, H5rad 2.4 with SIGNED int16 planes and a UTF-8 site name. Fetched

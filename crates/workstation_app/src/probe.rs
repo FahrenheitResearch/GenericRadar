@@ -90,9 +90,22 @@ pub enum ProbeReading {
     /// A gate was found, and it holds no number. `state` says which kind of
     /// nothing: a beam that swept and found no echo, a range-folded gate whose
     /// value belongs at another range, or unusable data.
+    ///
+    /// The indices ride along for the same reason [`ProbeValue`] carries them:
+    /// a gate that is THERE and blank is still a gate, and a reader that wants
+    /// to say why it is blank - the Level 1 spectrum panel does - has to be
+    /// able to find it. Without them the only honest answer a reader could
+    /// give was silence, which is how "this gate is empty, and here is why"
+    /// became "no panel at all" for exactly the gates the question is about.
     Absent {
         state: CellState,
         location: ProbeLocation,
+        /// Row within the moment grid. See [`ProbeValue::row`].
+        row: usize,
+        gate: usize,
+        /// Range to the centre of the gate, metres, as in
+        /// [`ProbeValue::slant_range_m`].
+        slant_range_m: f64,
     },
     /// No gate at all: past the last gate, inside the first, in an azimuth gap
     /// the renderer leaves unpainted, or in a cut or moment that is not there.
@@ -217,6 +230,9 @@ pub fn probe_polar(
         return ProbeReading::Absent {
             state: CellState::QualityMasked,
             location,
+            row,
+            gate,
+            slant_range_m,
         };
     }
 
@@ -239,10 +255,16 @@ pub fn probe_polar(
         Some(_) => ProbeReading::Absent {
             state: CellState::NoData,
             location,
+            row,
+            gate,
+            slant_range_m,
         },
         None => ProbeReading::Absent {
             state: absent_state(grid, raw_word(grid, row, gate)),
             location,
+            row,
+            gate,
+            slant_range_m,
         },
     }
 }
@@ -287,9 +309,9 @@ pub fn format_reading(
             }
             text
         }
-        ProbeReading::Absent { state, location } => {
-            format_absent(short_name, *state, location, units, range_decimals)
-        }
+        ProbeReading::Absent {
+            state, location, ..
+        } => format_absent(short_name, *state, location, units, range_decimals),
         ProbeReading::OutsideSweep(location) => format_absent(
             short_name,
             CellState::NoCoverage,
@@ -617,6 +639,9 @@ mod tests {
             ProbeReading::Absent {
                 state: CellState::QualityMasked,
                 location: *uncensored_location(&uncensored),
+                row: uncensored.row,
+                gate: uncensored.gate,
+                slant_range_m: uncensored.slant_range_m,
             }
         );
         assert!(reading.value().is_none());
@@ -643,6 +668,9 @@ mod tests {
                 azimuth_deg: 90.0,
                 screen_range_km: 10.0,
             },
+            row: 0,
+            gate: 40,
+            slant_range_m: 10_000.0,
         };
         let text = format_reading(
             &reading,
@@ -675,6 +703,9 @@ mod tests {
                         azimuth_deg: 90.0,
                         screen_range_km: 10.0,
                     },
+                    row: 0,
+                    gate: 40,
+                    slant_range_m: 10_000.0,
                 },
                 &reflectivity_domain(),
                 "REF",

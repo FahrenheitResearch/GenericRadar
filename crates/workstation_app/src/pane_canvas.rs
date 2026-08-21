@@ -120,6 +120,10 @@ pub struct PaneOverlay<'a> {
     pub badges: &'a [String],
     /// The formatted value under the cursor, from the previous frame.
     pub probe: Option<&'a str>,
+    /// The Doppler spectrum of the gate under the cursor, for a NEXRAD Level 1
+    /// (time series) file. `None` for every other format, which carries no
+    /// pulses to transform.
+    pub spectrum: Option<&'a crate::iq_spectrum_ui::GateSpectrum>,
 }
 
 /// A radar site at a known world position, ready to draw and hit-test.
@@ -427,6 +431,11 @@ pub fn draw_pane(
     }
     if let Some(probe) = overlay.probe {
         draw_probe_readout(&painter, rect, probe, chrome_color(map.chrome.probe_ink));
+    }
+    // Above the probe readout in the draw order and on the opposite side of the
+    // pane from the legend, so the three readouts do not stack on one corner.
+    if let Some(spectrum) = overlay.spectrum {
+        crate::iq_spectrum_ui::draw_gate_spectrum(&painter, rect, spectrum);
     }
     draw_tile_attribution(&painter, rect, map);
     // The header is the last thing drawn on the data and under the active
@@ -2588,6 +2597,7 @@ mod tests {
             product_name: "REF",
             badges: &[],
             probe: None,
+            spectrum: None,
         };
         let mut camera = camera;
         let mut last = None;

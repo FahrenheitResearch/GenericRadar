@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Frame rate, mode switching, clamps, focus.
+    // Adversarial pass: frame rate, mode switching, clamps, focus.
     // ------------------------------------------------------------------
 
     /// The eye and view direction the renderer will actually use, whichever

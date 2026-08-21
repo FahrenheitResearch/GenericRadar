@@ -100,7 +100,11 @@
 //! builds a fresh context per image.
 //!
 //! `--window` opens the sample panel live on a real display, with a toggle
-//! per registered theme.
+//! per registered theme. Without it nothing is opened at all: the capture
+//! above builds a `wgpu` device with no surface, so this run has no window to
+//! put anywhere - unlike the harnesses that photograph through
+//! `eframe::run_native`, which cannot work that way. See
+//! `../src/harness_window.rs`.
 
 // The whole application, compiled into this example exactly as `src/main.rs`
 // compiles it. The directory `#[path]` is what makes each module's own child
@@ -114,8 +118,11 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
+    pub mod iq_session;
+    pub mod iq_spectrum_ui;
     pub mod legend;
     pub mod live_service;
     pub mod load_service;
@@ -131,6 +138,7 @@ mod source {
     pub mod product_availability;
     pub mod product_picker;
     pub mod render_service;
+    pub mod research_sites;
     pub mod settings_ui;
     pub mod sites_service;
     pub mod sweep;
@@ -144,11 +152,19 @@ mod source {
 }
 
 pub(crate) use source::{
-    annotation, app, app_support, gate_filter_ui, hazards, legend, live_service, load_service,
-    nearest_site, net_tuning, north_up, palette_editor, palettes, pane_canvas, popup, probe,
-    product, product_availability, product_picker, render_service, settings_ui, sites_service,
-    sweep, theme, units, user_tables, vol3d, vrot, warnings_service, xsection,
+    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
+    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
+    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
+    units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
+
+// The one place a harness decides whether it may take over a display. Held
+// apart from the `source` block above because it is policy for the harness,
+// not application code the harness is photographing.
+#[allow(dead_code)]
+#[path = "../src/harness_window.rs"]
+mod harness_window;
 
 use std::path::{Path, PathBuf};
 
@@ -163,11 +179,14 @@ const WIDTH_POINTS: u32 = 896;
 const HEIGHT_POINTS: u32 = 640;
 
 fn main() {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if arguments.iter().any(|argument| argument == "--window") {
+    // The only mode that opens a window, and it is reached only when the
+    // operator typed `--window`. The default below renders through `wgpu`
+    // with no surface and no window at all.
+    if harness_window::requested_by_process() == harness_window::WindowRequest::Asked {
         run_window();
         return;
     }
+    let arguments = harness_window::positional_arguments();
     let value_of = |name: &str| {
         arguments
             .iter()
@@ -1030,6 +1049,8 @@ impl eframe::App for GalleryApp {
 
 fn run_window() {
     let options = eframe::NativeOptions {
+        // Reached only when `--window` was asked for by name. A real window
+        // is the point of this mode: it is the one a person drives by hand.
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WIDTH_POINTS as f32, HEIGHT_POINTS as f32 + 40.0]),
         ..Default::default()

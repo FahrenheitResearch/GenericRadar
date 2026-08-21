@@ -45,8 +45,9 @@
 //!   code: a new item in the catalog - or a whole category contributed by
 //!   another crate - appears in the window with zero changes here. That is
 //!   the contract `docs/extending.md` documents.
-//! * `app.rs` applies changed values to the live application and mirrors
-//!   live state back into the store.
+//! * `app.rs` (human-wired; see the integration notes) applies changed
+//!   values to the live application and mirrors live state back into the
+//!   store.
 //!
 //! The non-generic sections are both on the Radar page, and both are there
 //! because colour tables are not scalar knobs. The picker edits the live
@@ -62,7 +63,8 @@
 //! a minimum 24-point hit height.
 
 // Explicit child paths, not the defaults. This module is compiled in two
-// homes - as `workstation_app::settings_ui`, and via the `#[path]` include in
+// homes - as `workstation_app::settings_ui` once the human-owned `mod`
+// wiring lands, and until then via the `#[path]` include in
 // `crates/settings/tests/workstation_settings_ui.rs` - and a `#[path]`-loaded
 // module resolves DEFAULT child paths beside the loaded file (mod-rs
 // semantics), which in the harness is `src/`, where `palettes.rs` names a

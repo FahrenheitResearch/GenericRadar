@@ -5,9 +5,13 @@
 //!
 //! * `data/swp.1260521225514.COW2.229.1.0_SUR_v215.head24` — the first 37,380
 //!   bytes (all descriptor blocks plus the first 24 ray groups, cut at a block
-//!   boundary) of a CSWR COW2 surveillance sweepfile: Radx-written,
+//!   boundary) of a surveillance sweepfile whose descriptors name the
+//!   instrument `COW2` and the project `BOULDER`: Radx-written,
 //!   **big-endian**, **HRD RLE compressed**, CSFD gate geometry, staggered
-//!   PRT, Radx `_F` filtered field names.
+//!   PRT, Radx `_F` filtered field names. Who operated that deployment is not
+//!   recorded anywhere in this repository — an earlier version of this comment
+//!   said CSWR with nothing behind it — so `DATA-SOURCES.md` carries it as
+//!   provenance not established rather than as a credit.
 //! * `data/swp.1090509143923.NOXPRVP.0.0.5_PPI_v1.head3` — the first 51,832
 //!   bytes (descriptor blocks plus 3 ray groups, cut at a block boundary) of a
 //!   VORTEX-2 NOXP sweepfile: **little-endian**, **uncompressed**, Sigmet

@@ -1,4 +1,4 @@
-// Compute-cached lighting for the 3D radar explorer.
+// Compute-cached lighting for BowEcho's 3D radar explorer.
 //
 // RGB stores an outward threshold-surface normal encoded to 0..1. Alpha stores
 // scalar palette-preserving illumination divided by `encode_max`. The source

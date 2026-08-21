@@ -1098,6 +1098,10 @@ fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            // DORADE carries no NEXRAD generic data moment header, so there
+            // is no censoring threshold or recombination code here.
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: Vec::new(),
             storage: MomentStorage::F32(Vec::new()),
         },

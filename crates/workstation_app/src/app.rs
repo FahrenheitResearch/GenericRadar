@@ -129,6 +129,36 @@ const OPEN_PATH_HINT: &str = "NEXRAD Level II (.ar2v/.gz/.bz2/_V06, or no extens
      GR2Analyst .msg31, ODIM_H5 (.h5/.hdf/.hd5), CfRadial (.nc), or a mobile deployment .zip. \
      Files can also be dropped on the window.";
 
+/// What the SNR threshold readout on the bar means, and why the number is
+/// worth a place next to the tilt it describes.
+///
+/// The point of showing it at all: a weak field that is missing from the
+/// picture may never have been written, and this is the number that says how
+/// much was thrown away before the file existed.
+const SNR_THRESHOLD_HINT: &str = "Signal-to-noise threshold this sweep was censored at, from \
+     the Level 2 moment header. Gates weaker than this were discarded by the operational \
+     processor before the file was written, so they are missing from the product, not from \
+     the atmosphere. The operator sets it per site; the floor is -12.0 dB and 2.0 dB is \
+     typical.";
+
+/// What the recombination notice on the bar means. Shown only when the control
+/// flags claim a loss, so its presence is the whole message.
+const RESOLUTION_REDUCED_HINT: &str = "The control flags in this sweep's moment header say the \
+     processor combined gates or radials before writing, so this sweep is coarser on disk \
+     than the radar collected it.";
+
+/// Truncation bounds for the two censoring readouts on the menu bar.
+///
+/// `bevel::sunken_readout` truncates its galley at the width it is given, so
+/// these are not cosmetic: a bound below the longest text a readout can carry
+/// would silently ellipsize the statement rather than let the row wrap. The
+/// wide one holds the longest recombination label there is, and
+/// `a_recombined_sweep_states_its_loss_in_full` draws both readouts at their
+/// longest and checks neither galley was elided, so shrinking either fails
+/// rather than clips.
+const SNR_READOUT_WIDTH: f32 = 220.0;
+const RESOLUTION_NOTICE_WIDTH: f32 = 560.0;
+
 const MAX_LOAD_RESULTS_PER_FRAME: usize = 4;
 const MAX_RENDER_RESULTS_PER_FRAME: usize = 4;
 const TIMELINE_HEIGHT: f32 = 34.0;
@@ -199,6 +229,11 @@ struct PaneRuntime {
     /// kilometres, and the readout built from it.
     hovered_world_km: Option<(f64, f64)>,
     probe_text: Option<String>,
+    /// The Doppler spectrum of the gate the readout above named, for a
+    /// NEXRAD Level 1 file. Built beside `probe_text` and from the same
+    /// reading, so the plot and the numbers can never describe two different
+    /// gates. `None` for every other format.
+    spectrum: Option<crate::iq_spectrum_ui::GateSpectrum>,
     /// Turns bursty radial arrivals into a clockwise wipe. One per pane,
     /// because two panes can be following different tilts of the same volume.
     sweep: SweepAnimator,
@@ -302,6 +337,14 @@ struct SettingsCache {
     xsection_top_m: f32,
     /// Data: how long the timeline holds each frame while looping.
     loop_frame_time: Duration,
+    /// NEXRAD Level 1: the dwell, window and censor the moments of an open
+    /// time-series file are estimated with. Not a display preference - see
+    /// [`crate::iq_session`] - so a change re-runs the estimator rather than
+    /// merely repainting.
+    iq_controls: crate::iq_session::IqControls,
+    /// Which receiver channel the spectrum readout transforms: 0 horizontal,
+    /// 1 vertical.
+    iq_spectrum_channel: usize,
     /// Which gates are allowed to be painted. `GateFilter::OFF` is the shipped
     /// value; anything else and every pane draws a FILTERED band saying so.
     /// Cached here because the paint path reads it once per pane per frame -
@@ -326,6 +369,8 @@ impl Default for SettingsCache {
             annotation: crate::annotation::Annotation::default(),
             xsection_top_m: crate::xsection::DEFAULT_TOP_M,
             loop_frame_time: PLAYBACK_FRAME_TIME,
+            iq_controls: crate::iq_session::IqControls::default(),
+            iq_spectrum_channel: 0,
             gate_filter: render2d::GateFilter::OFF,
         }
     }
@@ -369,6 +414,14 @@ pub struct WorkstationApp {
     /// documented fallback, which badges itself ASSUMED so nobody mistakes it
     /// for a sounding.
     hail_environment: product_engine::HailEnvironment,
+    /// The open NEXRAD Level 1 (time series) record, when one is open.
+    ///
+    /// Held on the application rather than in the history because it is not a
+    /// frame: it is the PULSES the current frame was estimated from, and it is
+    /// what the Level 1 settings re-run and what the spectrum readout
+    /// transforms. `None` whenever the current frame came from a file that
+    /// arrived with its moments already made, which is every other format.
+    iq: Option<Box<crate::iq_session::IqSession>>,
     /// The 3D volume explorer. Its own window, so opening it does not disturb
     /// the pane layout an analyst has set up.
     vol3d: crate::vol3d::Vol3d,
@@ -415,6 +468,10 @@ pub struct WorkstationApp {
     /// `settings_ui::PaletteOfferCache`.
     palette_offers: crate::settings_ui::PaletteOfferCache,
     source_path_text: String,
+    /// The `Open…` window. Held here rather than rebuilt per frame because it
+    /// owns the folder it is looking at, the identifications it has already
+    /// paid for, and the channel its scan thread answers on.
+    file_browser: crate::file_browser::FileBrowser,
     status: String,
     load_ms: Option<f32>,
     last_playback_step: Instant,
@@ -494,6 +551,7 @@ impl WorkstationApp {
             workspace: WorkspaceState::default(),
             history: VolumeHistory::default(),
             hail_environment: product_engine::HailEnvironment::climatological_fallback(),
+            iq: None,
             vol3d: crate::vol3d::Vol3d::default(),
             xsection: crate::xsection::XSection::default(),
             vrot_active: false,
@@ -528,6 +586,7 @@ impl WorkstationApp {
             user_tables_rescan_pending: false,
             palette_offers: crate::settings_ui::PaletteOfferCache::default(),
             source_path_text,
+            file_browser: crate::file_browser::FileBrowser::new(context.clone()),
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
@@ -1032,6 +1091,18 @@ impl WorkstationApp {
                     .effective_int(registry, keys::data::CATEGORY, keys::data::LOOP_FRAME_MS)
                     .max(0) as u64,
             ),
+            // The store has already clamped the dwell into the catalog's
+            // declared range; `max(1)` is only about the `i64 as usize` cast,
+            // which would turn a negative into an enormous positive and ask
+            // the estimator for a dwell longer than any record.
+            iq_controls: iq_controls_from(registry, store),
+            iq_spectrum_channel: usize::from(
+                store.effective_text(
+                    registry,
+                    keys::timeseries::CATEGORY,
+                    keys::timeseries::SPECTRUM_CHANNEL,
+                ) == crate::settings_ui::catalog::timeseries_limits::CHANNEL_VERTICAL,
+            ),
             // Read, never written back. Unlike quality and the basemap, the
             // filter is not mirrored from live state every frame - it has no
             // live state other than the store - so a settings file carrying an
@@ -1209,6 +1280,12 @@ impl WorkstationApp {
                 self.invalidate_view_panes(self.workspace.visible_panes());
             }
             (keys::vol3d::CATEGORY, _) => self.apply_vol3d_settings(),
+            // The one settings page that changes a MEASUREMENT rather than a
+            // picture of one. The dwell, the window and the censor decide what
+            // the moments ARE on a Level 1 file, so the estimator is re-run
+            // over the pulses already in memory and the frame is replaced.
+            // Nothing here reads the file again.
+            (keys::timeseries::CATEGORY, _) => self.apply_timeseries_settings(),
             // The network policy lives in the live worker and the data layer
             // rather than in the cache, so it is pushed rather than read.
             // `recompute_settings_cache` already does this for every change;
@@ -1253,6 +1330,43 @@ impl WorkstationApp {
     /// `allow`, not `expect`: dead code is judged per compilation unit, and
     /// this method has a caller in one (the example) and none in the other
     /// (the binary), so an `expect` would be unfulfilled in the example.
+    /// The volume currently on the panes.
+    ///
+    /// `pub(crate)` for `examples/iq_proof.rs`, which counts the radials a
+    /// dwell change produced. Reading the radial count off the shipped state is
+    /// the difference between proving the slider reached the ESTIMATOR and
+    /// proving it reached the settings file, which is the thing that would pass
+    /// while the field never changed.
+    ///
+    /// `allow`, not `expect`: dead code is judged per compilation unit, and
+    /// this has a caller in the example and none in the binary.
+    #[allow(dead_code)]
+    pub(crate) fn current_volume(&self) -> Option<&RadarVolume> {
+        self.history.current().map(|frame| frame.volume.as_ref())
+    }
+
+    /// Write a settings value and take the application through the same two
+    /// steps the settings window's own dispatch runs afterwards.
+    ///
+    /// `pub(crate)` for `examples/iq_proof.rs`, and deliberately not a
+    /// shortcut: a proof that reached into `settings_cache` directly would
+    /// photograph a field the shipped path never produced. The ORDER here is
+    /// the shipped order - apply, then recompute - which is exactly why
+    /// `apply_timeseries_settings` reads the store rather than the cache.
+    ///
+    /// `allow`, not `expect`: see [`Self::current_volume`].
+    #[allow(dead_code)]
+    pub(crate) fn apply_setting_for_proof(
+        &mut self,
+        category: &str,
+        id: &str,
+        value: settings::SettingValue,
+    ) {
+        self.settings_store.set(category, id, value);
+        self.apply_changed_setting(category, id);
+        self.recompute_settings_cache();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn settings_ui_mut(&mut self) -> &mut crate::settings_ui::SettingsUi {
         &mut self.settings_ui
@@ -1562,6 +1676,7 @@ impl WorkstationApp {
             origin: FrameOrigin::Local,
             final_stage: FrameStage::Complete,
             source_label,
+            iq_controls: self.settings_cache.iq_controls,
         }) {
             self.status = format!("load worker is closed: {}", request.path.display());
         }
@@ -1617,10 +1732,124 @@ impl WorkstationApp {
     }
 
     fn poll_site_directory(&mut self) {
+        let mut arrived = false;
         while let Some(sites) = self.sites_service.try_recv() {
             self.sites = sites;
             // Force a reprojection against the current anchor.
             self.placed_sites_projection = None;
+            arrived = true;
+        }
+        if arrived {
+            self.locate_time_series_frame();
+        }
+    }
+
+    /// A site in the directory, by id.
+    fn located_site(&self, site_id: &str) -> Option<&LocatedSite> {
+        self.sites
+            .iter()
+            .find(|site| site.id.eq_ignore_ascii_case(site_id))
+    }
+
+    /// Where a Level 1 record's radar stood, or nothing.
+    ///
+    /// Two catalogs, asked in this order and only this order.
+    ///
+    /// 1. The station directory the application already keeps for its site
+    ///    markers, which is the NWS OPERATIONAL feed. If a site is in there,
+    ///    that is the position, full stop.
+    /// 2. [`crate::research_sites`], a small sourced table of the research and
+    ///    testbed radars whose time series are published and which the
+    ///    operational feed therefore does not list. KOUN - NSSL's research
+    ///    WSR-88D at Norman, and the radar the archived Level 1 records are
+    ///    mostly from - is the reason it exists.
+    ///
+    /// The order is the point. The operational feed is fetched, cached and
+    /// re-fetched; the supplementary table is frozen in the binary. Asking the
+    /// frozen one second means a position that moves in the published feed
+    /// moves here too, and a stale line in this repository can never quietly
+    /// override it.
+    ///
+    /// Still `Option`, and the `None` still reaches the pane as POSITION
+    /// UNKNOWN. A name in neither catalog gets no position at all rather than
+    /// the nearest plausible one: the sweep's ranges and azimuths are real
+    /// without a geography, and a fabricated antenna position under real
+    /// weather is the failure this whole path is shaped around.
+    ///
+    /// Returns an owned site rather than a borrow because the two catalogs
+    /// have different lifetimes - one is a `Vec` field, the other is
+    /// `'static` - and because both callers immediately copy the fields out
+    /// to build a `radar_core::RadarSite` anyway.
+    fn time_series_site(&self, site_id: &str) -> Option<LocatedSite> {
+        if let Some(published) = self.located_site(site_id) {
+            return Some(published.clone());
+        }
+        crate::research_sites::research_site(site_id).map(|site| LocatedSite {
+            id: site.id.to_owned(),
+            name: Some(site.name.to_owned()),
+            latitude_deg: site.latitude_deg,
+            longitude_deg: site.longitude_deg,
+        })
+    }
+
+    /// Give an already-installed Level 1 frame the position the directory has
+    /// just supplied.
+    ///
+    /// The directory is fetched on its own thread and cached on disk, so on a
+    /// cold machine it lands SECONDS after a file dropped at startup has
+    /// already been decoded and installed. Without this the record keeps the
+    /// position it was installed with - none - for the whole session, and the
+    /// sweep never reaches the basemap however long the analyst waits.
+    ///
+    /// Only a frame that has no position is touched. A volume that stated its
+    /// own coordinates is never overwritten by a directory entry: the file is
+    /// the better authority about where its own radar was.
+    ///
+    /// A record whose site is in [`Self::time_series_site`]'s supplementary
+    /// research table was already placed when it was installed and so never
+    /// reaches the lookup below - the table is in the binary and does not
+    /// arrive.
+    fn locate_time_series_frame(&mut self) {
+        let Some(session) = self.iq.as_ref() else {
+            return;
+        };
+        let Some(frame) = self.history.current() else {
+            return;
+        };
+        if frame.volume.site.latitude_deg.is_some() {
+            return;
+        }
+        let Some(located) = self.time_series_site(session.site_id()) else {
+            return;
+        };
+        let (name, latitude, longitude) = (
+            located.name.clone(),
+            located.latitude_deg,
+            located.longitude_deg,
+        );
+        let mut volume = (*frame.volume).clone();
+        volume.site.name = name;
+        volume.site.latitude_deg = Some(latitude as f32);
+        volume.site.longitude_deg = Some(longitude as f32);
+        let (origin, stage, source_label) = (frame.origin, frame.stage, frame.source_label.clone());
+        self.history.install(VolumeFrame::new(
+            Arc::new(volume),
+            origin,
+            stage,
+            source_label,
+        ));
+        // Anchoring moves the ground under every camera, so this goes through
+        // the same door a loaded volume does rather than setting the anchor
+        // here and leaving the cameras where they were.
+        if self.map_scene.set_radar_anchor(latitude, longitude) {
+            let changed = self.workspace.leave_overview(
+                PLACEHOLDER_KM_PER_POINT,
+                analyst_runtime::DEFAULT_KM_PER_POINT,
+            );
+            self.invalidate_view_panes(&changed);
+            self.placed_sites_projection = None;
+            self.frame_clock.bump();
+            self.reset_all_panes();
         }
     }
 
@@ -1768,6 +1997,10 @@ impl WorkstationApp {
                         origin: FrameOrigin::Live,
                         final_stage: stage,
                         source_label,
+                        // A live volume is never a time series - Level 1 is
+                        // archive material and there is no feed of it - so
+                        // this is carried only so the request has one shape.
+                        iq_controls: self.settings_cache.iq_controls,
                     }) {
                         self.status = format!("load worker is closed: {}", request.path.display());
                     }
@@ -1836,9 +2069,36 @@ impl WorkstationApp {
         }
     }
 
-    fn install_loaded_volume(&mut self, loaded: LoadedVolume) {
+    fn install_loaded_volume(&mut self, mut loaded: LoadedVolume) {
         if loaded.generation != self.session_clock.current() {
             return;
+        }
+        // A NEXRAD Level 1 record brings its pulses with it. Take them before
+        // the volume is moved into the history, and give the volume the site
+        // position the record could not: the RVP8 header states a processor
+        // name and no coordinates, so without this the sweep is drawn in
+        // radar-local kilometres over whatever the map was anchored on before.
+        //
+        // This is a lookup in two catalogs, not a guess: the operational
+        // station directory the application already keeps for its site
+        // markers, and - only when that has no answer - the sourced table of
+        // research radars in `crate::research_sites`, which is where KOUN and
+        // the rest of the archived time series live. See
+        // `Self::time_series_site`. A record whose site is in NEITHER keeps no
+        // position at all rather than borrowing one.
+        //
+        // Any frame that is not a time series clears the session, so the knobs
+        // and the spectrum readout can never act on pulses that belong to a
+        // file the analyst has moved on from.
+        self.iq = loaded.iq.take();
+        if let Some(session) = self.iq.as_ref()
+            && let Some(located) = self.time_series_site(session.site_id())
+        {
+            let mut volume = (*loaded.volume).clone();
+            volume.site.name.clone_from(&located.name);
+            volume.site.latitude_deg = Some(located.latitude_deg as f32);
+            volume.site.longitude_deg = Some(located.longitude_deg as f32);
+            loaded.volume = Arc::new(volume);
         }
         // Anchor the map at the radar this volume came from. Re-anchoring is a
         // no-op when the site is unchanged; a genuine site change moves the
@@ -1897,6 +2157,20 @@ impl WorkstationApp {
                 // kilometres now names a different place on earth.
                 self.xsection.clear_line();
             }
+        } else if opening && self.iq.is_some() {
+            // A Level 1 record whose site is not in the station directory. The
+            // RVP8 header carries no coordinates, so there is no anchor to set
+            // and nothing to reproject - but the camera still has to leave the
+            // continental overview, or an analyst who opened a file is shown a
+            // hemisphere with a 125 km speck on it and no way to know the sweep
+            // is there. The kilometres are radar-local, which is exactly what
+            // this hand-over is documented to keep: see
+            // `WorkspaceState::leave_overview`.
+            let changed = self.workspace.leave_overview(
+                PLACEHOLDER_KM_PER_POINT,
+                analyst_runtime::DEFAULT_KM_PER_POINT,
+            );
+            self.invalidate_view_panes(&changed);
         }
 
         let before = self.current_frame_signature();
@@ -2196,6 +2470,7 @@ impl WorkstationApp {
         let active = self.workspace.active_pane;
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
+        let mut open_browser = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
@@ -2246,11 +2521,22 @@ impl WorkstationApp {
                             .hint_text("Radar volume file path"),
                     )
                     .on_hover_text(OPEN_PATH_HINT);
-                    if ui.button("Load file").clicked() && !self.source_path_text.trim().is_empty()
-                    {
-                        requested_load = Some(PathBuf::from(self.source_path_text.trim()));
-                        ui.close();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Load file").clicked()
+                            && !self.source_path_text.trim().is_empty()
+                        {
+                            requested_load = Some(PathBuf::from(self.source_path_text.trim()));
+                            ui.close();
+                        }
+                        // Beside the box rather than instead of it. Typing a
+                        // path stays the fastest way in for somebody who
+                        // knows it; browsing is for the folder nobody has
+                        // memorised.
+                        if ui.button("Browse…").clicked() {
+                            open_browser = true;
+                            ui.close();
+                        }
+                    });
                     bevel::etched_separator(ui);
                     // The one place a running application names the active
                     // profile: unobtrusive - a menu nobody has to open - and
@@ -2529,6 +2815,19 @@ impl WorkstationApp {
                 if bevel::toolbar_button(ui, "+ Tilt").clicked() {
                     tilt_delta = 1;
                 }
+                // Immediately after the stepper, because these describe the
+                // sweep the stepper chose. Readout wells rather than bare
+                // labels, so they keep the bar's grammar and stay legible on
+                // whatever ground the theme paints.
+                let (snr_readout, resolution_notice) = self.active_censoring_readouts();
+                if let Some(readout) = &snr_readout {
+                    bevel::sunken_readout(ui, 0.0, SNR_READOUT_WIDTH, readout.as_str())
+                        .on_hover_text(SNR_THRESHOLD_HINT);
+                }
+                if let Some(notice) = &resolution_notice {
+                    bevel::sunken_readout(ui, 0.0, RESOLUTION_NOTICE_WIDTH, notice.as_str())
+                        .on_hover_text(RESOLUTION_REDUCED_HINT);
+                }
 
                 bevel::etched_separator(ui);
                 // Sized, not `desired_width`: a text edit laid out from its font
@@ -2631,6 +2930,9 @@ impl WorkstationApp {
             self.invalidate_view_panes(self.workspace.visible_panes());
         }
 
+        if open_browser {
+            self.show_file_browser();
+        }
         if let Some(path) = requested_load {
             self.begin_load(path);
         }
@@ -2674,6 +2976,7 @@ impl WorkstationApp {
         let active = self.workspace.active_pane;
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
+        let mut open_browser = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
@@ -2697,6 +3000,16 @@ impl WorkstationApp {
             .on_hover_text(OPEN_PATH_HINT);
             if ui.button("Load").clicked() && !self.source_path_text.trim().is_empty() {
                 requested_load = Some(PathBuf::from(self.source_path_text.trim()));
+            }
+            if ui
+                .button("Browse…")
+                .on_hover_text(
+                    "Look through a folder. Every file is read rather than judged by its name, \
+                     so a volume stored without an extension still says what it is.",
+                )
+                .clicked()
+            {
+                open_browser = true;
             }
 
             ui.separator();
@@ -2929,6 +3242,15 @@ impl WorkstationApp {
             if ui.button("+ Tilt").clicked() {
                 tilt_delta = 1;
             }
+            // The same two facts as on the menu bar, in this style's plain
+            // widgets: one readout, one definition of what it says.
+            let (snr_readout, resolution_notice) = self.active_censoring_readouts();
+            if let Some(readout) = &snr_readout {
+                ui.label(readout).on_hover_text(SNR_THRESHOLD_HINT);
+            }
+            if let Some(notice) = &resolution_notice {
+                ui.label(notice).on_hover_text(RESOLUTION_REDUCED_HINT);
+            }
             if ui
                 .selectable_label(cameras_linked, "Link cameras")
                 .clicked()
@@ -3024,6 +3346,9 @@ impl WorkstationApp {
             self.invalidate_view_panes(self.workspace.visible_panes());
         }
 
+        if open_browser {
+            self.show_file_browser();
+        }
         if let Some(path) = requested_load {
             self.begin_load(path);
         }
@@ -3115,6 +3440,44 @@ impl WorkstationApp {
     /// The volume it previews on is the one the timeline has selected - the
     /// frame on screen - so a palette is judged against the storm the analyst
     /// is looking at rather than against a gradient.
+    /// Put the `Open…` window up.
+    ///
+    /// The folder it lands in is the one the last session read successfully.
+    /// Only when nothing has ever been stored does the path in the box get a
+    /// say, and then only as the folder it sits in: somebody who reached a
+    /// volume by typing its path almost always wants the next one from
+    /// beside it.
+    fn show_file_browser(&mut self) {
+        let typed = self.source_path_text.trim();
+        let near = (!typed.is_empty()).then(|| PathBuf::from(typed));
+        self.file_browser.show(
+            &self.settings_store,
+            &self.settings_registry,
+            near.as_deref(),
+        );
+    }
+
+    /// Draw the `Open…` window and load whatever it was pointed at.
+    ///
+    /// A file chosen here goes through `begin_load` - the same door a typed
+    /// path and a dropped file use - so there is exactly one loading path in
+    /// the application and browsing cannot acquire behaviour of its own.
+    fn file_browser_window(&mut self, context: &egui::Context) {
+        let units = self.settings_cache.units;
+        let outcome = crate::file_browser::draw_file_browser(
+            context,
+            &mut self.file_browser,
+            crate::file_browser::FileBrowserInput {
+                units,
+                store: &mut self.settings_store,
+            },
+        );
+        if let Some(path) = outcome.open {
+            self.source_path_text = path.display().to_string();
+            self.begin_load(path);
+        }
+    }
+
     fn palette_editor_window(&mut self, context: &egui::Context) {
         if !self.palette_editor.open {
             return;
@@ -3192,6 +3555,88 @@ impl WorkstationApp {
         self.xsection.window(context, &input);
     }
 
+    /// Whether the frame on screen knows where on earth it was measured.
+    ///
+    /// True when there is no frame at all: an empty instrument showing the
+    /// basemap it opened on is not claiming anything about a sweep.
+    ///
+    /// An RVP8 time-series header carries a signal-processor name and no
+    /// coordinates, so a Level 1 record's position is a lookup - see
+    /// [`Self::time_series_site`]. The research radars the archives are made of
+    /// are placed from a table in the binary and are located the instant they
+    /// are opened; anything else waits on the station directory, which is a
+    /// network fetch cached on disk and therefore simply absent on a cold
+    /// machine or an offline one. Until it lands - or if the site is in neither
+    /// catalog, which is the permanent case - the sweep's ranges and azimuths
+    /// are real and its geography does not exist.
+    fn frame_position_is_known(&self) -> bool {
+        self.history
+            .current()
+            .is_none_or(|frame| frame.volume.site.latitude_deg.is_some())
+    }
+
+    /// The map underlay, markers and projection this pane may draw.
+    ///
+    /// # Why a sweep with no position gets no map
+    ///
+    /// Everything geographic in here is anchored on a radar position, and a
+    /// frame that has none is drawn wherever the map anchor happened to be
+    /// left. The pane then makes two statements at once: the header says
+    /// POSITION UNKNOWN, and underneath it labelled counties and a
+    /// four-decimal cursor readout say precisely where the storm is. One of
+    /// those is a fabricated position, and it is the one drawn in the largest
+    /// type - a KOUN stare from Norman, Oklahoma was photographed over Smith
+    /// and Osborne counties, Kansas, with a confident lat/lon under the
+    /// cursor.
+    ///
+    /// So an unlocated frame gets no basemap, no imagery, no site markers, no
+    /// warning polygons and - because the coordinate half of the corner
+    /// readout is computed through this projection - no coordinates. What
+    /// stays is everything that is true without a position: the sweep, the
+    /// range rings, and the range and azimuth from the antenna. The moment the
+    /// directory lands, `locate_time_series_frame` gives the frame its
+    /// position and all of it comes back.
+    fn pane_map(&mut self, pane: PaneId, camera: Camera2D, pane_rect: egui::Rect) -> PaneMap {
+        let located = self.frame_position_is_known();
+        PaneMap {
+            // Ask the scene for this pane's LOD. Once resident this is a cache
+            // lookup; it queues a build only when the bucket is new.
+            geometry: located
+                .then(|| {
+                    self.map_scene
+                        .geometry_for_pane(pane.index(), camera.sanitized().km_per_point)
+                })
+                .flatten(),
+            tiles: located
+                .then(|| {
+                    self.map_scene
+                        .tiles_for_pane(pane.index(), camera, pane_rect)
+                })
+                .flatten(),
+            projection: located.then(|| self.map_scene.projection()).flatten(),
+            // Paint-time colours for the chosen basemap look. Read from the
+            // style the controller is holding rather than stored beside it,
+            // so the picker has exactly one thing to set. Kept even with no
+            // map: it is what the pane clears to, and a pane with no ground
+            // colour is not more honest, only darker.
+            chrome: map_scene::MapChrome::for_style(self.map_scene.style()),
+            sites: if located {
+                Arc::clone(&self.placed_sites)
+            } else {
+                Arc::from([])
+            },
+            site_labels: self.settings_cache.site_labels,
+            annotation: self.settings_cache.annotation,
+            units: self.settings_cache.units,
+            active_site: self.live_site.clone(),
+            hazards: if located {
+                Arc::clone(&self.placed_hazards)
+            } else {
+                Arc::from([])
+            },
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         // One clock read for the whole canvas, so four panes cannot disagree
         // about what time it is by a few microseconds and print two different
@@ -3228,27 +3673,7 @@ impl WorkstationApp {
                 .and_then(|volume| self.resolve_cut_index(pane, volume));
             let title = pane_title(volume.as_deref(), pane, product, cut_index);
             let status = self.pane_header_status(pane, product, now);
-            // Ask the scene for this pane's LOD. Once resident this is a cache
-            // lookup; it queues a build only when the bucket is new.
-            let pane_map = PaneMap {
-                geometry: self
-                    .map_scene
-                    .geometry_for_pane(pane.index(), camera.sanitized().km_per_point),
-                tiles: self
-                    .map_scene
-                    .tiles_for_pane(pane.index(), camera, pane_rect),
-                projection: self.map_scene.projection(),
-                // Paint-time colours for the chosen basemap look. Read from the
-                // style the controller is holding rather than stored beside it,
-                // so the picker has exactly one thing to set.
-                chrome: map_scene::MapChrome::for_style(self.map_scene.style()),
-                sites: Arc::clone(&self.placed_sites),
-                site_labels: self.settings_cache.site_labels,
-                annotation: self.settings_cache.annotation,
-                units: self.settings_cache.units,
-                active_site: self.live_site.clone(),
-                hazards: Arc::clone(&self.placed_hazards),
-            };
+            let pane_map = self.pane_map(pane, camera, pane_rect);
             let badges = self.pane_badges(product, now);
             let interaction = {
                 let texture =
@@ -3281,6 +3706,7 @@ impl WorkstationApp {
                     product_name: product.descriptor().short_name,
                     badges: &badges,
                     probe: self.panes[pane.index()].probe_text.as_deref(),
+                    spectrum: self.panes[pane.index()].spectrum.as_ref(),
                 };
                 draw_pane(
                     ui,
@@ -4053,10 +4479,12 @@ impl WorkstationApp {
     ) {
         let Some((east_km, north_km)) = self.panes[pane.index()].hovered_world_km else {
             self.panes[pane.index()].probe_text = None;
+            self.panes[pane.index()].spectrum = None;
             return;
         };
         let (Some(volume), Some(cut_index)) = (volume, cut_index) else {
             self.panes[pane.index()].probe_text = None;
+            self.panes[pane.index()].spectrum = None;
             return;
         };
         let descriptor = product.descriptor();
@@ -4093,6 +4521,138 @@ impl WorkstationApp {
             self.settings_cache.units,
             self.settings_cache.annotation.range_decimals,
         ));
+        // Built from the SAME reading, so the plot and the numbers beside it
+        // can never be describing two different gates - which is what would
+        // happen if the panel re-derived the gate from the cursor position
+        // under its own rounding.
+        self.panes[pane.index()].spectrum = self.gate_spectrum_for(&reading);
+    }
+
+    /// The spectrum panel for a probe reading, when a Level 1 record is open.
+    ///
+    /// The probe's `row` is the moment grid's row, which for a processed sweep
+    /// is the dwell index, and its `gate` is the gate column - the two indices
+    /// `sweep_gate_spectrum` takes. That correspondence is what lets a hover
+    /// over a rendered pixel become the transform of the pulses that pixel was
+    /// made from.
+    fn gate_spectrum_for(
+        &self,
+        reading: &crate::probe::ProbeReading,
+    ) -> Option<crate::iq_spectrum_ui::GateSpectrum> {
+        let session = self.iq.as_ref()?;
+        let channel = self.settings_cache.iq_spectrum_channel;
+        let (row, gate, range_m, blank) = match reading {
+            crate::probe::ProbeReading::Value(value) => {
+                (value.row, value.gate, value.slant_range_m as f32, None)
+            }
+            // A gate that is there and blank still gets a panel: "this gate is
+            // empty, and here is why" is the answer to the question the
+            // analyst asked by hovering, and it matters most here - the whole
+            // point of the SNR censor knob is that what an analyst moving it
+            // is asking is what got removed. Every emitted moment of a
+            // censored gate is NaN, so this is the reading such a gate
+            // produces; returning `None` for it left the branch below - and
+            // the sentence it exists to write - unreachable.
+            crate::probe::ProbeReading::Absent {
+                row,
+                gate,
+                slant_range_m,
+                state,
+                ..
+            } => (*row, *gate, *slant_range_m as f32, Some(*state)),
+            // Outside the sweep there is no gate to report on and the panel
+            // goes away.
+            crate::probe::ProbeReading::OutsideSweep(_) => return None,
+        };
+        let estimate = session
+            .processed()
+            .dwell(row)
+            .and_then(|dwell| dwell.get(gate));
+        if let Some(absence) = gate_spectrum_absence(blank, estimate) {
+            return Some(crate::iq_spectrum_ui::GateSpectrum {
+                spectrum: None,
+                estimator_velocity_mps: None,
+                range_m,
+                channel,
+                absence: Some(absence),
+            });
+        }
+        match session.spectrum(row, gate, channel) {
+            Ok(spectrum) => Some(crate::iq_spectrum_ui::GateSpectrum {
+                range_m: spectrum.range_m,
+                spectrum: Some(spectrum),
+                estimator_velocity_mps: estimate
+                    .map(|estimate| estimate.velocity_mps)
+                    .filter(|velocity| velocity.is_finite()),
+                channel,
+                absence: None,
+            }),
+            // A single-polarisation record asked for its vertical channel is
+            // the case this reaches: say so rather than showing an empty frame.
+            Err(error) => Some(crate::iq_spectrum_ui::GateSpectrum {
+                spectrum: None,
+                estimator_velocity_mps: None,
+                range_m,
+                channel,
+                absence: Some(error),
+            }),
+        }
+    }
+
+    /// Re-estimate the open time-series record with the settings now in force.
+    ///
+    /// Cheap enough to do on the UI thread and measured before it was left
+    /// there: the reference record is 1,830 pulses of 248 gates, and one
+    /// pass over it at a 64-pulse dwell is a few milliseconds across the
+    /// rayon pool the estimator already uses. It is not a file read and not a
+    /// network call, so there is nothing here worth the complexity of a worker
+    /// and a generation clock.
+    ///
+    /// A refusal - a staggered-PRT record, a dwell longer than the record - is
+    /// reported and the previous field is LEFT on screen. Blanking the pane
+    /// would lose the picture the analyst already had over a slider they can
+    /// simply drag back.
+    fn apply_timeseries_settings(&mut self) {
+        let controls = iq_controls_from(&self.settings_registry, &self.settings_store);
+        let Some(session) = self.iq.as_mut() else {
+            return;
+        };
+        match session.set_controls(controls) {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                self.status = format!("Level 1: {error}");
+                return;
+            }
+        }
+        // The site was resolved when the file was opened; re-resolving it here
+        // would drop the position on a settings change if the directory had
+        // since been cleared.
+        let site = self
+            .history
+            .current()
+            .map(|frame| frame.volume.site.clone())
+            .unwrap_or_else(|| radar_core::RadarSite::new(session.site_id()));
+        let source_label = session.source_label().to_owned();
+        let provenance = session.provenance();
+        let mut volume = session.volume(site);
+        volume.metadata.source_path = Some(source_label.clone());
+        self.history.install(VolumeFrame::new(
+            Arc::new(volume),
+            FrameOrigin::Local,
+            FrameStage::Complete,
+            source_label,
+        ));
+        // The frame's identity and stage are unchanged - same site, same
+        // volume time - so nothing downstream can notice by comparing
+        // signatures. The clock bump is what puts the re-estimated field on
+        // screen, and the capabilities are dropped because the cut's radial
+        // count changed with the dwell.
+        self.capabilities = None;
+        self.capabilities_for = None;
+        self.frame_clock.bump();
+        self.reset_all_panes();
+        self.status = format!("Level 1: {provenance}");
     }
 
     fn resolve_cut_index(&self, pane: PaneId, volume: &RadarVolume) -> Option<usize> {
@@ -4271,6 +4831,64 @@ impl WorkstationApp {
             .unwrap_or_else(|| "Unavailable".to_owned())
     }
 
+    /// What the operational processor did to the sweep the active pane is
+    /// drawing, before it wrote the file: the signal-to-noise threshold it
+    /// censored this moment at, and - only when the control flags claim it -
+    /// that what is on disk is coarser than what the radar collected.
+    ///
+    /// Beside the tilt readout and read off the same cut that readout
+    /// resolves, because censoring is a property of the sweep on screen rather
+    /// than of the volume: on a split-cut VCP the surveillance leg and the
+    /// Doppler leg of one elevation are censored at different thresholds, and
+    /// a number that did not move when the tilt did would be describing the
+    /// wrong sweep.
+    ///
+    /// Both come back `None` when the source never stated them. Only the
+    /// NEXRAD generic data moment header carries these two fields (ICD
+    /// 2620002W, Build 22.0, 05 June 2023, Table XVII-B, bytes 16-17 and byte
+    /// 18); a Message 1 volume predates that block, and ODIM, CfRadial and
+    /// DORADE have no equivalent, so the bar says nothing rather than
+    /// implying a 0.0 dB threshold on an un-recombined sweep.
+    fn active_censoring_readouts(&self) -> (Option<String>, Option<String>) {
+        let Some(frame) = self.history.current() else {
+            return (None, None);
+        };
+        let pane = self.workspace.active_pane;
+        let moment =
+            DisplayProduct::from_product_id(&self.workspace.pane(pane).product).source_moment();
+        let Some(index) = self.resolve_cut_index(pane, &frame.volume) else {
+            return (None, None);
+        };
+        let Some(grid) = frame
+            .volume
+            .cuts
+            .get(index)
+            .and_then(|cut| cut.moments.get(&moment))
+        else {
+            return (None, None);
+        };
+        // `radar_core` owns both the rounding rule and the words, so this
+        // readout and any other reading of the same fields cannot drift into
+        // two spellings of one number.
+        let threshold = grid.snr_threshold_db.map(|threshold_db| {
+            format!(
+                "{} SNR threshold {} dB",
+                moment.short_name(),
+                radar_core::format_snr_threshold_db(threshold_db)
+            )
+        });
+        let resolution_loss = grid
+            .recombination
+            .filter(radar_core::MomentRecombination::reduces_resolution)
+            .map(|recombination| {
+                format!(
+                    "Resolution reduced on this sweep: {}",
+                    recombination.label()
+                )
+            });
+        (threshold, resolution_loss)
+    }
+
     /// How old the volume on screen is at `now`. `None` before the first one
     /// arrives.
     ///
@@ -4389,6 +5007,29 @@ impl WorkstationApp {
     /// is the common case and draws nothing.
     fn pane_badges(&self, product: DisplayProduct, now: DateTime<Utc>) -> Vec<String> {
         let mut badges: Vec<String> = Vec::new();
+        // Ahead of everything, including the stall badge. Every other badge in
+        // this stack qualifies a number the RADAR reported - it is old, it is
+        // partial, some of it is hidden. This one says the numbers are not the
+        // radar's at all: a Level 1 record carries pulses, and the field on
+        // screen is the one this application estimated from them under the
+        // settings currently in force. An analyst who cannot tell a computed
+        // field from a delivered one cannot tell which of the two they are
+        // about to quote.
+        if self.iq.is_some() {
+            // TWO badges, not one line. The legend stacks badges on their own
+            // rows and wraps within a row, so a single string is at the mercy
+            // of the column width: "LEVEL 1 · MOMENTS COMPUTED HERE" was cut to
+            // "MOMENTS COMPUT…" at 100 %, and "LEVEL 1 · COMPUTED" broke as
+            // "COMPUTE / D" at 160 % - a badge about honesty, snapped in half.
+            // Two short words each fit their own row at every scale the
+            // application offers, which was checked by photographing them.
+            //
+            // The whole sentence is on the pane header, which has the room. A
+            // badge's job is to catch the eye already reading the colour ladder
+            // and send it there.
+            badges.push("LEVEL 1".to_owned());
+            badges.push("COMPUTED".to_owned());
+        }
         // First in the stack, ahead of PARTIAL and the hail environment: the
         // badge list is truncated to `legend::MAX_BADGES`, and nothing else a
         // pane can say outranks "what you are looking at is not now". This puts
@@ -4501,6 +5142,41 @@ impl WorkstationApp {
                     .unwrap_or(current),
             );
         }
+        // The badge stack can be switched off with the legend; this row cannot,
+        // which is why the whole sentence goes here and the badge carries only
+        // the headline. It names the dwell, the window and the censor because
+        // on Level 1 those are part of the measurement: the same pulses under a
+        // different dwell are a different field, and two screenshots have no
+        // other way of telling an analyst which is which.
+        if let Some(session) = self.iq.as_ref() {
+            // Before the provenance, because it is the stronger caveat: it
+            // says what the picture below it now is.
+            //
+            // An RVP8 time-series header carries a signal-processor name and no
+            // coordinates, so the position comes from a catalog: the sourced
+            // research table in the binary, or the station directory, which is
+            // fetched over the network and cached and is therefore simply
+            // absent on a cold machine that is offline. A record from a radar
+            // in neither is never placed at all. The sweep is
+            // still drawn, because the ranges and azimuths are real and are
+            // what an analyst came for; the geography is not, and `pane_map`
+            // withholds it rather than anchoring it wherever the map happened
+            // to be left. This row is what tells the analyst that the empty
+            // ground under the sweep is an absence and not a basemap that
+            // failed to load.
+            if !self.frame_position_is_known() {
+                // Short on purpose. This row truncates from the RIGHT, and the
+                // provenance behind it is not decoration - it is what the field
+                // was made with. The first draft named the site and explained
+                // itself in a clause, and pushed "gates below 2.0 dB SNR left
+                // blank" off the end of the row. The site id is already on the
+                // timeline bar; what this has to say is what the pane is now
+                // showing, which is range and azimuth from an antenna and
+                // nothing about where on earth that antenna stood.
+                parts.push("POSITION UNKNOWN - radar-local kilometres only".to_owned());
+            }
+            parts.push(session.provenance());
+        }
         if self.live_feed_stalled(now) {
             parts.push(
                 if self.live_feed_archive_fallback() {
@@ -4511,6 +5187,12 @@ impl WorkstationApp {
                 .to_owned(),
             );
         }
+        // The age stays for a time series too. It is a true statement about the
+        // frame and the same one the timeline bar makes, and suppressing it
+        // here would leave the two rows disagreeing about the same file. An age
+        // is not a claim about a feed; the words that WOULD be - STALLED,
+        // ARCHIVE FALLBACK - are above, and a record with no feed behind it
+        // never reaches them.
         if let Some(age) = self.displayed_frame_age(now) {
             parts.push(format!("{} old", format_age(age)));
         }
@@ -4619,6 +5301,7 @@ impl eframe::App for WorkstationApp {
         self.vol3d_window(&context);
         self.xsection_window(&context);
         self.palette_editor_window(&context);
+        self.file_browser_window(&context);
         self.toolbar(ui);
         // No separator under the bar: the band paints its own raised bevel,
         // and a stock hairline immediately below it reads as a second, weaker
@@ -4737,6 +5420,118 @@ impl eframe::App for WorkstationApp {
 /// mistake is not fixed here, it is unrepresentable: the rule has no blend
 /// parameter to be given the wrong point for. This function stays because the
 /// caller's `world` really is a ground point and a reader should be told so.
+/// The Level 1 estimator settings a store holds.
+///
+/// Read straight from the store rather than from [`SettingsCache`], because the
+/// settings window's dispatch runs `apply_changed_setting` BEFORE
+/// `recompute_settings_cache`: an apply that read the cache would re-estimate
+/// the sweep with the settings from before the analyst moved the slider, and
+/// the field would lag one change behind the page describing it. Sharing this
+/// function between the cache and the apply is what makes that impossible
+/// rather than merely fixed once.
+fn iq_controls_from(
+    registry: &settings::SettingsRegistry,
+    store: &settings::SettingsStore,
+) -> crate::iq_session::IqControls {
+    use crate::settings_ui::catalog::keys;
+    crate::iq_session::IqControls {
+        // The store has already clamped this into the catalog's declared range;
+        // `max(1)` is only about the `i64 as usize` cast, which would turn a
+        // negative into an enormous positive and ask the estimator for a dwell
+        // longer than any record.
+        dwell_pulses: store
+            .effective_int(
+                registry,
+                keys::timeseries::CATEGORY,
+                keys::timeseries::DWELL_PULSES,
+            )
+            .max(1) as usize,
+        taper: iq_taper_from_id(&store.effective_text(
+            registry,
+            keys::timeseries::CATEGORY,
+            keys::timeseries::WINDOW,
+        )),
+        censor: iq_censor_from_db(store.effective_float(
+            registry,
+            keys::timeseries::CATEGORY,
+            keys::timeseries::SNR_MIN_DB,
+        )),
+    }
+}
+
+/// The window a stored id names.
+///
+/// Total, like every other settings resolution: the store has already checked
+/// the id against the declared options, and a value it could not check resolves
+/// to the estimator's own default rather than taking the page down. See
+/// `nexrad_io::iq_moments::taper::Taper`.
+pub(crate) fn iq_taper_from_id(id: &str) -> nexrad_io::iq_moments::taper::Taper {
+    use crate::settings_ui::catalog::timeseries_limits as limit;
+    use nexrad_io::iq_moments::taper::Taper;
+    match id {
+        limit::WINDOW_VON_HANN => Taper::VonHann,
+        limit::WINDOW_HAMMING => Taper::Hamming,
+        limit::WINDOW_BLACKMAN => Taper::Blackman,
+        _ => Taper::Rectangular,
+    }
+}
+
+/// The censor a stored dB reading means.
+///
+/// The leftmost stop of the slider means *off* - no threshold at all - and the
+/// comparison is against the declared floor rather than within a tolerance, on
+/// the same principle the gate filter's four criteria are read with: a number
+/// that is NEARLY the floor is still a threshold that is on, and a field
+/// reporting "no threshold" while hiding gates is the one failure this whole
+/// admission exists to prevent.
+pub(crate) fn iq_censor_from_db(db: f64) -> nexrad_io::iq_moments::estimator::SnrCensor {
+    use crate::settings_ui::catalog::timeseries_limits as limit;
+    use nexrad_io::iq_moments::estimator::SnrCensor;
+    if db <= limit::OFF_SNR_DB {
+        SnrCensor::Off
+    } else {
+        SnrCensor::MinDb(db as f32)
+    }
+}
+
+/// Why a gate has no spectrum to show, or `None` when it has one.
+///
+/// `blank` is the PANE's answer for that pixel - `None` when the pane drew a
+/// number there, otherwise the kind of nothing it drew - and `estimate` is what
+/// the pulses produced. Both are consulted, in that order, because they can
+/// answer for different reasons and the pane's answer is the one the analyst is
+/// looking at:
+///
+/// * a gate the pane's own gate filter removed is not on screen, so a plot of
+///   it would be a picture of something the pane deliberately left empty;
+/// * a gate whose `R(0)` never exceeded the receiver noise has no spectrum -
+///   transforming it would draw the receiver, which is what this panel exists
+///   not to do;
+/// * a gate the SNR censor hid is the case the censor knob is FOR, and saying
+///   which threshold hid it is the answer to what the analyst is asking.
+///
+/// A blank pixel the estimator cannot account for still gets a sentence rather
+/// than a plot: an empty pixel with a full spectrum drawn beside it is two
+/// statements about one gate that disagree.
+fn gate_spectrum_absence(
+    blank: Option<product_engine::stats::CellState>,
+    estimate: Option<&nexrad_io::iq_moments::estimator::GateEstimate>,
+) -> Option<String> {
+    use product_engine::stats::CellState;
+    if blank == Some(CellState::QualityMasked) {
+        return Some("hidden by the pane's gate filter".to_owned());
+    }
+    if let Some(estimate) = estimate {
+        if estimate.below_noise {
+            return Some("no power above the receiver noise".to_owned());
+        }
+        if estimate.censored {
+            return Some("below the SNR threshold".to_owned());
+        }
+    }
+    blank.map(|state| state.label().to_ascii_lowercase())
+}
+
 fn site_change_display_rotation(
     projection: &map_scene::RadarProjection,
     ground_centre: analyst_runtime::WorldPoint,
@@ -5375,6 +6170,7 @@ mod tests {
             let output = context.run_ui(egui::RawInput::default(), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     let overlay = crate::pane_canvas::PaneOverlay {
+                        spectrum: None,
                         legend: None,
                         table: None,
                         product_name: "REF",
@@ -5700,6 +6496,8 @@ mod tests {
                 keys::network::CATEGORY,
                 keys::annotation::CATEGORY,
                 keys::xsection::CATEGORY,
+                // The Level 1 page, which arrived with the time-series reader.
+                keys::timeseries::CATEGORY,
                 // ...and the page about all the other pages, last.
                 keys::profiles::CATEGORY,
             ],
@@ -5875,6 +6673,297 @@ mod tests {
         }
     }
 
+    // --- what the file says it threw away -----------------------------------
+    //
+    // Every generic data moment block in a Message 31 radial states the
+    // signal-to-noise threshold the operational processor censored that moment
+    // at, and whether it recombined the sweep before writing it (NEXRAD ICD
+    // 2620002W, Build 22.0, 05 June 2023, Table XVII-B, bytes 16-17 and byte
+    // 18). An analyst hunting a weak field that is not on the screen has to be
+    // able to tell "the atmosphere was empty" from "the processor threw it
+    // away before the file existed", and the bar is where this application
+    // says which.
+
+    /// The censoring readouts one toolbar frame drew, in BOTH chromes.
+    ///
+    /// Both every time, because the two are one setting apart: a readout added
+    /// to one and forgotten in the other is invisible to whichever half of the
+    /// analysts chose the other. Each style contributes its own entries, so a
+    /// statement drawn once per style comes back twice.
+    fn censoring_texts(app: &mut WorkstationApp) -> Vec<String> {
+        let mut drawn = Vec::new();
+        for style in [ToolbarStyle::Menus, ToolbarStyle::Everything] {
+            app.settings_cache.toolbar_style = style;
+            drawn.extend(toolbar_texts(app).into_iter().filter(|text| {
+                text.contains("SNR threshold") || text.starts_with("Resolution reduced")
+            }));
+        }
+        drawn
+    }
+
+    /// The text runs one toolbar frame had to clip to fit, flattened.
+    ///
+    /// A separate walk from `toolbar_texts` because `Galley::text` reports the
+    /// whole source string whether or not it was drawn whole (epaint 0.34.3,
+    /// `text_layout_types.rs`: "the full, non-elided text of the input job").
+    /// Comparing strings therefore cannot catch a readout that was ellipsized
+    /// on its way to the screen; `Galley::elided` is the flag that can.
+    fn toolbar_elided_texts(app: &mut WorkstationApp) -> Vec<String> {
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.elided => {
+                    found.push(text.galley.text().trim().to_owned());
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::default());
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1600.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.toolbar(ui),
+        );
+        let mut elided = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut elided);
+        }
+        elided
+    }
+
+    /// One of the io crate's real fixtures, loaded and measured.
+    fn app_showing(fixture: &str) -> WorkstationApp {
+        let path = crate::load_service::io_fixture(fixture);
+        let volume = nexrad_io::decode_supported_volume_from_path(&path)
+            .unwrap_or_else(|error| panic!("{} did not decode: {error}", path.display()));
+        let mut app = test_app();
+        install(&mut app, Arc::new(volume));
+        // What `canvas` does before it resolves a cut. Without it the tilt and
+        // the readout beside it answer from the fallback path rather than from
+        // the measured volume.
+        app.refresh_capabilities();
+        app
+    }
+
+    /// The number on the bar is the one in the file, and it follows the sweep
+    /// on screen rather than the volume.
+    ///
+    /// Real bytes: KDVN (Davenport, Iowa) 2026-08-19 19:28:02 UTC, VCP 212 -
+    /// four LDM records of the operational volume kept verbatim in the io
+    /// crate's fixtures. Reflectivity is drawn from the contiguous
+    /// surveillance half of the lowest split cut, censored at 2.0 dB;
+    /// velocity comes from the Doppler half of the same elevation, censored
+    /// harder at 3.5 dB. Across the whole 11 MB volume the field takes only
+    /// those two values, so a readout that answered 2.0 dB under velocity
+    /// would be describing the wrong half of the cut.
+    #[test]
+    fn the_bar_states_the_snr_threshold_the_sweep_on_screen_was_censored_at() {
+        let mut app = app_showing("KDVN20260819_192802_V06.rec0_1_7_79");
+        let active = app.workspace.active_pane;
+
+        app.apply_product_selection(active, DisplayProduct::Reflectivity);
+        assert_eq!(
+            censoring_texts(&mut app),
+            ["REF SNR threshold 2.0 dB"; 2],
+            "the surveillance leg of the lowest split cut was censored at 2.0 dB"
+        );
+
+        app.apply_product_selection(active, DisplayProduct::Velocity);
+        assert_eq!(
+            censoring_texts(&mut app),
+            ["VEL SNR threshold 3.5 dB"; 2],
+            "the Doppler leg of the same elevation was censored at 3.5 dB"
+        );
+
+        // The control flags are 0 on all 46,440 moment blocks of this volume,
+        // so nothing here may claim a resolution loss. `censoring_texts`
+        // collects both statements; only the threshold was drawn.
+        assert!(
+            !censoring_texts(&mut app)
+                .iter()
+                .any(|text| text.starts_with("Resolution reduced")),
+            "an un-recombined sweep was reported as coarsened"
+        );
+    }
+
+    /// Hovering the readout explains what the number cost, in both chromes.
+    ///
+    /// The number alone reads as trivia. The sentence under the pointer is the
+    /// part that earns it a place on the bar: the gates below the threshold
+    /// are missing from the PRODUCT, not from the atmosphere.
+    #[test]
+    fn hovering_the_snr_readout_says_what_the_number_costs() {
+        for style in [ToolbarStyle::Menus, ToolbarStyle::Everything] {
+            let mut app = app_showing("KDVN20260819_192802_V06.rec0_1_7_79");
+            app.settings_cache.toolbar_style = style;
+            let context = egui::Context::default();
+            crate::theme::apply(&context, &crate::theme::Appearance::default());
+
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+            let mut over = None;
+            let mut drawn = Vec::new();
+            // Find the readout, move the pointer onto it, then let the clock
+            // run without moving again: egui waits out
+            // `interaction.tooltip_delay` and wants the pointer STILL before it
+            // paints a tooltip, so a single hovering frame would draw nothing.
+            for pass in 0..4 {
+                let events = match (pass, over) {
+                    (1, Some(position)) => vec![egui::Event::PointerMoved(position)],
+                    _ => Vec::new(),
+                };
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(f64::from(pass)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.toolbar(ui),
+                );
+                let shapes: Vec<egui::Shape> = output
+                    .shapes
+                    .iter()
+                    .map(|clipped| clipped.shape.clone())
+                    .collect();
+                if over.is_none() {
+                    over = exact_text_position(&shapes, "REF SNR threshold 2.0 dB");
+                    assert!(
+                        over.is_some(),
+                        "the {style:?} bar drew no readout to hover. It drew: {:?}",
+                        shape_texts(&shapes)
+                    );
+                }
+                drawn = shape_texts(&shapes);
+            }
+            assert!(
+                drawn.iter().any(|text| text == SNR_THRESHOLD_HINT),
+                "hovering the {style:?} bar's readout explained nothing. It drew: {drawn:?}"
+            );
+        }
+    }
+
+    /// A sweep the processor coarsened before writing says so, whole.
+    ///
+    /// Hand-set flags, and they have to be: the control flags are 0 on every
+    /// one of the 46,440 moment blocks of the real volume above, and on every
+    /// other volume this repository has decoded, so no real bytes here can
+    /// drive this branch. `radar_core` pins the four ICD codes and the words
+    /// each becomes. What is pinned HERE is that both statements reach the bar,
+    /// and reach it whole: `bevel::sunken_readout` clips its galley at the
+    /// width it is handed, so a bound set below the longest label would quietly
+    /// ellipsize the one statement that says the picture is coarser than the
+    /// radar made it.
+    #[test]
+    fn a_recombined_sweep_states_its_loss_in_full() {
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new("KTLX"), Utc::now());
+        let gates = radar_core::GateRange {
+            first_gate_m: 2_125,
+            gate_spacing_m: 250,
+            gate_count: 4,
+        };
+        let cut = volume.push_cut(0.5, Some(1));
+        cut.radials.push(radar_core::Radial {
+            azimuth_deg: 0.0,
+            elevation_deg: 0.5,
+            time_offset_ms: 0,
+            gate_range: gates.clone(),
+            nyquist_velocity_mps: None,
+            radial_status: None,
+        });
+        let mut grid = radar_core::MomentGrid::new_u8(
+            radar_core::MomentType::Reflectivity,
+            gates,
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        // 2.125 dB is a value the 0.125 dB quantum can hold and one decimal
+        // cannot print, so the rounding rule is exercised on the way through
+        // as well.
+        grid.snr_threshold_db = Some(2.125);
+        grid.recombination = Some(radar_core::MomentRecombination::RadialsAndRangeGates);
+        grid.push_u8_row_slice(0, &[0_u8; 4])
+            .expect("an 8-bit row belongs in an 8-bit grid");
+        cut.moments
+            .insert(radar_core::MomentType::Reflectivity, grid);
+
+        let mut app = test_app();
+        install(&mut app, Arc::new(volume));
+        app.refresh_capabilities();
+        assert_eq!(
+            censoring_texts(&mut app),
+            [
+                "REF SNR threshold 2.125 dB",
+                "Resolution reduced on this sweep: radials and range gates recombined to legacy \
+                 resolution",
+                "REF SNR threshold 2.125 dB",
+                "Resolution reduced on this sweep: radials and range gates recombined to legacy \
+                 resolution",
+            ],
+            "the bar did not state both facts about a recombined sweep"
+        );
+
+        for style in [ToolbarStyle::Menus, ToolbarStyle::Everything] {
+            app.settings_cache.toolbar_style = style;
+            let clipped: Vec<String> = toolbar_elided_texts(&mut app)
+                .into_iter()
+                .filter(|text| {
+                    text.contains("SNR threshold") || text.starts_with("Resolution reduced")
+                })
+                .collect();
+            assert!(
+                clipped.is_empty(),
+                "the {style:?} bar ellipsized a censoring statement: {clipped:?}"
+            );
+        }
+    }
+
+    /// A format that never stated these fields says nothing at all.
+    ///
+    /// The failure this forbids is a readout reading "REF SNR threshold 0.0
+    /// dB" over an ODIM sweep: a claim the file never made, and an invisible
+    /// one, because 0.0 dB is a plausible operational setting. Real files of
+    /// every other format the application opens, plus a grid built the way the
+    /// Message 1 path builds one - that path predates the generic data moment
+    /// block entirely and leaves both fields unset.
+    #[test]
+    fn a_volume_that_never_stated_a_threshold_draws_no_readout() {
+        for fixture in [
+            // SMHI Angelholm, 2026-08-20 00:00 UTC (OPERA ORD, CC BY 4.0).
+            "seang.scan.20260820.dbzh_th_vradh.h5",
+            // ARM X-SAPR at SGP, 2011-05-20, a 40-ray classic-netCDF PPI.
+            "cfrad.xsapr_sgp_ppi_20110520.classic.nc",
+            // VORTEX-2 NOXP, 2009-05-09 (doi:10.5281/zenodo.14194361).
+            "swp.1090509143923.NOXPRVP.0.0.5_PPI_v1.head3",
+        ] {
+            let mut app = app_showing(fixture);
+            let drawn = censoring_texts(&mut app);
+            assert!(
+                drawn.is_empty(),
+                "{fixture} carries no censoring fields, but the bar drew {drawn:?}"
+            );
+        }
+
+        let mut app = test_app();
+        install(&mut app, renderable_volume(1_760_000_000));
+        app.refresh_capabilities();
+        assert!(
+            censoring_texts(&mut app).is_empty(),
+            "a grid built without these fields was reported as if it had them"
+        );
+    }
+
     /// A one-cut, 360-radial reflectivity volume the real render worker can
     /// raster. Shape and encoding follow `probe.rs`'s test volume.
     fn renderable_volume(unix_seconds: i64) -> Arc<RadarVolume> {
@@ -5918,6 +7007,7 @@ mod tests {
     fn install(app: &mut WorkstationApp, volume: Arc<RadarVolume>) {
         let generation = app.session_clock.current();
         app.install_loaded_volume(LoadedVolume {
+            iq: None,
             generation,
             origin: FrameOrigin::Live,
             source_label: "test".to_owned(),
@@ -5931,6 +7021,7 @@ mod tests {
     fn install_partial(app: &mut WorkstationApp, volume: Arc<RadarVolume>) {
         let generation = app.session_clock.current();
         app.install_loaded_volume(LoadedVolume {
+            iq: None,
             generation,
             origin: FrameOrigin::Live,
             source_label: "test".to_owned(),
@@ -7288,8 +8379,8 @@ mod tests {
     /// while every unit test stayed green.
     ///
     /// The loud indicator this used to read - a full-width band under the
-    /// header - is gone. The pin did not go with it: the same claim is now
-    /// made against the pane HEADER, which
+    /// header - no longer exists. The pin did not move with it: the same
+    /// claim is now made against the pane HEADER, which
     /// is drawn unconditionally and which `pane_header_status` builds from the
     /// settings cache, so it is on the glass from the frame a criterion is set
     /// rather than from the frame the render lands.
@@ -8240,6 +9331,389 @@ mod tests {
             None,
             "the pane's statement outlived the filter"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Level 1: what a pane says about a gate it left blank, and what it may
+    // say about where the sweep was.
+    // -----------------------------------------------------------------------
+
+    /// A time-series sweep with a signal about 10 dB over the receiver noise.
+    ///
+    /// Synthetic on purpose, and only about the bookkeeping: the estimators
+    /// themselves are proved on real KOUN pulses in `nexrad_io`. What is being
+    /// exercised here is the path from a hovered pixel to a sentence, and for
+    /// that the sweep has to be (a) a stare at a known azimuth so a cursor can
+    /// be put on it, (b) long enough in range to be hovered at the scale a
+    /// pane opens on, and (c) at an SNR the censor slider can straddle: above
+    /// the shipped 2 dB threshold, below the 20 dB the slider reaches.
+    fn stare_sweep(site: &str) -> nexrad_io::iq::IqSweep {
+        use nexrad_io::iq::{IqPulse, IqSweep};
+        const PRT_S: f32 = 833.375e-6;
+        const NOISE_DBM: f32 = -80.5;
+        const SATURATION_DBM: f32 = 6.0;
+        const GATES: usize = 96;
+        // R(0) ten times the noise power, so S = 9 N and the SNR is 9.5 dB.
+        let noise_power = 10f32.powf((NOISE_DBM - SATURATION_DBM) / 10.0);
+        let amplitude = (10.0 * noise_power).sqrt();
+        let pulses = (0..512)
+            .map(|index| {
+                let phase = 0.3 * index as f32;
+                IqPulse {
+                    // A stare, like the reference Ascope records: the antenna
+                    // is parked, so every dwell is at one azimuth and a cursor
+                    // due east of the radar is on the spoke.
+                    azimuth_deg: 90.0,
+                    elevation_deg: 4.0,
+                    prt_seconds: PRT_S,
+                    prt_previous_seconds: PRT_S,
+                    h: (0..GATES)
+                        .map(|_| (amplitude * phase.cos(), amplitude * phase.sin()))
+                        .collect(),
+                    v: (0..GATES)
+                        .map(|_| (amplitude * phase.cos(), amplitude * phase.sin()))
+                        .collect(),
+                    ..IqPulse::default()
+                }
+            })
+            .collect();
+        IqSweep {
+            site: site.to_owned(),
+            time_utc: 1_369_079_161,
+            wavelength_m: 0.1108,
+            pulse_width_s: 1.5e-6,
+            gate_spacing_m: Some(500.0),
+            first_gate_m: 1_000.0,
+            range_bins: (0..GATES).map(|bin| 1_000.0 + 500.0 * bin as f32).collect(),
+            noise_dbm: [NOISE_DBM, NOISE_DBM],
+            dbz_calibration: -35.5,
+            saturation_dbm: SATURATION_DBM,
+            pulses,
+            ..IqSweep::default()
+        }
+    }
+
+    /// Open that sweep in the application, through the shipped install path.
+    fn install_time_series(app: &mut WorkstationApp, sweep: nexrad_io::iq::IqSweep) {
+        let session = crate::iq_session::IqSession::from_sweep(
+            sweep,
+            "stare.iqd",
+            crate::iq_session::IqControls::default(),
+        )
+        .expect("the fixture processes");
+        let site = radar_core::RadarSite::new(session.site_id());
+        let volume = Arc::new(session.volume(site));
+        let generation = app.session_clock.current();
+        app.install_loaded_volume(LoadedVolume {
+            iq: Some(Box::new(session)),
+            generation,
+            origin: FrameOrigin::Local,
+            source_label: "stare.iqd".to_owned(),
+            stage: FrameStage::Complete,
+            volume,
+            elapsed_ms: 1.0,
+        });
+    }
+
+    /// Put the pointer on the gate at `east_km`, `north_km` and return the
+    /// frame that reports it.
+    ///
+    /// The pane's scale is MEASURED rather than assumed: two probe frames give
+    /// the affine map from screen points to radar-local kilometres, which is
+    /// then inverted. A hard-coded pixel would silently start photographing
+    /// empty basemap the day the default camera, the window size or the
+    /// toolbar's height changed.
+    ///
+    /// Two frames at the end because the pane records where the pointer was
+    /// and probes it on the NEXT frame - deliberately, so the readout never
+    /// reaches into the volume mid-paint.
+    fn hover_radar_km(
+        app: &mut WorkstationApp,
+        context: &egui::Context,
+        east_km: f64,
+        north_km: f64,
+    ) -> Vec<egui::Shape> {
+        let pane = first_pane();
+        let base = egui::pos2(700.0, 470.0);
+        let stepped = base + egui::vec2(40.0, 40.0);
+        app_frame(app, context, vec![egui::Event::PointerMoved(base)]);
+        app_frame(app, context, vec![egui::Event::PointerMoved(base)]);
+        let (base_east, base_north) = app.panes[pane.index()]
+            .hovered_world_km
+            .expect("the pointer is over the pane");
+        app_frame(app, context, vec![egui::Event::PointerMoved(stepped)]);
+        app_frame(app, context, vec![egui::Event::PointerMoved(stepped)]);
+        let (stepped_east, stepped_north) = app.panes[pane.index()]
+            .hovered_world_km
+            .expect("the pointer is over the pane");
+        let east_per_point = (stepped_east - base_east) / 40.0;
+        let north_per_point = (stepped_north - base_north) / 40.0;
+        let at = egui::pos2(
+            base.x + ((east_km - base_east) / east_per_point) as f32,
+            base.y + ((north_km - base_north) / north_per_point) as f32,
+        );
+        app_frame(app, context, vec![egui::Event::PointerMoved(at)]);
+        let shapes = app_frame(app, context, vec![egui::Event::PointerMoved(at)]);
+        let (landed_east, landed_north) = app.panes[pane.index()]
+            .hovered_world_km
+            .expect("the pointer is over the pane");
+        assert!(
+            (landed_east - east_km).abs() < 0.5 && (landed_north - north_km).abs() < 0.5,
+            "aimed at {east_km},{north_km} km and landed on {landed_east},{landed_north}"
+        );
+        shapes
+    }
+
+    /// THE pin on defect 3: a gate that is there and blank says why.
+    ///
+    /// The pane's own comment promised it - "this gate is empty, and here is
+    /// why is the answer to the question the analyst asked by hovering" - and
+    /// then returned `None` for `ProbeReading::Absent`, which is exactly the
+    /// reading a censored gate produces: every emitted moment of one is NaN.
+    /// So hovering the gates the censor removed, which is the whole reason the
+    /// censor knob exists, produced no panel at all.
+    ///
+    /// Asserted on a whole application frame rather than on
+    /// `gate_spectrum_absence`, because the failure was never a wrong string -
+    /// it was a right string that could not be reached.
+    #[test]
+    fn hovering_a_censored_gate_gets_a_panel_that_says_why_it_is_empty() {
+        use crate::settings_ui::catalog::{keys::timeseries, timeseries_limits as limit};
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("dark"));
+        let mut app = test_app();
+        install_time_series(&mut app, stare_sweep("ZQZQ_RVP"));
+
+        // First, with the shipped threshold: the gate is 9.5 dB over the
+        // receiver noise, so it is on screen and the panel is a spectrum.
+        let shown = shape_texts(&hover_radar_km(&mut app, &context, 20.0, 0.0));
+        assert!(
+            shown.iter().any(|text| text.contains("DOPPLER SPECTRUM")),
+            "the fixture gate is not even readable at the shipped threshold: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text.contains("below the SNR")),
+            "the fixture gate is censored before the test censors it: {shown:?}"
+        );
+
+        // Now put the threshold above it. The gate is still THERE - the beam
+        // sampled it and the pulses are in memory - and the pane draws nothing
+        // at that pixel.
+        app.apply_setting_for_proof(
+            timeseries::CATEGORY,
+            timeseries::SNR_MIN_DB,
+            settings::SettingValue::Float(limit::MAX_SNR_DB),
+        );
+        let hidden = shape_texts(&hover_radar_km(&mut app, &context, 20.0, 0.0));
+        assert!(
+            hidden
+                .iter()
+                .any(|text| text.contains("NO DATA - SAMPLED BUT UNUSABLE")),
+            "the readout does not report a sampled, blank gate: {hidden:?}"
+        );
+        assert!(
+            hidden.iter().any(|text| text.contains("DOPPLER SPECTRUM")),
+            "hovering a censored gate produced no panel at all, so the analyst asking what \
+             the censor removed is answered with silence: {hidden:?}"
+        );
+        assert!(
+            hidden
+                .iter()
+                .any(|text| text.contains("below the SNR threshold")),
+            "the panel is up but does not say why the gate is empty: {hidden:?}"
+        );
+    }
+
+    /// THE pin on defect 4: a pane may not assert a geography it does not
+    /// have.
+    ///
+    /// An RVP8 header carries no coordinates, so an unlocated record's
+    /// position is a network fetch that may never arrive. While it has not,
+    /// the header said "POSITION UNKNOWN" and the pane simultaneously drew the
+    /// sweep over labelled counties with a four-decimal lat/lon under the
+    /// cursor - two statements on one pane contradicting each other, one of
+    /// them a fabricated position. A KOUN stare from Norman, Oklahoma was
+    /// photographed over Smith and Osborne counties, Kansas.
+    #[test]
+    fn a_sweep_with_no_position_gets_no_geography_to_be_drawn_over() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::by_id("dark"));
+        let mut app = test_app();
+        install_time_series(&mut app, stare_sweep("ZQZQ_RVP"));
+        assert!(
+            !app.frame_position_is_known(),
+            "the fixture's site is in the station directory, so this test proves nothing"
+        );
+
+        let texts = shape_texts(&hover_radar_km(&mut app, &context, 20.0, 0.0));
+        assert!(
+            texts.iter().any(|text| text.contains("POSITION UNKNOWN")),
+            "the pane does not admit it has no position: {texts:?}"
+        );
+        // The radar-local half of the corner readout is still there, which is
+        // what makes the absence of the other half a suppression rather than a
+        // readout that was switched off.
+        assert!(
+            texts.iter().any(|text| text.contains("090.0°")),
+            "the corner readout is not running, so this test cannot see whether the \
+             coordinate half was suppressed: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("°N") || text.contains("°S")),
+            "the cursor readout prints a latitude for a sweep with no position: {texts:?}"
+        );
+
+        // And nothing geographic reaches the pane to be drawn.
+        let pane_rect = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(1400.0, 820.0));
+        let map = app.pane_map(first_pane(), Camera2D::default(), pane_rect);
+        assert!(
+            map.projection.is_none(),
+            "the pane was handed the projection the coordinate readout is computed through"
+        );
+        assert!(
+            map.geometry.is_none(),
+            "the pane was handed basemap geometry: county names under an unlocated sweep"
+        );
+        assert!(map.tiles.is_none(), "the pane was handed imagery");
+        assert!(
+            map.sites.is_empty(),
+            "the pane was handed radar site markers"
+        );
+        assert!(
+            map.hazards.is_empty(),
+            "the pane was handed warning polygons"
+        );
+
+        // The control: a frame that DOES know where it is gets all of it back,
+        // through the same function. Without this the assertions above would
+        // pass just as well on a pane that never draws a map at all.
+        let mut located = radar_core::RadarSite::new("KTLX");
+        located.latitude_deg = Some(35.3333);
+        located.longitude_deg = Some(-97.2778);
+        install(&mut app, Arc::new(RadarVolume::new(located, Utc::now())));
+        // The history keeps the sweep that was already selected, and orders
+        // frames by site before time, so the new one is not simply the last:
+        // scrub to it by name.
+        let ktlx = app
+            .history
+            .frames()
+            .iter()
+            .position(|frame| frame.volume.site.id == "KTLX")
+            .expect("the located volume is in the history");
+        assert!(app.history.select(ktlx));
+        assert!(app.frame_position_is_known());
+        let map = app.pane_map(first_pane(), Camera2D::default(), pane_rect);
+        assert!(
+            map.projection.is_some(),
+            "a located frame lost its projection too, so the suppression is not conditional"
+        );
+    }
+
+    /// The other half of the same rule: a record the application CAN source is
+    /// placed, offline, the moment it is opened.
+    ///
+    /// The archived Level 1 records are almost all KOUN, NSSL's research
+    /// WSR-88D at Norman. It serves no operational product, so
+    /// `api.weather.gov/radar/stations` does not list it, so before
+    /// `crate::research_sites` the reference record opened as POSITION UNKNOWN
+    /// forever - not until the directory arrived, but forever, because the
+    /// directory was never going to have it. The station list here is EMPTY,
+    /// which is what makes this a test of the sourced table rather than of the
+    /// network.
+    #[test]
+    fn a_research_radar_is_placed_from_the_sourced_table_with_no_directory() {
+        let mut app = test_app();
+        assert!(
+            app.sites.is_empty(),
+            "the station directory arrived, so this test cannot tell which catalog answered"
+        );
+        install_time_series(&mut app, stare_sweep("KOUN_RVP"));
+
+        assert!(
+            app.frame_position_is_known(),
+            "the reference record's own site is still unplaced"
+        );
+        let frame = app.history.current().expect("the record is installed");
+        // The processor suffix is off the id, and the position is the one the
+        // catalog states - checked against the catalog AND against the literal
+        // coordinate, so this fails if the sourced number is ever edited as
+        // well as if the plumbing that carries it breaks.
+        assert_eq!(frame.volume.site.id, "KOUN");
+        let sourced = crate::research_sites::research_site("KOUN").expect("KOUN is sourced");
+        assert_eq!(sourced.latitude_deg, 35.236058);
+        assert_eq!(sourced.longitude_deg, -97.46235);
+        assert_eq!(
+            frame.volume.site.latitude_deg,
+            Some(sourced.latitude_deg as f32)
+        );
+        assert_eq!(
+            frame.volume.site.longitude_deg,
+            Some(sourced.longitude_deg as f32)
+        );
+
+        // And the geography the unlocated case withholds is now handed to the
+        // pane, through the same function that withheld it.
+        let pane_rect = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(1400.0, 820.0));
+        let map = app.pane_map(first_pane(), Camera2D::default(), pane_rect);
+        assert!(
+            map.projection.is_some(),
+            "a placed research radar still gets no projection, so nothing geographic can draw"
+        );
+    }
+
+    /// Precedence, stated as a behaviour rather than as a comment.
+    ///
+    /// The published directory is asked first and wins outright. The two
+    /// catalogs cannot actually disagree today - no id is in both, and
+    /// `research_sites::no_entry_here_shadows_a_published_station` replays the
+    /// whole retrieved feed to prove it - so this test manufactures the
+    /// collision, because the ORDER is what has to survive somebody adding a
+    /// row to the frozen table years from now.
+    #[test]
+    fn the_published_directory_outranks_the_sourced_table() {
+        let mut app = test_app();
+        app.sites = vec![LocatedSite {
+            id: "KOUN".to_owned(),
+            name: Some("published".to_owned()),
+            latitude_deg: 41.0,
+            longitude_deg: -101.0,
+        }];
+        let published = app
+            .time_series_site("KOUN")
+            .expect("both catalogs have KOUN in this test");
+        assert_eq!(published.name.as_deref(), Some("published"));
+        assert_eq!(published.latitude_deg, 41.0);
+        assert_eq!(published.longitude_deg, -101.0);
+
+        // Take the directory away and the sourced table answers instead.
+        app.sites.clear();
+        let sourced = app
+            .time_series_site("KOUN")
+            .expect("the sourced table has KOUN");
+        assert_eq!(sourced.latitude_deg, 35.236058);
+        assert_eq!(sourced.longitude_deg, -97.46235);
+
+        // A site in neither is still refused, which is the behaviour this
+        // whole path is built around and the one the fallback must not cost.
+        assert_eq!(app.time_series_site("ZQZQ"), None);
+        assert_eq!(app.time_series_site("NOXP"), None);
+    }
+
+    /// The refusal survives the fallback, end to end through the install path.
+    ///
+    /// The same fixture site the defect-4 test uses, asserted at the frame
+    /// rather than at the pane: a record from a radar neither catalog knows
+    /// comes out of `install_loaded_volume` with no coordinates on it at all.
+    #[test]
+    fn an_unsourced_site_still_installs_with_no_position() {
+        let mut app = test_app();
+        install_time_series(&mut app, stare_sweep("ZQZQ_RVP"));
+        let frame = app.history.current().expect("the record is installed");
+        assert_eq!(frame.volume.site.latitude_deg, None);
+        assert_eq!(frame.volume.site.longitude_deg, None);
+        assert!(!app.frame_position_is_known());
     }
 
     /// The newest `<SITE>*_V06` in the live cache, by filename - the same

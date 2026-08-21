@@ -773,6 +773,8 @@ mod tests {
             offset: 0.0,
             nodata: None,
             range_folded: None,
+            snr_threshold_db: None,
+            recombination: None,
             radial_indices: (0..az_count).collect(),
             storage: MomentStorage::F32(values),
         };

@@ -24,8 +24,9 @@
 //!
 //! # Ported from BowEcho, and where this departs
 //!
-//! BowEcho spells the same gesture as a `ctrl_best_radar_click` predicate
-//! feeding a `best_radar_candidates` selector. What it actually does:
+//! BowEcho spells the same gesture `ctrl_best_radar_click` (`app_ui/src/
+//! main.rs`) feeding `best_radar_candidates` (`app_ui/src/sites_ui.rs`).
+//! What it actually does:
 //!
 //!   * chord: `ctrl && !alt && !shift`;
 //!   * take every site within 460 km whose catalogued kind is `Wsr88d` or
@@ -287,7 +288,8 @@ pub fn nearest_s_band_click(
 /// the feature.
 ///
 /// BowEcho settles this the same way and does it in the predicate rather
-/// than at the call site: its `plain_map_click_allowed` is
+/// than at the call site: `plain_map_click_allowed`
+/// (`app_ui/src/main.rs:46693`) is
 /// `!shift && !ctrl_best_radar_click(modifiers) && !alt_model_sounding(..)`,
 /// and the marker branch is gated on it, so a held Ctrl takes the marker
 /// hit-test out of the running entirely before `handle_marker_click` is
