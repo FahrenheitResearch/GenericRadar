@@ -84,6 +84,7 @@ use std::path::Path;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use radar_core::{
     GateRange, MomentGrid, MomentRow, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
+    ResearchMoment,
 };
 
 use crate::{NexradError, Result};
@@ -357,6 +358,8 @@ fn detect_endian(bytes: &[u8]) -> Result<Endian> {
 /// One PARM descriptor plus the moment grid it feeds.
 struct ParamState {
     name: String,
+    description: Option<String>,
+    units: Option<String>,
     scale: f32,
     bias: f32,
     bad_data: i32,
@@ -607,6 +610,8 @@ impl SweepParse {
     fn parse_parm(&mut self, block: &[u8], offset: usize) -> Result<()> {
         require(block, 104, offset, "PARM")?;
         let name = text(&block[8..16]);
+        let description = text(&block[16..56]);
+        let units = text(&block[56..64]);
         let binary_format = self.endian.i16(block, 78);
         let scale = self.endian.f32(block, 92);
         let bias = self.endian.f32(block, 96);
@@ -625,6 +630,8 @@ impl SweepParse {
         };
         self.params.push(ParamState {
             name,
+            description: (!description.is_empty()).then_some(description),
+            units: (!units.is_empty()).then_some(units),
             scale: if scale.abs() > 1.0e-6 { scale } else { 1.0 },
             bias,
             bad_data,
@@ -1072,7 +1079,7 @@ fn truncate_to_declared<T>(values: &mut Vec<T>, declared: Option<usize>) {
 }
 
 fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
-    match param.binary_format {
+    let mut grid = match param.binary_format {
         1 => MomentGrid::new_u8(
             param.moment.clone(),
             gate_range,
@@ -1093,6 +1100,8 @@ fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
         // float passthrough and bad gates are already NaN.
         _ => MomentGrid {
             moment: param.moment.clone(),
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -1105,7 +1114,10 @@ fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
             radial_indices: Vec::new(),
             storage: MomentStorage::F32(Vec::new()),
         },
-    }
+    };
+    grid.producer_description = param.description.clone();
+    grid.producer_units = param.units.clone();
+    grid
 }
 
 fn i32_to_u8_sentinel(bad_data: i32) -> Option<u8> {
@@ -1126,6 +1138,9 @@ fn i32_to_u16_sentinel(bad_data: i32) -> Option<u16> {
 /// `DBZHC_F` → `DBZHC` → `DBZ` and `DB_RHOHV` → `RHOHV`.
 pub(crate) fn canonical_moment(name: &str) -> Option<MomentType> {
     let normalized = name.trim().to_ascii_uppercase();
+    if let Some(moment) = ResearchMoment::from_producer_name(&normalized) {
+        return Some(MomentType::Research(moment));
+    }
     let mut stem = normalized.as_str();
     loop {
         if let Some(moment) = match_moment_stem(stem) {
@@ -1315,6 +1330,8 @@ mod tests {
 
             let mut parm = base_block(b"PARM", 216, endian);
             parm[8..11].copy_from_slice(b"DBZ");
+            parm[16..39].copy_from_slice(b"Equivalent reflectivity");
+            parm[56..59].copy_from_slice(b"dBZ");
             put_i16(&mut parm, 78, 2, endian); // 16-bit
             put_f32(&mut parm, 92, 100.0, endian); // scale
             put_f32(&mut parm, 96, 0.0, endian); // bias
@@ -1427,6 +1444,46 @@ mod tests {
         assert_eq!(grid.scaled_value(0, 1), Some(20.0));
         assert_eq!(grid.scaled_value(0, 2), None); // bad gate
         assert_eq!(grid.scaled_value(1, 2), Some(7.0));
+        assert_eq!(
+            grid.producer_description.as_deref(),
+            Some("Equivalent reflectivity")
+        );
+        assert_eq!(grid.producer_units.as_deref(), Some("dBZ"));
+    }
+
+    #[test]
+    fn opaque_nvm_keeps_its_parm_description_and_units_without_inference() {
+        let mut bytes = Synth {
+            endian: Endian::Big,
+            compressed: false,
+        }
+        .build(&synth_rays());
+        let parm = find_block(&bytes, b"PARM");
+        bytes[parm + 8..parm + 16].fill(0);
+        bytes[parm + 8..parm + 11].copy_from_slice(b"NVM");
+        bytes[parm + 16..parm + 56].fill(0);
+        bytes[parm + 16..parm + 36].copy_from_slice(b"Producer-defined NVM");
+        bytes[parm + 56..parm + 64].fill(0);
+        bytes[parm + 56..parm + 59].copy_from_slice(b"arb");
+        let rdat_positions: Vec<usize> = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(index, window)| (window == b"RDAT").then_some(index))
+            .collect();
+        for rdat in rdat_positions {
+            bytes[rdat + 8..rdat + 16].fill(0);
+            bytes[rdat + 8..rdat + 11].copy_from_slice(b"NVM");
+        }
+
+        let volume = decode_dorade_sweep(&bytes).expect("decode");
+        let moment = MomentType::Unknown("NVM".to_owned());
+        let grid = volume.cuts[0].moments.get(&moment).expect("opaque NVM");
+        assert_eq!(grid.moment, moment);
+        assert_eq!(
+            grid.producer_description.as_deref(),
+            Some("Producer-defined NVM")
+        );
+        assert_eq!(grid.producer_units.as_deref(), Some("arb"));
     }
 
     #[test]
@@ -1659,6 +1716,32 @@ mod tests {
         );
         assert_eq!(canonical_moment("NCP"), None);
         assert_eq!(canonical_moment("DM"), None);
+        // The DOW field references used here do not define NVM. Preserve it as
+        // `Unknown("NVM")` at the decode call site rather than expanding the
+        // mnemonic into a quantity the producer did not document here.
+        assert_eq!(canonical_moment("NVM"), None);
+    }
+
+    #[test]
+    fn canonical_moment_keeps_dow_frequency_products_separate() {
+        let names = [
+            "DBMH1", "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM", "DBZH1", "DBZH2", "DBZHM",
+            "DBZV1", "DBZV2", "DBZVM",
+        ];
+        let moments: Vec<MomentType> = names
+            .iter()
+            .map(|name| canonical_moment(name).expect("known research product"))
+            .collect();
+        let unique: BTreeSet<MomentType> = moments.iter().cloned().collect();
+        assert_eq!(unique.len(), names.len());
+        for (name, moment) in names.iter().zip(moments) {
+            assert_eq!(moment.short_name(), *name);
+        }
+        assert_ne!(
+            canonical_moment("DBZH1"),
+            Some(MomentType::Reflectivity),
+            "a second DOW reflectivity must not collide with the first"
+        );
     }
 
     #[test]

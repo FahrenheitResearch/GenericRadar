@@ -13,7 +13,7 @@
 //! renderer at all.
 
 use chrono::{TimeZone, Utc};
-use nexrad_io::iq::{IqPulse, IqSweep};
+use nexrad_io::iq::{IqCalibration, IqPulse, IqSweep};
 use nexrad_io::iq_moments::estimator::SnrCensor;
 use nexrad_io::iq_moments::taper::Taper;
 use nexrad_io::iq_moments::{DwellPlan, MomentConfig, process_sweep};
@@ -71,15 +71,17 @@ fn wedge_sweep(pulses: usize) -> IqSweep {
         site: "KOUN".to_owned(),
         time_utc: 1_369_079_161,
         wavelength_m: WAVELENGTH_M,
-        pulse_width_s: 1.5e-6,
+        pulse_width_s: Some(1.5e-6),
         gate_spacing_m: Some(GATE_SPACING_M),
         first_gate_m: GATE_SPACING_M,
         range_bins: (0..GATES)
             .map(|gate| GATE_SPACING_M * (gate + 1) as f32)
             .collect(),
-        noise_dbm: [NOISE_DBM, NOISE_DBM],
-        dbz_calibration: -35.5,
-        saturation_dbm: SATURATION_DBM,
+        calibration: IqCalibration::Absolute {
+            noise_dbm: [NOISE_DBM, NOISE_DBM],
+            dbz_calibration: -35.5,
+            saturation_dbm: SATURATION_DBM,
+        },
         pulses: built,
         ..IqSweep::default()
     }

@@ -30,16 +30,10 @@
 //! in eleven seconds crosses the 360 km box in eleven seconds. Nothing here
 //! needs to know how many kilometres that is.
 
-// This module once carried its own `#![allow(dead_code)]` promising deletion
-// "in the commit that pastes [the call sites] into vol3d/pane.rs" - that
-// commit is this one: `pane::canvas` drives [`drive_camera`] and the pane
-// toolbar surfaces [`camera_controls`]. Note the parent module's own
-// `#![allow(dead_code)]` (vol3d.rs, for its ported BowEcho surface) STILL
-// reaches this file - lint scoping covers children - and cannot be re-armed
-// here with `#![warn(dead_code)]`, because `examples/vol3d_opacity_proof.rs`
-// recompiles the whole vol3d tree standalone, where this module's entry
-// points are legitimately uncalled. Narrowing that parent allow is vol3d.rs's
-// own change.
+// `pane::canvas` routes input through [`drive_camera`], and the pane toolbar
+// exposes [`camera_controls`]. The parent module's `#![allow(dead_code)]` also
+// applies here because `examples/vol3d_opacity_proof.rs` recompiles the volume
+// tree standalone without calling every camera entry point.
 
 use eframe::egui;
 

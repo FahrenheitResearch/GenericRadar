@@ -167,6 +167,9 @@ pub fn family_for_product_header(product: Option<&str>) -> ColorTableFamily {
     match normalized_product(product).as_str() {
         "br" | "ref" | "refl" | "reflectivity" | "basereflectivity" | "dbz" | "z" | "cref"
         | "cr" => ColorTableFamily::Reflectivity,
+        "dbm" | "receivedpower" | "dbmh1" | "dbmh2" | "dbmhm" | "dbmv1" | "dbmv2" | "dbmvm" => {
+            ColorTableFamily::ReceivedPower
+        }
         "bv"
         | "vel"
         | "v"
@@ -1363,6 +1366,8 @@ Color: 75 254 254 254
             ("BR", ColorTableFamily::Reflectivity),
             ("br", ColorTableFamily::Reflectivity),
             ("REF", ColorTableFamily::Reflectivity),
+            ("DBM", ColorTableFamily::ReceivedPower),
+            ("DBMH1", ColorTableFamily::ReceivedPower),
             ("BV", ColorTableFamily::Velocity),
             ("vel", ColorTableFamily::Velocity),
             ("Base_Velocity", ColorTableFamily::Velocity),

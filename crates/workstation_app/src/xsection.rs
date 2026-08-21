@@ -12,10 +12,9 @@
 //! through [`XSectionInput`] (exactly as the 3D explorer's pane does), so the
 //! product registry, colour table and volume history stay owned by `app.rs`
 //! and the same colour table that paints the pane paints the slice. That
-//! independence is also what lets `tests/xsection_unit.rs` compile this file
-//! before the `mod xsection;` line lands in `main.rs` — and it is why the
-//! submodules below are inline blocks rather than files: an inline module
-//! resolves identically under both roots.
+//! independence also lets `tests/xsection_unit.rs` compile this file as a
+//! focused harness. The submodules below are inline blocks so they resolve
+//! identically under the application and harness roots.
 //!
 //! Gesture design, so nothing collides with what the panes already bind:
 //! placing the line is an ARMED mode (a toolbar toggle, like Vrot) that
@@ -926,6 +925,8 @@ mod build {
                     MomentType::Reflectivity,
                     MomentGrid {
                         moment: MomentType::Reflectivity,
+                        producer_description: None,
+                        producer_units: None,
                         gate_range,
                         scale: 1.0,
                         offset: 0.0,

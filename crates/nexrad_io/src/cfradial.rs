@@ -58,7 +58,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentRow, MomentStorage, MomentType, RadarSite,
-    RadarVolume, Radial, VcpInfo,
+    RadarVolume, Radial, ResearchMoment, VcpInfo,
 };
 
 pub use crate::netcdf3::looks_like_netcdf3_bytes;
@@ -328,6 +328,16 @@ pub fn decode_cfradial1_source(file: &dyn NcSource) -> Result<RadarVolume> {
         for sweep in &mut sweeps {
             let mut grid = MomentGrid {
                 moment: moment.clone(),
+                producer_description: field
+                    .attr_str("long_name")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                producer_units: field
+                    .attr_str("units")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
                 gate_range: gate_range.clone(),
                 scale: 1.0,
                 offset: 0.0,
@@ -567,6 +577,9 @@ fn field_name_is_a_derived_diagnostic(name: &str) -> bool {
 /// model's seven moments land.
 fn canonical_moment(name: &str) -> Option<MomentType> {
     let normalized = name.trim().to_ascii_uppercase();
+    if let Some(moment) = ResearchMoment::from_producer_name(&normalized) {
+        return Some(MomentType::Research(moment));
+    }
     let mut stem = normalized.as_str();
     loop {
         if let Some(moment) = match_moment_stem(stem) {
@@ -817,9 +830,21 @@ mod tests {
         );
         // No recognised stem: the caller keeps the CF name rather than guess.
         assert_eq!(canonical_moment("NCP"), None);
+        assert_eq!(canonical_moment("NVM"), None);
         // Suffix peeling must never strip a name down to nothing.
         assert_eq!(canonical_moment("_H"), None);
         assert_eq!(canonical_moment("HC"), None);
+    }
+
+    #[test]
+    fn cfradial_keeps_dow_frequency_products_as_exact_fields() {
+        for name in [
+            "DBMH1", "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM", "DBZH1", "DBZH2", "DBZHM",
+            "DBZV1", "DBZV2", "DBZVM",
+        ] {
+            let moment = canonical_moment(name).expect("known research product");
+            assert_eq!(moment.short_name(), name);
+        }
     }
 
     #[test]

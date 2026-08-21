@@ -20,6 +20,12 @@ stop matching the code.
   UCAR/Unidata. Both credits are load-bearing and neither substitutes for the
   other: NWS produces the data, Unidata pays for and serves the objects every
   request here lands on.
+- **KOUN Level 1 / I/Q** - raw RVP8/RVP900 time-series records published by
+  **NOAA/NSSL** through the public KOUN THREDDS catalog at
+  `data.nssl.noaa.gov/thredds/catalog/RRDD/KOUN`. The application browses that
+  machine-readable hierarchy and downloads only validated `KOUN_RVP` objects
+  from the same fixed HTTPS host. This is one official archive, not a claim
+  that research-radar Level 1 holdings are centralized.
 - **Watches, warnings and advisories** - NOAA/NWS `api.weather.gov`.
 - **Basemap tiles** - **USGS The National Map** (each service's own credit
   string is displayed in the application, verbatim as that service publishes

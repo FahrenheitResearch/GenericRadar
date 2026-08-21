@@ -21,9 +21,8 @@
 //!
 //! The module name IS the id with hyphens written as underscores, and the
 //! list is sorted by it, which is the same order the ids sort in (`-` and
-//! `_` both sort before every letter). A registration is therefore one line
-//! that a merge can place without reading the file, which is the point: six
-//! themes arriving on six branches must not collide over a shared array.
+//! `_` both sort before every letter). This keeps registration deterministic
+//! and makes duplicate or misplaced ids easy to detect.
 //!
 //! # Why the two founding ids are so terse
 //!

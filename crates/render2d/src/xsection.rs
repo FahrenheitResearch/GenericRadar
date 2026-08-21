@@ -768,6 +768,8 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Reflectivity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -1916,18 +1918,17 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The pre-change reconstruction, frozen.
+    // The interpolated-fill reference reconstruction, frozen.
     // ------------------------------------------------------------------
 
-    /// `interpolate_profile` and `sample_slice` exactly as they stood in the
-    /// commit before the beams fill landed (`git show HEAD:crates/render2d/
-    /// src/xsection.rs`, copied verbatim, only the surrounding module added).
+    /// The reference versions of `interpolate_profile` and `sample_slice`
+    /// preserve the reconstruction used by the `Interpolated` fill mode.
     ///
     /// This is the regression pin for the promise that `Interpolated` is the
-    /// OLD PICTURE, not a re-derivation of it. A fingerprint constant proves
-    /// only that today equals today; this proves today equals the code the
-    /// analyst was looking at, over real volumes and every moment, and when
-    /// it breaks the diff says which line of the reconstruction moved.
+    /// established picture, not a re-derivation of it. A fingerprint constant
+    /// proves only that today equals today; this comparison exercises the
+    /// frozen implementation over real volumes and every moment, and a failure
+    /// identifies which part of the reconstruction moved.
     ///
     /// It reaches into the module's private profile machinery on purpose:
     /// `column_profile`, the split-cut merge and the tilt geometry are shared

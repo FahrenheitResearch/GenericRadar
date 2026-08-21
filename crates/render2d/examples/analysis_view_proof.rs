@@ -9,7 +9,7 @@
 //!
 //! It writes, for reflectivity on cut 0 and velocity on cut 1, both a PNG to
 //! look at and the raw RGBA bytes to hash. The raw bytes are the point: the
-//! promise this branch makes is that an unrotated pane is BYTE-IDENTICAL to
+//! contract this proof enforces is that an unrotated pane is BYTE-IDENTICAL to
 //! what the renderer produced before the camera rotation existed, and a
 //! picture that is merely indistinguishable is not that.
 //!

@@ -215,6 +215,9 @@ fn decode_with_previews(
         Some(SupportedVolumeFormat::NexradLevel1TimeSeries) => {
             decode_time_series(raw, source_label, iq_controls)
         }
+        Some(SupportedVolumeFormat::MatlabIqCube) => {
+            decode_matlab_iq(raw, source_label, iq_controls)
+        }
         // Progressive preview is a property of the Archive II record stream;
         // the other containers decode whole or not at all.
         Some(_) => nexrad_io::decode_supported_volume_bytes(raw)
@@ -237,6 +240,25 @@ fn decode_time_series(
     controls: crate::iq_session::IqControls,
 ) -> Result<Decoded, String> {
     let session = crate::iq_session::IqSession::open(raw, source_label, controls)?;
+    decoded_iq_session(session)
+}
+
+/// Decode a MATLAB Level 5 OU-PRIME cube without inventing receiver or
+/// reflectivity calibration. The cube-to-sweep conversion records its native
+/// ray boundaries, and `IqSession` fixes processing to one dwell per ray.
+fn decode_matlab_iq(
+    raw: &[u8],
+    source_label: &str,
+    controls: crate::iq_session::IqControls,
+) -> Result<Decoded, String> {
+    let sweep = nexrad_io::matlab_iq::decode_ou_prime_mat(raw)
+        .and_then(nexrad_io::matlab_iq::OuPrimeIqCube::into_iq_sweep)
+        .map_err(|error| format!("MATLAB Level 5 I/Q cube: {error}"))?;
+    let session = crate::iq_session::IqSession::from_sweep(sweep, source_label, controls)?;
+    decoded_iq_session(session)
+}
+
+fn decoded_iq_session(session: crate::iq_session::IqSession) -> Result<Decoded, String> {
     let volume = session.volume(radar_core::RadarSite::new(session.site_id()));
     Ok(Decoded {
         volume,
@@ -400,6 +422,12 @@ mod tests {
     /// container decodes it. Returns the complete volume, or the message the
     /// analyst would have seen.
     fn load_as_a_drop_would(path: &Path) -> Result<Arc<RadarVolume>, String> {
+        load_complete_as_a_drop_would(path).map(|loaded| loaded.volume)
+    }
+
+    /// Same path as [`load_as_a_drop_would`], retaining the I/Q session so a
+    /// test can prove the pulses were not discarded after rendering a volume.
+    fn load_complete_as_a_drop_would(path: &Path) -> Result<LoadedVolume, String> {
         let chosen = crate::app_support::choose_dropped_radar_file([path.to_path_buf()])
             .expect("a drop of one file chooses that file");
         let (sender, receiver) = mpsc::sync_channel(RESULT_QUEUE_CAPACITY);
@@ -421,7 +449,7 @@ mod tests {
         while let Ok(update) = receiver.try_recv() {
             match update {
                 LoadUpdate::Volume(loaded) if loaded.stage == FrameStage::Complete => {
-                    outcome = Ok(loaded.volume);
+                    outcome = Ok(loaded);
                 }
                 LoadUpdate::Failed { message, .. } => outcome = Err(message),
                 _ => {}
@@ -507,6 +535,40 @@ mod tests {
             source.ends_with("swp.1090509143923.NOXPRVP.0.0.5_PPI_v1"),
             "the member should be named too, got {source:?}"
         );
+    }
+
+    #[test]
+    fn the_load_path_retains_a_real_matlab_iq_session_without_fabricated_products() {
+        let Ok(path) = std::env::var("OU_PRIME_MAT_SAMPLE") else {
+            eprintln!("skipping: set OU_PRIME_MAT_SAMPLE to the OU-PRIME MAT file");
+            return;
+        };
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            eprintln!(
+                "skipping: OU_PRIME_MAT_SAMPLE points at {}, which is not there",
+                path.display()
+            );
+            return;
+        }
+
+        let loaded = load_complete_as_a_drop_would(&path)
+            .expect("MATLAB I/Q should decode through the complete load path");
+        let session = loaded.iq.as_ref().expect("I/Q session is retained");
+        assert_eq!(session.site_id(), "OUPRIME");
+        assert_eq!(session.native_dwell_pulses(), Some(32));
+        assert_eq!(session.processed().report.dwells, 150);
+        assert!(
+            loaded.volume.cuts[0]
+                .moments
+                .contains_key(&MomentType::RelativePower)
+        );
+        assert!(
+            !loaded.volume.cuts[0]
+                .moments
+                .contains_key(&MomentType::Reflectivity)
+        );
+        assert!(session.provenance().contains("SNR unavailable"));
     }
 
     /// The Level II path, on the real volume the renders are pinned to.

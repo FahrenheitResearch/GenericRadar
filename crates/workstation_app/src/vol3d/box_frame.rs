@@ -855,6 +855,8 @@ mod tests {
                 MomentType::Reflectivity,
                 MomentGrid {
                     moment: MomentType::Reflectivity,
+                    producer_description: None,
+                    producer_units: None,
                     gate_range: gate_range.clone(),
                     scale: 1.0,
                     offset: 0.0,
@@ -1359,6 +1361,8 @@ mod tests {
             MomentType::Reflectivity,
             MomentGrid {
                 moment: MomentType::Reflectivity,
+                producer_description: None,
+                producer_units: None,
                 gate_range,
                 scale: 1.0,
                 offset: 0.0,

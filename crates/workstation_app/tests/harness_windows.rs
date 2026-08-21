@@ -4,12 +4,11 @@
 //! Several examples in this workspace photograph real chrome by driving a real
 //! `eframe` viewport. That viewport is a real, focused window on whatever
 //! display the harness was started on, and `eframe` maps it without consulting
-//! the caller - `src/harness_window.rs` records exactly where. An earlier
-//! attempt to suppress it with `ViewportBuilder::with_visible(false)` had no
-//! runtime effect at all, and left several files stating that it did.
+//! the caller - `src/harness_window.rs` records exactly where.
+//! `ViewportBuilder::with_visible(false)` does not suppress that window at
+//! runtime, so the source must not claim that it does.
 //!
-//! Two rules are pinned here, and the second one is the one that would have
-//! caught that:
+//! Two rules are pinned here:
 //!
 //! 1. every example that calls `eframe::run_native` either refuses to start
 //!    without `--window` (the harnesses that need a window) or reaches

@@ -166,11 +166,9 @@ fn main() -> ExitCode {
     if let Some(gate) = options.spectrum_gate {
         match sweep_gate_spectrum(&sweep, &config, options.dwell_index, gate, 0) {
             Ok(spectrum) => {
-                println!("velocity_mps,power_dbm");
-                for (velocity, power) in spectrum
-                    .velocities_mps
-                    .iter()
-                    .zip(spectrum.power_dbm.iter())
+                println!("velocity_mps,power_db");
+                for (velocity, power) in
+                    spectrum.velocities_mps.iter().zip(spectrum.power_db.iter())
                 {
                     println!("{velocity:.6},{power:.6}");
                 }
@@ -216,14 +214,14 @@ fn main() -> ExitCode {
     );
 
     println!(
-        "gate,range_m,power_h_dbm,snr_h_db,snr_v_db,sqi,reflectivity_dbz,velocity_mps,\
+        "gate,range_m,power_h_db,snr_h_db,snr_v_db,sqi,reflectivity_dbz,velocity_mps,\
          width_mps,zdr_db,rhohv,phidp_deg,censored,below_noise"
     );
     for (gate, estimate) in estimates.iter().enumerate() {
         println!(
             "{gate},{:.4},{},{},{},{},{},{},{},{},{},{},{},{}",
             estimate.range_m,
-            csv(estimate.power_h_dbm),
+            csv(estimate.power_h_db),
             csv(estimate.snr_h_db),
             csv(estimate.snr_v_db),
             csv(estimate.sqi),

@@ -112,11 +112,12 @@ fn the_fixture_carries_the_files_own_calibration_and_range_ladder() {
     assert_eq!(sweep.pulses.len(), 32);
     assert_eq!(sweep.range_bins.len(), 76);
     assert!((sweep.wavelength_m - 0.1108).abs() < 1e-6);
-    assert!((sweep.pulse_width_s - 1.5e-6).abs() < 1e-12);
-    assert!((sweep.dbz_calibration - -35.5).abs() < 1e-4);
-    assert!((sweep.saturation_dbm - 6.0).abs() < 1e-4);
-    assert!((sweep.noise_dbm[0] - -80.5555).abs() < 1e-3);
-    assert!((sweep.noise_dbm[1] - -80.5955).abs() < 1e-3);
+    assert!((sweep.pulse_width_s.unwrap() - 1.5e-6).abs() < 1e-12);
+    assert!((sweep.calibration.dbz_calibration().unwrap() - -35.5).abs() < 1e-4);
+    assert!((sweep.calibration.saturation_dbm().unwrap() - 6.0).abs() < 1e-4);
+    let noise_dbm = sweep.calibration.noise_dbm().unwrap();
+    assert!((noise_dbm[0] - -80.5555).abs() < 1e-3);
+    assert!((noise_dbm[1] - -80.5955).abs() < 1e-3);
     for pulse in &sweep.pulses {
         assert!((pulse.prt_seconds - 833.375e-6).abs() < 1e-9);
         assert!((pulse.elevation_deg - 4.0).abs() < 0.01);
@@ -367,7 +368,7 @@ fn the_spectrum_of_a_real_gate_peaks_at_its_pulse_pair_velocity() {
         let spectrum =
             sweep_gate_spectrum(&dump.sweep, &config, 0, gate, 0).expect("a real gate's spectrum");
         let peak = spectrum
-            .power_dbm
+            .power_db
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))

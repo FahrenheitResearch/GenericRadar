@@ -1,4 +1,4 @@
-//! Photograph a real NEXRAD Level 1 record open in the real application.
+//! Photograph a real Level 1 record open in the real application.
 //!
 //! ```text
 //! cargo run --release -p workstation_app --example iq_proof -- <iq-file> <out-dir>
@@ -42,6 +42,7 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod current_view_export;
     pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
@@ -77,9 +78,9 @@ mod source {
 
 #[allow(unused_imports)]
 pub(crate) use source::{
-    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
-    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
-    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
+    iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
+    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
     product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
     units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
@@ -197,7 +198,7 @@ fn run(input: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The four frames, per theme.
+/// The proof frames for one theme.
 fn photograph_theme(shot: &mut Shot<'_>, app: &mut app::WorkstationApp, theme_id: &str) -> usize {
     let mut written = 0;
 
@@ -246,6 +247,55 @@ fn photograph_theme(shot: &mut Shot<'_>, app: &mut app::WorkstationApp, theme_id
         );
     }
     written += write(shot, app, theme_id, "field");
+
+    // Some research cubes preserve already-formed rays and carry neither a
+    // receiver-noise measurement nor an absolute calibration. Those absences
+    // change which controls are physically meaningful. Photograph the refusal
+    // instead of trying to force the RVP continuous-pulse experiment below
+    // onto a source that cannot support it.
+    let relative_native = seen.iter().any(|text| text.contains("power is relative"));
+    if relative_native {
+        for required in [
+            "native 32-pulse rays",
+            "SNR unavailable: source has no receiver-noise calibration",
+            "absolute receiver power and calibrated reflectivity are unavailable",
+        ] {
+            assert!(
+                seen.iter().any(|text| text.contains(required)),
+                "{theme_id}: relative I/Q field is missing {required:?}: {seen:?}"
+            );
+        }
+        for forbidden in ["dBm", "dBZ"] {
+            assert!(
+                !seen.iter().any(|text| text.contains(forbidden)),
+                "{theme_id}: an uncalibrated I/Q cube makes the fabricated {forbidden} claim: \
+                 {seen:?}"
+            );
+        }
+
+        let before = radial_count(app);
+        set_dwell(shot, app, 256);
+        let shapes = settle_hovering(shot, app, 6);
+        let after = radial_count(app);
+        assert_eq!(
+            after, before,
+            "{theme_id}: a dwell setting crossed measured ray boundaries ({before} -> {after})"
+        );
+        assert!(
+            texts(&shapes)
+                .iter()
+                .any(|text| text.contains("native 32-pulse rays")),
+            "{theme_id}: the pane stopped admitting that the source fixes the dwell"
+        );
+        written += write(shot, app, theme_id, "native_dwell_locked");
+
+        app.settings_ui_mut().open = true;
+        app.settings_ui_mut()
+            .open_category(settings_ui::catalog::keys::timeseries::CATEGORY);
+        written += write(shot, app, theme_id, "controls");
+        app.settings_ui_mut().open = false;
+        return written;
+    }
 
     // 2. The same pulses under a longer dwell. This is the whole feature: the
     //    slider redraws the storm. Set through the real settings store, so what
@@ -323,7 +373,7 @@ fn photograph_theme(shot: &mut Shot<'_>, app: &mut app::WorkstationApp, theme_id
         .open_category(settings_ui::catalog::keys::timeseries::CATEGORY);
     let shapes = settle(shot, app, 6);
     let seen = texts(&shapes);
-    for row in ["Pulses per dwell", "Window", "Hide gates below"] {
+    for row in ["Preferred pulses per dwell", "Window", "Hide gates below"] {
         assert!(
             seen.iter().any(|text| text.contains(row)),
             "{theme_id}: the Level 1 page is missing the {row:?} control: {seen:?}"

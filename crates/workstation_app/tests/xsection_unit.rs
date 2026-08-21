@@ -1,7 +1,5 @@
-//! Compiles `src/xsection.rs` (and its submodules) as a test crate and runs
-//! its unit tests TODAY, before the one-line `mod xsection;` wiring lands in
-//! `main.rs`. Once `main.rs` declares the module, these same tests run as
-//! ordinary unit tests of the binary and this harness can be deleted.
+//! Compiles `src/xsection.rs` (and its submodules) as a focused test crate and
+//! runs its unit tests independently of the rest of the application.
 //!
 //! The module reaches exactly one `crate::` sibling — `units`, which is a leaf
 //! with no siblings of its own — and everything else about its surface arrives

@@ -1,5 +1,6 @@
 //! Public radar data-source helpers.
 
+pub mod research_archive;
 pub mod tuning;
 pub mod warnings;
 
@@ -272,7 +273,7 @@ pub fn classify_feed_age(age: Duration) -> FeedFreshness {
 pub enum DataSourceError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("S3 XML parse failed: {0}")]
+    #[error("XML parse failed: {0}")]
     Xml(#[from] quick_xml::DeError),
     #[error("JSON parse failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -295,6 +296,12 @@ pub enum DataSourceError {
     /// rather than inventing a zero.
     #[error("download of {key} was cancelled")]
     ObjectDownloadCancelled { key: String },
+    #[error("research archive returned an unsafe path: {0}")]
+    UnsafeResearchArchivePath(String),
+    #[error("research download {name} is larger than the {maximum_bytes}-byte safety limit")]
+    ResearchDownloadTooLarge { name: String, maximum_bytes: u64 },
+    #[error("download of research file {name} was cancelled")]
+    ResearchDownloadCancelled { name: String },
     #[error(
         "{site} volume {volume_id} at {volume_time} is missing chunk {missing_chunk_id} of {last_chunk_id}"
     )]

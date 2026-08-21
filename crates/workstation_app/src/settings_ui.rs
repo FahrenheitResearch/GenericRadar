@@ -45,9 +45,8 @@
 //!   code: a new item in the catalog - or a whole category contributed by
 //!   another crate - appears in the window with zero changes here. That is
 //!   the contract `docs/extending.md` documents.
-//! * `app.rs` (human-wired; see the integration notes) applies changed
-//!   values to the live application and mirrors live state back into the
-//!   store.
+//! * `app.rs` applies changed values to the live application and mirrors live
+//!   state back into the store.
 //!
 //! The non-generic sections are both on the Radar page, and both are there
 //! because colour tables are not scalar knobs. The picker edits the live
@@ -63,14 +62,13 @@
 //! a minimum 24-point hit height.
 
 // Explicit child paths, not the defaults. This module is compiled in two
-// homes - as `workstation_app::settings_ui` once the human-owned `mod`
-// wiring lands, and until then via the `#[path]` include in
-// `crates/settings/tests/workstation_settings_ui.rs` - and a `#[path]`-loaded
-// module resolves DEFAULT child paths beside the loaded file (mod-rs
+// homes: as `workstation_app::settings_ui` and via the `#[path]` include in
+// `crates/settings/tests/workstation_settings_ui.rs`. A `#[path]`-loaded
+// module resolves default child paths beside the loaded file (mod-rs
 // semantics), which in the harness is `src/`, where `palettes.rs` names a
 // different, pre-existing module of the application. An explicit
-// `settings_ui/…` path resolves identically in both homes (verified
-// empirically both ways); do not "simplify" these back to bare `pub mod`.
+// `settings_ui/…` path resolves identically in both homes; do not "simplify"
+// these back to bare `pub mod`.
 #[path = "settings_ui/catalog.rs"]
 pub mod catalog;
 #[path = "settings_ui/palettes.rs"]
@@ -215,8 +213,8 @@ pub(crate) fn described_option_inks(
 
 /// The ground egui paints under one described option row.
 ///
-/// Dead code in the application - egui paints the ground itself - and alive
-/// in the contrast audit in `workstation_app/tests/theme_catalog.rs`, which
+/// Dead code in the application - egui paints the ground itself - and used by
+/// the contrast tests in `workstation_app/tests/theme_catalog.rs`, which
 /// includes this file by path so that the ink from
 /// [`described_option_inks`] is measured against the fill the SAME row is
 /// drawn on. It lives here rather than in the test because it is a fact
@@ -239,8 +237,8 @@ pub(crate) fn described_option_ground(
 /// Every state a described option row can be drawn in, as
 /// `(widget state, selected)`.
 ///
-/// The audit's checklist, kept beside the two functions it crosses so that a
-/// state added to egui - or a row that starts sensing drag - is added in one
+/// The complete state matrix, kept beside the two functions it crosses so that
+/// a state added to egui - or a row that starts sensing drag - is added in one
 /// place. Also dead code in the application.
 #[allow(dead_code)]
 pub(crate) const DESCRIBED_OPTION_STATES: [(egui::widget_style::WidgetState, bool); 8] = [
@@ -863,12 +861,11 @@ struct PaletteContext<'a> {
 
 /// Every piece of mutable window state a page may touch, in one value.
 ///
-/// Bundled because the alternative is a positional parameter per surface, and
-/// this window gained two surfaces at once - the subsection and reset
-/// machinery brought `confirm`, named profiles brought `profiles` - which
-/// between them pushed `draw_category_page` past the argument count clippy
-/// refuses. Neither branch tripped it alone. The next surface goes in here
-/// rather than on the end of the signature.
+/// Bundled because the alternative is a positional parameter per surface. The
+/// subsection and reset machinery needs `confirm`, and named profiles needs
+/// `profiles`; together they push `draw_category_page` past the argument count
+/// clippy accepts. The next surface goes in here rather than on the end of the
+/// signature.
 struct PageContext<'a> {
     confirm: &'a mut Confirmations,
     profiles: &'a mut profiles::ProfilesUi,
@@ -1826,9 +1823,9 @@ fn spec_matches(category: &SettingsCategory, spec: &SettingSpec, terms: &[String
 
 /// Does typing `query` into the window's search field reach this row?
 ///
-/// For callers outside this module - `app.rs` asks it of the gate filter's
-/// five criteria, which arrived on a different branch from the search field
-/// and have to be findable by the analyst who needs to turn them off.
+/// For callers outside this module: `app.rs` asks it of the gate filter's five
+/// criteria so every control remains findable by an analyst who needs to turn
+/// it off.
 ///
 /// Deliberately the real predicate rather than a second implementation of it:
 /// a helper that matched on its own terms could agree with a search that had
@@ -2659,15 +2656,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The four pages the audit added, put through every piece of machinery
-    /// the window branch built - because those two branches never compiled
-    /// together until this integration, and "the new pages work in the new
-    /// window" is exactly the claim neither of them could make alone.
+    /// Four cross-cutting settings pages, put through every piece of the
+    /// window's generic page machinery.
     ///
-    /// Deliberately driven off `AUDIT_PAGES` rather than off the whole
-    /// registry: a test over every page would keep passing if one of these
-    /// four silently stopped being registered, which is the failure this is
-    /// here to catch.
+    /// Deliberately driven off this explicit list rather than off the whole
+    /// registry: a test over every page would keep passing if one of these four
+    /// silently stopped being registered, which is the failure this catches.
     const AUDIT_PAGES: [&str; 4] = [
         catalog::keys::units::CATEGORY,
         catalog::keys::network::CATEGORY,
@@ -2700,9 +2694,9 @@ mod tests {
         }
     }
 
-    /// Subsections are the window branch's answer to a page that has grown
-    /// into a wall. The audit's pages have to go through the same split - and
-    /// the split has to be lossless, or a row is declared and never drawn.
+    /// Subsections keep a page from becoming a wall of controls. These pages
+    /// have to go through the same split, and the split has to be lossless or a
+    /// row is declared and never drawn.
     #[test]
     fn every_page_the_audit_added_survives_the_subsection_split() {
         let registry = catalog::registry();
@@ -2729,9 +2723,8 @@ mod tests {
         }
     }
 
-    /// Per-page reset is the window branch's machinery; the audit's pages
-    /// have to answer to it. A page whose values a reset cannot reach is a
-    /// page with no way back to the shipped behaviour.
+    /// Every listed page must participate in per-page reset. A page whose
+    /// values a reset cannot reach has no way back to the shipped behaviour.
     #[test]
     fn every_page_the_audit_added_can_be_reset_through_the_window() {
         let registry = catalog::registry();
@@ -2760,12 +2753,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// And the profiles branch's half: a named snapshot has to carry the
-    /// audit's pages, or switching profiles silently reverts them.
+    /// A named snapshot has to carry every listed page, or switching profiles
+    /// silently reverts those settings.
     ///
-    /// The mutation this catches was run, not imagined: dropping one audit
-    /// category inside `snapshot_for_profile` turns this red, and turns the
-    /// drawn-unit round trip in `app.rs` red with it.
+    /// Dropping one of these categories inside `snapshot_for_profile` fails
+    /// this test and the drawn-unit round trip in `app.rs`.
     #[test]
     fn a_profile_snapshot_carries_every_page_the_audit_added() {
         let registry = catalog::registry();

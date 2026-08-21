@@ -161,11 +161,9 @@ fn the_picker_call_sequence_compiles_and_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// The two functions the handoff adds to `pane_canvas.rs`, VERBATIM.
-//
-// They are here so the compiler checks the text a human is going to paste. The
-// only difference from the snippet is the `PaneMap` above standing in for the
-// pane's own, which carries the same `tiles` field.
+// Compile the pane-canvas tile callbacks against the public scene API. The
+// local `PaneMap` stands in for the pane's map state and carries the same
+// `tiles` field used by the application.
 // ---------------------------------------------------------------------------
 
 /// Queue this pane's raster tile underlay.
@@ -317,10 +315,8 @@ fn the_pane_canvas_snippet_compiles_and_draws() {
 }
 
 // ---------------------------------------------------------------------------
-// The block the handoff adds to `app_support.rs::basemap_picker`, VERBATIM.
-// Wrapped in a function here only so it can be run; in `app_support.rs` it is
-// the tail of the existing `basemap_picker` and `scene` is already its
-// parameter.
+// Exercise the imagery-picker branch through the same scene interface used by
+// the application, keeping provider eligibility and selection executable.
 // ---------------------------------------------------------------------------
 fn imagery_picker(ui: &mut egui::Ui, scene: &mut MapSceneController) {
     // Ground imagery, which is a different axis from the vector look above:

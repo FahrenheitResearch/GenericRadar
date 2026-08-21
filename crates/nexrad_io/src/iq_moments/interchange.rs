@@ -53,7 +53,7 @@
 //! Version 1 is still read, because dumps of it exist; it is reported as
 //! [`DumpVersion::V1`] so a caller can say that its timing is nominal.
 
-use crate::iq::{IqPulse, IqSweep};
+use crate::iq::{IqCalibration, IqPulse, IqSweep};
 
 /// Which layout a dump was written in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +85,10 @@ pub enum DumpError {
     SiteTooLong { length: usize, remaining: usize },
     #[error("site name is not ASCII")]
     SiteNotAscii,
+    #[error("IQDUMP02 requires absolute receiver and reflectivity calibration")]
+    RelativeCalibrationUnsupported,
+    #[error("IQDUMP02 requires a declared transmitted pulse width")]
+    MissingPulseWidth,
 }
 
 /// A dump and the version it was written in.
@@ -170,13 +174,15 @@ pub fn read_dump(bytes: &[u8]) -> Result<Dump, DumpError> {
             site,
             time_utc,
             wavelength_m,
-            pulse_width_s,
+            pulse_width_s: Some(pulse_width_s),
             gate_spacing_m,
             first_gate_m: range_bins.first().copied().unwrap_or_default(),
             range_bins,
-            noise_dbm: [noise_h_dbm, noise_v_dbm],
-            dbz_calibration: dbz0_db,
-            saturation_dbm,
+            calibration: IqCalibration::Absolute {
+                noise_dbm: [noise_h_dbm, noise_v_dbm],
+                dbz_calibration: dbz0_db,
+                saturation_dbm,
+            },
             pulses: built,
             // Fields the dump does not carry. A dump is an estimator fixture,
             // not a record: it exists to hand two implementations identical
@@ -205,10 +211,21 @@ fn uniform_spacing(range_bins: &[f32]) -> Option<f32> {
 }
 
 /// Write a sweep as a version 2 dump. Round-trips through [`read_dump`].
-pub fn write_dump(sweep: &IqSweep) -> Vec<u8> {
+pub fn write_dump(sweep: &IqSweep) -> Result<Vec<u8>, DumpError> {
     let pulses = sweep.pulses.len();
     let bins = sweep.range_bins.len();
     let dual_pol = pulses > 0 && sweep.pulses.iter().all(|pulse| pulse.v.len() == bins);
+
+    let IqCalibration::Absolute {
+        noise_dbm,
+        dbz_calibration,
+        saturation_dbm,
+    } = sweep.calibration
+    else {
+        return Err(DumpError::RelativeCalibrationUnsupported);
+    };
+
+    let pulse_width_s = sweep.pulse_width_s.ok_or(DumpError::MissingPulseWidth)?;
 
     let mut out = Vec::new();
     out.extend_from_slice(DumpVersion::V2.magic());
@@ -223,11 +240,11 @@ pub fn write_dump(sweep: &IqSweep) -> Vec<u8> {
     for value in [
         sweep.wavelength_m,
         nominal_prt,
-        sweep.pulse_width_s,
-        sweep.noise_dbm[0],
-        sweep.noise_dbm[1],
-        sweep.dbz_calibration,
-        sweep.saturation_dbm,
+        pulse_width_s,
+        noise_dbm[0],
+        noise_dbm[1],
+        dbz_calibration,
+        saturation_dbm,
     ] {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -258,7 +275,7 @@ pub fn write_dump(sweep: &IqSweep) -> Vec<u8> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 struct Cursor<'a> {
@@ -349,13 +366,15 @@ mod tests {
             site: "KOUN".to_owned(),
             time_utc: 1_369_079_161,
             wavelength_m: 0.1108,
-            pulse_width_s: 1.5e-6,
+            pulse_width_s: Some(1.5e-6),
             gate_spacing_m: Some(500.0),
             first_gate_m: 0.0,
             range_bins: (0..8).map(|bin| 500.0 * bin as f32).collect(),
-            noise_dbm: [-80.5555, -80.5955],
-            dbz_calibration: -35.5,
-            saturation_dbm: 6.0,
+            calibration: IqCalibration::Absolute {
+                noise_dbm: [-80.5555, -80.5955],
+                dbz_calibration: -35.5,
+                saturation_dbm: 6.0,
+            },
             pulses,
             ..IqSweep::default()
         }
@@ -364,7 +383,8 @@ mod tests {
     #[test]
     fn a_version_two_dump_round_trips_every_field_including_per_pulse_timing() {
         let original = sweep(&[833.375e-6, 833.375e-6, 555.583e-6, 833.375e-6]);
-        let round_tripped = read_dump(&write_dump(&original)).expect("reads back");
+        let bytes = write_dump(&original).expect("absolute calibration is writable");
+        let round_tripped = read_dump(&bytes).expect("reads back");
         assert_eq!(round_tripped.version, DumpVersion::V2);
         assert_eq!(round_tripped.sweep, original);
     }
@@ -381,7 +401,8 @@ mod tests {
                 pulse.prt_seconds = 833.375e-6 * 2.0 / 3.0;
             }
         }
-        let round_tripped = read_dump(&write_dump(&original)).expect("reads back");
+        let bytes = write_dump(&original).expect("absolute calibration is writable");
+        let round_tripped = read_dump(&bytes).expect("reads back");
         let config = MomentConfig {
             dwell: DwellPlan::contiguous(8),
             ..MomentConfig::default()
@@ -398,7 +419,7 @@ mod tests {
         // Version 1 bytes, built by hand: the same header without the time,
         // site and per-pulse PRT block.
         let original = sweep(&[833.375e-6; 3]);
-        let two = write_dump(&original);
+        let two = write_dump(&original).expect("absolute calibration is writable");
         let mut one = Vec::new();
         one.extend_from_slice(DumpVersion::V1.magic());
         // pulses, bins, dual_pol and the seven scalars are byte-identical.
@@ -424,7 +445,8 @@ mod tests {
         for pulse in &mut original.pulses {
             pulse.v.clear();
         }
-        let round_tripped = read_dump(&write_dump(&original)).expect("reads back");
+        let bytes = write_dump(&original).expect("absolute calibration is writable");
+        let round_tripped = read_dump(&bytes).expect("reads back");
         assert_eq!(round_tripped.sweep, original);
     }
 
@@ -432,7 +454,7 @@ mod tests {
     fn a_truncated_or_foreign_file_is_an_error_and_not_a_panic() {
         assert_eq!(read_dump(b"not a dump at all"), Err(DumpError::NotADump));
         assert_eq!(read_dump(&[]), Err(DumpError::NotADump));
-        let full = write_dump(&sweep(&[833.375e-6; 4]));
+        let full = write_dump(&sweep(&[833.375e-6; 4])).expect("absolute calibration is writable");
         for cut in [8usize, 20, 40, full.len() - 1] {
             assert!(matches!(
                 read_dump(&full[..cut]),

@@ -7,9 +7,8 @@
 //! looked up, never restated here. Before that split existed, a product's name
 //! lived in one match and its units in another, and the two drifted.
 //!
-//! This adapter is temporary. As the registry grows past the ten sweep
-//! products the panes can name, the handle becomes a `ProductId` and this file
-//! goes away.
+//! This adapter is temporary. Once pane state stores `ProductId` directly,
+//! the fixed handle and its catalog-sized match can go away.
 
 use product_engine::registry::ProductDescriptor;
 use product_engine::{DisplayDomain, ProductRegistry};
@@ -19,6 +18,7 @@ use radar_core::{MomentType, ProductId, RadarVolume};
 pub enum DisplayProduct {
     #[default]
     Reflectivity,
+    RelativePower,
     Velocity,
     DealiasedVelocity,
     StormRelativeVelocity,
@@ -28,6 +28,18 @@ pub enum DisplayProduct {
     CorrelationCoefficient,
     DifferentialPhase,
     SpecificDifferentialPhase,
+    DowReceivedPowerH1,
+    DowReceivedPowerH2,
+    DowReceivedPowerHMerged,
+    DowReceivedPowerV1,
+    DowReceivedPowerV2,
+    DowReceivedPowerVMerged,
+    DowReflectivityH1,
+    DowReflectivityH2,
+    DowReflectivityHMerged,
+    DowReflectivityV1,
+    DowReflectivityV2,
+    DowReflectivityVMerged,
     CompositeReflectivity,
     EchoTop18,
     Vil,
@@ -38,8 +50,9 @@ pub enum DisplayProduct {
 }
 
 impl DisplayProduct {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 30] = [
         Self::Reflectivity,
+        Self::RelativePower,
         Self::Velocity,
         Self::DealiasedVelocity,
         Self::StormRelativeVelocity,
@@ -49,6 +62,18 @@ impl DisplayProduct {
         Self::CorrelationCoefficient,
         Self::DifferentialPhase,
         Self::SpecificDifferentialPhase,
+        Self::DowReceivedPowerH1,
+        Self::DowReceivedPowerH2,
+        Self::DowReceivedPowerHMerged,
+        Self::DowReceivedPowerV1,
+        Self::DowReceivedPowerV2,
+        Self::DowReceivedPowerVMerged,
+        Self::DowReflectivityH1,
+        Self::DowReflectivityH2,
+        Self::DowReflectivityHMerged,
+        Self::DowReflectivityV1,
+        Self::DowReflectivityV2,
+        Self::DowReflectivityVMerged,
         Self::CompositeReflectivity,
         Self::EchoTop18,
         Self::Vil,
@@ -63,6 +88,7 @@ impl DisplayProduct {
     pub const fn id(self) -> &'static str {
         match self {
             Self::Reflectivity => "REF",
+            Self::RelativePower => "PWR_REL",
             Self::Velocity => "VEL",
             Self::DealiasedVelocity => "DVEL",
             Self::StormRelativeVelocity => "SRV",
@@ -72,6 +98,18 @@ impl DisplayProduct {
             Self::CorrelationCoefficient => "RHO",
             Self::DifferentialPhase => "PHI",
             Self::SpecificDifferentialPhase => "KDP",
+            Self::DowReceivedPowerH1 => "DBMH1",
+            Self::DowReceivedPowerH2 => "DBMH2",
+            Self::DowReceivedPowerHMerged => "DBMHM",
+            Self::DowReceivedPowerV1 => "DBMV1",
+            Self::DowReceivedPowerV2 => "DBMV2",
+            Self::DowReceivedPowerVMerged => "DBMVM",
+            Self::DowReflectivityH1 => "DBZH1",
+            Self::DowReflectivityH2 => "DBZH2",
+            Self::DowReflectivityHMerged => "DBZHM",
+            Self::DowReflectivityV1 => "DBZV1",
+            Self::DowReflectivityV2 => "DBZV2",
+            Self::DowReflectivityVMerged => "DBZVM",
             Self::CompositeReflectivity => "CREF",
             Self::EchoTop18 => "ET18",
             Self::Vil => "VIL",
@@ -235,6 +273,18 @@ mod tests {
         assert_eq!(
             DisplayProduct::DealiasedStormRelativeVelocity.source_moment(),
             MomentType::Velocity
+        );
+    }
+
+    #[test]
+    fn relative_power_has_its_own_uncalibrated_source_moment() {
+        assert_eq!(
+            DisplayProduct::RelativePower.source_moment(),
+            MomentType::RelativePower
+        );
+        assert_ne!(
+            DisplayProduct::RelativePower.source_moment(),
+            MomentType::Reflectivity
         );
     }
 

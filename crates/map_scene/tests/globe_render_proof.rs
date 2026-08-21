@@ -5,12 +5,12 @@
 //! from the real shipped basemap, with the real site catalogue drawn on top
 //! through the same `Camera2D::world_to_screen` the pane uses.
 //!
-//! The globe morph is not in `shader.wgsl` yet - it arrives as an integration
-//! note - so this file carries the proposed WGSL and its own pipeline. That is
-//! only trustworthy if the proposed pipeline is the shipped one plus the
-//! morph, so [`the_morph_pipeline_at_zero_blend_is_the_shipped_pipeline`]
-//! renders the same camera through both and demands the two frames be equal
-//! byte for byte. Everything else in this file rests on that.
+//! This file carries a parameterized copy of the globe WGSL and compiles it in
+//! a dedicated pipeline so the proof can render comparison variants. Its
+//! flat-map baseline and uniform layout are pinned to production by
+//! [`the_morph_pipeline_at_zero_blend_is_the_shipped_pipeline`], which renders
+//! the same camera through both pipelines and requires byte-for-byte equality.
+//! The remaining comparisons use that verified baseline.
 //!
 //! `MAP_SCENE_GLOBE_PROOF_OUT` chooses where the frames are written. Run it:
 //!
@@ -85,12 +85,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// The proposed vertex morph, as it would read in `shader.wgsl`.
+/// The parameterized vertex morph used by this GPU proof.
 ///
-/// The first four items are the shipped shader, transcribed. The rest is the
-/// integration note. `LIMB_MODE` is replaced before compilation so the same
-/// source can render the shipped map, the smearing version and the fixed one,
-/// which is what makes the comparison a comparison.
+/// The baseline declarations and rendering logic mirror the production shader.
+/// `LIMB_FADE_VALUE` is replaced before compilation so the same source can
+/// render clamp-only and faded-limb variants; the zero-blend comparison verifies
+/// that their shared baseline remains byte-equivalent to production.
 const MORPH_SHADER: &str = r#"
 struct MapUniform {
     world_to_clip: mat4x4<f32>,
@@ -162,8 +162,7 @@ fn to_globe_normal(position_km: vec2<f32>, normal: vec2<f32>, blend: f32) -> vec
 // segment with both ends behind the limb carries fade 0 along its whole length
 // and disappears instead of smearing along the rim.
 fn limb_fade(position_km: vec2<f32>, blend: f32) -> f32 {
-    // A fade width of zero is the CONTROL: the clamp with no fade at all,
-    // which is the shape the previous proposal had.
+    // A fade width of zero is the control: the clamp-only variant with no fade.
     if (LIMB_FADE_RAD <= 0.0 || blend <= 0.5) {
         return 1.0;
     }
@@ -316,16 +315,14 @@ impl MorphPipeline {
     }
 }
 
-/// The shipped `MapPaintCallback::uniform`, transcribed. It is `pub(crate)`,
-/// so this is the only way to build the same matrix from outside the crate -
-/// and the zero-blend frame comparison is what proves the transcription.
+/// The production `MapPaintCallback::uniform` calculation, reproduced because
+/// that method is `pub(crate)`. The zero-blend frame comparison verifies the
+/// calculation against the production callback.
 ///
 /// The result is a raw `[f32; 20]` rather than a `MapUniform`, deliberately.
-/// The integration note renames that block's fourth scalar from `_pad` to
-/// `globe_blend`, and a test that named either one would stop compiling the
-/// moment the note landed - or the moment it was reverted. What the test
-/// actually depends on is the LAYOUT, and that is asserted against the shipped
-/// type instead.
+/// That keeps the uniform-block layout explicit without coupling the proof to
+/// the production constructor. The final scalar carries `globe_blend`, and the
+/// layout is asserted against the production type below.
 fn uniform_for(camera: Camera2D, viewport: ViewportMetrics, blend: f32) -> [f32; 20] {
     let camera = camera.sanitized();
     let viewport = viewport.sanitized();
@@ -349,8 +346,8 @@ fn uniform_for(camera: Camera2D, viewport: ViewportMetrics, blend: f32) -> [f32;
     let m11 = cos * sy;
     let tx = -(m00 * cx + m01 * cy);
     let ty = -(m10 * cx + m11 * cy);
-    // The shipped block, scalar for scalar: four matrix columns, the viewport,
-    // the device pixel ratio, and the slot the note turns into `globe_blend`.
+    // The production block, scalar for scalar: four matrix columns, the
+    // viewport, the device pixel ratio, and `globe_blend`.
     assert_eq!(
         std::mem::size_of::<MapUniform>(),
         std::mem::size_of::<[f32; 20]>(),
@@ -533,7 +530,7 @@ impl Harness {
         self.read_back(encoder)
     }
 
-    /// One frame through the proposed morph pipeline.
+    /// One frame through the proof's parameterized morph pipeline.
     fn morph_frame(
         &mut self,
         pipeline: &MorphPipeline,
@@ -776,10 +773,9 @@ fn drawn_pixels(pixels: &[u8], ground: &[u8]) -> usize {
         .count()
 }
 
-/// EVERYTHING in this file rests on this: the proposed pipeline, driven at
-/// zero blend, must be the shipped pipeline. Not close - equal, byte for byte,
-/// on a real GPU, at the scales an analyst works at and at the coarsest scale
-/// where the blend is still exactly zero.
+/// Establishes equivalence between the proof and production pipelines. At zero
+/// blend their frames must be equal byte for byte on a real GPU, both at the
+/// scales an analyst uses and at the coarsest scale whose blend is exactly zero.
 #[test]
 fn the_morph_pipeline_at_zero_blend_is_the_shipped_pipeline() {
     let Some(mut harness) = Harness::new() else {
@@ -877,8 +873,8 @@ fn the_far_hemisphere_leaves_no_mark_on_the_globe() {
     }
 }
 
-/// What the far-zoom view looks like TODAY, what the clamp-only morph makes of
-/// it, and what the faded limb makes of it. This is the picture, not a metric.
+/// Compares the production far-zoom view, a clamp-only morph and the faded
+/// limb. This produces visual evidence rather than a numeric metric.
 #[test]
 #[ignore = "writes PNGs for a human to look at"]
 fn look_at_the_globe() {
@@ -886,7 +882,7 @@ fn look_at_the_globe() {
         eprintln!("SKIPPED look_at_the_globe: no wgpu adapter");
         return;
     };
-    // Fade width 0 reproduces a clamp with no fade: the previous proposal.
+    // Fade width zero produces the clamp-only comparison with no limb fade.
     let clamped = MorphPipeline::new(&harness.device, harness.format, 0.0);
     let faded = MorphPipeline::new(&harness.device, harness.format, globe::LIMB_FADE_RAD as f32);
     let ground = {
@@ -1228,13 +1224,12 @@ fn real_sites_return_to_their_own_pixel_after_a_zoom_round_trip() {
     );
 }
 
-/// Where the raster underlay actually stops, measured rather than inherited.
+/// Measures where the raster underlay stops through `tile_zoom_for`.
 ///
-/// The integration note that switches the tile layer off past
-/// `MIN_BLEND_KM_PER_POINT` is only honest if it knows what it is taking away.
-/// `tile_zoom_for` already refuses to answer once the camera is coarser than
-/// the provider's coarsest zoom, and this reports that cutoff per device pixel
-/// ratio - which is what decides how much imagery the globe costs.
+/// The tile scene stops drawing as soon as the globe blend becomes nonzero.
+/// Independently, `tile_zoom_for` returns `None` below the tile system's minimum
+/// supported zoom. This reports that native cutoff per device-pixel ratio and
+/// verifies its relationship to the globe transition.
 #[test]
 fn the_raster_layer_already_stands_down_near_the_globe_floor() {
     for pixels_per_point in [1.0_f32, 1.25, 1.5, 2.0, 3.0, 4.0] {
@@ -1251,13 +1246,13 @@ fn the_raster_layer_already_stands_down_near_the_globe_floor() {
              (globe floor {:.2})",
             globe::MIN_BLEND_KM_PER_POINT
         );
-        // What the note gives up is the band between the globe floor and this
+        // The suppressed-imagery band lies between the globe floor and this
         // cutoff. On a 1x display there is none.
         if pixels_per_point <= 1.25 {
             assert!(
                 coarsest <= globe::MIN_BLEND_KM_PER_POINT,
                 "at {pixels_per_point}x the imagery outlives the globe floor by \
-                 {coarsest} km/point, so the note gives up more than it says"
+                 {coarsest} km/point"
             );
         }
     }

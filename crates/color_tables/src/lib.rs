@@ -85,6 +85,7 @@ impl Rgba8 {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ColorTableFamily {
     Reflectivity,
+    ReceivedPower,
     Velocity,
     SpectrumWidth,
     DifferentialReflectivity,
@@ -98,6 +99,7 @@ impl ColorTableFamily {
     pub fn label(self) -> &'static str {
         match self {
             Self::Reflectivity => "Reflectivity",
+            Self::ReceivedPower => "Received Power (dBm)",
             Self::Velocity => "Velocity / SRV",
             Self::SpectrumWidth => "Spectrum Width",
             Self::DifferentialReflectivity => "Differential Reflectivity (ZDR)",
@@ -113,8 +115,9 @@ impl ColorTableFamily {
     /// Base moments first because they are what an analyst reaches for most,
     /// then dual-pol in the order the moments appear in a NEXRAD message, then
     /// the catch-all last.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Reflectivity,
+        Self::ReceivedPower,
         Self::Velocity,
         Self::SpectrumWidth,
         Self::DifferentialReflectivity,
@@ -144,6 +147,10 @@ impl ColorTableFamily {
     pub fn nominal_domain(self) -> (f32, f32) {
         match self {
             Self::Reflectivity => (-32.0, 95.0),
+            // NCAR's operational `dbmlow.colors`, used for the DOW6/7 DBM
+            // products, is defined edge-to-edge over this received-power span.
+            // https://github.com/NCAR/lrose-displays/blob/master/color_scales/dbmlow.colors
+            Self::ReceivedPower => (-120.0, 20.0),
             Self::Velocity => (-70.0, 70.0),
             Self::SpectrumWidth => (0.0, 24.0),
             Self::DifferentialReflectivity => (ZDR_MIN_DB, ZDR_MAX_DB),
@@ -1232,6 +1239,7 @@ impl TableRendering {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColorTableSet {
     reflectivity: ColorTable,
+    received_power: ColorTable,
     velocity: ColorTable,
     spectrum_width: ColorTable,
     differential_reflectivity: ColorTable,
@@ -1245,6 +1253,7 @@ impl ColorTableSet {
     pub fn for_family(&self, family: ColorTableFamily) -> &ColorTable {
         match family {
             ColorTableFamily::Reflectivity => &self.reflectivity,
+            ColorTableFamily::ReceivedPower => &self.received_power,
             ColorTableFamily::Velocity => &self.velocity,
             ColorTableFamily::SpectrumWidth => &self.spectrum_width,
             ColorTableFamily::DifferentialReflectivity => &self.differential_reflectivity,
@@ -1258,6 +1267,7 @@ impl ColorTableSet {
     pub fn set_family(&mut self, family: ColorTableFamily, table: ColorTable) {
         match family {
             ColorTableFamily::Reflectivity => self.reflectivity = table,
+            ColorTableFamily::ReceivedPower => self.received_power = table,
             ColorTableFamily::Velocity => self.velocity = table,
             ColorTableFamily::SpectrumWidth => self.spectrum_width = table,
             ColorTableFamily::DifferentialReflectivity => self.differential_reflectivity = table,
@@ -1277,6 +1287,7 @@ impl Default for ColorTableSet {
     fn default() -> Self {
         Self {
             reflectivity: builtin_reflectivity_table(),
+            received_power: builtin_received_power_table(),
             velocity: builtin_velocity_table(),
             spectrum_width: builtin_spectrum_width_table(),
             differential_reflectivity: builtin_differential_reflectivity_table(),
@@ -2118,7 +2129,7 @@ mod tests {
         ));
         let flipped = table.mirrored_values("flipped");
 
-        // The verifier's table, as measured on the real KDVN velocity frame.
+        // This table, as measured on the real KDVN velocity frame.
         // The middle column is what a banded mirror produced.
         for (value, expected) in [
             (-20.0_f32, [0, 228, 255, 255]),
@@ -3726,6 +3737,28 @@ mod tests {
                 assert!(!family.is_cyclic(), "{} does not wrap", family.label());
             }
         }
+    }
+
+    #[test]
+    fn received_power_uses_the_ncar_dow_dbm_span_and_bands() {
+        assert_eq!(
+            ColorTableFamily::ReceivedPower.nominal_domain(),
+            (-120.0, 20.0)
+        );
+        let table = builtin_received_power_table();
+        assert_eq!(table.inked_value_span(), Some((-120.0, 20.0)));
+        assert_eq!(
+            table.color_for_value(-100.0),
+            Rgba8::opaque(0, 0, 255).to_array()
+        );
+        assert_eq!(
+            table.color_for_value(-80.0),
+            Rgba8::opaque(34, 139, 34).to_array()
+        );
+        assert_eq!(
+            table.color_for_value(0.0),
+            Rgba8::opaque(178, 34, 34).to_array()
+        );
     }
 
     /// The defect this module was changed to fix, pinned so it cannot come back.

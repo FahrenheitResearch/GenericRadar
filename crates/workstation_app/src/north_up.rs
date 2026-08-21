@@ -15,8 +15,9 @@
 //! `Camera2D::zoom_about` and `Camera2D::pan_by_screen_delta` both send a
 //! SCREEN offset to a WORLD offset through the camera's rotation, so resolving
 //! the outward gesture through one rotation and the return gesture through
-//! another leaves the pair short of the identity. Measured on the branch this
-//! file repairs: twenty wheel in-and-out cycles about a corner anchor drifted
+//! another leaves the pair short of the identity. Measured before the stable
+//! gesture rotation was introduced: twenty wheel in-and-out cycles about a
+//! corner anchor drifted
 //! the centre 304.0 km at a 600 km centre and 2.0 km per point, 1888.9 km in
 //! the globe band; ten drags out and ten back left the map 74.1 to 1221.8 km
 //! from where it started. With the derived rotation forced to zero - the
@@ -525,8 +526,8 @@ mod tests {
         MAX_ROTATION_DEG, MAX_TURN_RATE_DEG_PER_KM, NORTH_UP_FULL_RANGE_KM,
     };
 
-    /// A 1600x900 pane at one device pixel per point: the window the branch's
-    /// own proofs and the verifier both measured on, so the numbers in the doc
+    /// A 1600x900 pane at one device pixel per point: the window used by the
+    /// proofs and measurements, so the numbers in the doc
     /// comments and the numbers here describe the same picture.
     const PANE: ViewportMetrics = ViewportMetrics {
         width_points: 1600.0,
@@ -537,7 +538,7 @@ mod tests {
     /// A wheel anchored well off the middle of the pane. The centre is the one
     /// anchor for which `zoom_about` does not move the view centre at all, so
     /// zooming there would pass this proof without proving anything; the
-    /// verifier measured the defect on a corner and so does this.
+    /// defect was measured at a corner and so is this proof.
     const CORNER: ScreenPoint = ScreenPoint {
         x: 1500.0,
         y: 800.0,

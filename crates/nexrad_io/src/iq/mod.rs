@@ -182,10 +182,13 @@ const BINARY_ANGLE_FULL_CIRCLE: f32 = 65_536.0;
 
 /// One transmitted pulse: the complex receiver voltage at every recorded gate.
 ///
-/// `h` and `v` hold `(I, Q)` in the normalised units the record is written in,
-/// where unit magnitude is [`IqSweep::saturation_dbm`]. Both are the same
-/// length as [`IqSweep::range_bins`], and `v` is empty when only one channel
-/// was recorded.
+/// `h` and `v` hold `(I, Q)` in the units the source recorded. For an
+/// [`IqCalibration::Absolute`] sweep they are normalised receiver samples and
+/// the calibration states the power represented by unit magnitude. For
+/// [`IqCalibration::RelativeStoredIq`] they remain arbitrary stored units and
+/// must never be labelled dBm. Both are the same length as
+/// [`IqSweep::range_bins`], and `v` is empty when only one channel was
+/// recorded.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IqPulse {
     /// Antenna azimuth at transmission, degrees clockwise from true north,
@@ -246,6 +249,122 @@ pub struct IqBurst {
     pub reported_phase_rad: [f32; 2],
 }
 
+/// What the stored I/Q amplitudes can honestly be converted into.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum IqCalibration {
+    /// The acquisition supplies the receiver and reflectivity calibration used
+    /// by the existing RVP time-series path.
+    Absolute {
+        /// Receiver noise power per channel, dBm.
+        noise_dbm: [f32; 2],
+        /// SIGMET/IRIS dBZ0 reflectivity calibration.
+        dbz_calibration: f32,
+        /// Power represented by a decoded sample magnitude of one, dBm.
+        saturation_dbm: f32,
+    },
+    /// Only the stored receiver-unit scale is known. `10 log10(I^2 + Q^2)`
+    /// is meaningful relative power, but it is not dBm and cannot be turned
+    /// into dBZ or SNR without metadata the file does not contain.
+    #[default]
+    RelativeStoredIq,
+}
+
+impl IqCalibration {
+    #[must_use]
+    pub fn noise_dbm(self) -> Option<[f32; 2]> {
+        match self {
+            Self::Absolute { noise_dbm, .. } => Some(noise_dbm),
+            Self::RelativeStoredIq => None,
+        }
+    }
+
+    #[must_use]
+    pub fn dbz_calibration(self) -> Option<f32> {
+        match self {
+            Self::Absolute {
+                dbz_calibration, ..
+            } => Some(dbz_calibration),
+            Self::RelativeStoredIq => None,
+        }
+    }
+
+    #[must_use]
+    pub fn saturation_dbm(self) -> Option<f32> {
+        match self {
+            Self::Absolute { saturation_dbm, .. } => Some(saturation_dbm),
+            Self::RelativeStoredIq => None,
+        }
+    }
+
+    /// Noise power in the same linear units as the decoded samples.
+    #[must_use]
+    pub fn noise_power(self, channel: usize) -> Option<f32> {
+        let Self::Absolute {
+            noise_dbm,
+            saturation_dbm,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let dbm = noise_dbm[channel.min(1)];
+        Some(10f32.powf((dbm - saturation_dbm) / 10.0))
+    }
+}
+
+/// How the stored complex-voltage phase maps onto the application's signed
+/// radial-velocity convention.
+///
+/// The ordering of `I + jQ` is acquisition-system metadata, not a universal
+/// property of complex samples. RVP and OU-PRIME use opposite conventions;
+/// treating them alike mirrors every Doppler velocity while leaving a field
+/// that still looks meteorologically plausible.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DopplerPhaseConvention {
+    /// A positive argument of `x[k] * conj(x[k + 1])` is positive velocity.
+    #[default]
+    PositiveLagPhaseIsPositiveVelocity,
+    /// A positive argument of `x[k] * conj(x[k + 1])` is negative velocity.
+    PositiveLagPhaseIsNegativeVelocity,
+}
+
+impl DopplerPhaseConvention {
+    #[must_use]
+    pub const fn velocity_multiplier(self) -> f64 {
+        match self {
+            Self::PositiveLagPhaseIsPositiveVelocity => 1.0,
+            Self::PositiveLagPhaseIsNegativeVelocity => -1.0,
+        }
+    }
+}
+
+/// One legal interval of pulses in a sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PulseSpan {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl PulseSpan {
+    #[must_use]
+    pub fn end(self) -> Option<usize> {
+        self.start.checked_add(self.len)
+    }
+}
+
+/// Whether dwell windows may cross arbitrary pulse positions.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PulseLayout {
+    /// A continuous time series such as an RVP record. Analyst-selected dwell
+    /// windows may slide through the stream.
+    #[default]
+    Continuous,
+    /// Native rays with hard acquisition boundaries. Initial processing uses
+    /// exactly one dwell per span; crossing or subdividing a ray would either
+    /// combine different antenna positions or create duplicate-azimuth rows.
+    Rays(Vec<PulseSpan>),
+}
+
 /// One time-series record: an acquisition description and its pulses.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IqSweep {
@@ -261,12 +380,14 @@ pub struct IqSweep {
     pub time_millis: u16,
     /// Radar wavelength in metres, from `fWavelengthCM`.
     pub wavelength_m: f32,
-    /// Transmitted pulse width in seconds, from `fPWidthUSec`.
-    pub pulse_width_s: f32,
-    /// `iPolarization` verbatim. Advisory only: the number of channels
+    /// Transmitted pulse width in seconds when the source declares it. Gate
+    /// spacing alone does not establish the transmitted waveform width.
+    pub pulse_width_s: Option<f32>,
+    /// `iPolarization` verbatim when the source uses RVP metadata. Advisory
+    /// only: the number of channels
     /// actually recorded is [`Self::channels_recorded`], which comes from
     /// `iVIQPerBin` and is what the byte layout obeys.
-    pub polarization_code: i64,
+    pub polarization_code: Option<i64>,
     /// Channels present per pulse, from `iVIQPerBin`: 1 or 2.
     pub channels_recorded: usize,
     /// Samples per channel the acquisition reserved for the burst before its
@@ -274,9 +395,9 @@ pub struct IqSweep {
     /// declared no burst. Carried so a processor can see where the gates
     /// were taken to start without reopening the file.
     pub burst_samples: usize,
-    /// `iMajorMode` verbatim. Modes 12 and 15 never reach here; see the
-    /// module note on refusals.
-    pub major_mode: i64,
+    /// `iMajorMode` verbatim for an RVP record. Modes 12 and 15 never reach
+    /// here; non-RVP sources leave it absent.
+    pub major_mode: Option<i64>,
     /// `iSampleSize`: the dwell length the processor itself would have used.
     /// A processor reading this record is free to choose another.
     pub nominal_sample_size: i64,
@@ -295,16 +416,16 @@ pub struct IqSweep {
     /// select alternate bins, or any other subset, and an index-times-spacing
     /// assumption then misplaces every gate.
     pub range_bins: Vec<f32>,
-    /// `fNoiseDBm` per channel, in dBm. Convert to the record's normalised
-    /// power with `10^((noise_dbm - saturation_dbm) / 10)`; that is the `N`
-    /// subtracted in `S = R(0) - N`.
-    pub noise_dbm: [f32; 2],
-    /// `fDBzCalib`, the reflectivity calibration constant in dB.
-    pub dbz_calibration: f32,
-    /// `fSaturationDBM`: the power in dBm that unit sample magnitude
-    /// represents. A sample's power in dBm is
-    /// `10*log10(i*i + q*q) + saturation_dbm`.
-    pub saturation_dbm: f32,
+    /// Calibration actually carried by the source. This is explicitly
+    /// relative when noise, receiver power and radar-constant metadata are
+    /// absent; callers must not manufacture placeholders for those values.
+    pub calibration: IqCalibration,
+    /// Pulse acquisition boundaries. MATLAB cubes use one span per azimuth
+    /// ray; RVP time series are continuous.
+    pub pulse_layout: PulseLayout,
+    /// Acquisition-specific I/Q phase convention, pinned against real motion
+    /// for each reader rather than inferred from a formula or filename.
+    pub doppler_phase_convention: DopplerPhaseConvention,
     /// Every pulse in the record, in the order it was transmitted.
     pub pulses: Vec<IqPulse>,
 }
@@ -342,9 +463,8 @@ impl IqSweep {
     /// Noise power for `channel` in the record's normalised units, ready to
     /// subtract from `R(0)`.
     #[must_use]
-    pub fn noise_power(&self, channel: usize) -> f32 {
-        let dbm = self.noise_dbm[channel.min(1)];
-        10f32.powf((dbm - self.saturation_dbm) / 10.0)
+    pub fn noise_power(&self, channel: usize) -> Option<f32> {
+        self.calibration.noise_power(channel)
     }
 
     /// Whether every pulse is separated from its neighbours by the same
@@ -606,19 +726,23 @@ pub fn decode_iq_time_series_limited(raw: &[u8], max_pulses: usize) -> Result<Iq
         time_utc: 0,
         time_millis: 0,
         wavelength_m: info.float("fWavelengthCM")? / 100.0,
-        pulse_width_s: info.float("fPWidthUSec")? * 1e-6,
-        polarization_code: info.opt_int("iPolarization")?.unwrap_or(0),
+        pulse_width_s: Some(info.float("fPWidthUSec")? * 1e-6),
+        polarization_code: info.opt_int("iPolarization")?,
         channels_recorded: geometry.channels,
         burst_samples,
-        major_mode,
+        major_mode: Some(major_mode),
         nominal_sample_size: info.opt_int("iSampleSize")?.unwrap_or(0),
         range_mask_res_m,
         gate_spacing_m: uniform_spacing(&range_bins),
         first_gate_m: range_bins.first().copied().unwrap_or(0.0),
         range_bins,
-        noise_dbm,
-        dbz_calibration,
-        saturation_dbm,
+        calibration: IqCalibration::Absolute {
+            noise_dbm,
+            dbz_calibration,
+            saturation_dbm,
+        },
+        pulse_layout: PulseLayout::Continuous,
+        doppler_phase_convention: DopplerPhaseConvention::PositiveLagPhaseIsPositiveVelocity,
         pulses: Vec::new(),
     };
 
@@ -1143,7 +1267,7 @@ mod tests {
         assert_eq!(sweep.pulses[0].h.len(), 4);
         assert_eq!(sweep.pulses[0].v.len(), 4);
         assert!((sweep.wavelength_m - 0.1108).abs() < 1e-6);
-        assert!((sweep.pulse_width_s - 1.5e-6).abs() < 1e-12);
+        assert!((sweep.pulse_width_s.unwrap() - 1.5e-6).abs() < 1e-12);
     }
 
     #[test]
@@ -1498,8 +1622,7 @@ mod tests {
         assert_eq!(whole.pulses.len(), 5);
         assert_eq!(clipped.pulses.len(), 2);
         assert_eq!(clipped.range_bins, whole.range_bins);
-        assert_eq!(clipped.noise_dbm, whole.noise_dbm);
-        assert_eq!(clipped.saturation_dbm, whole.saturation_dbm);
+        assert_eq!(clipped.calibration, whole.calibration);
     }
 
     #[test]
@@ -1649,8 +1772,8 @@ mod tests {
         // -80.5555 dBm against a 6 dBm saturation reference is -86.5555 dB
         // below unit magnitude squared.
         let expected = 10f32.powf(-86.5555 / 10.0);
-        assert!((sweep.noise_power(0) - expected).abs() < 1e-12);
-        assert!(sweep.noise_power(1) < sweep.noise_power(0));
+        assert!((sweep.noise_power(0).unwrap() - expected).abs() < 1e-12);
+        assert!(sweep.noise_power(1).unwrap() < sweep.noise_power(0).unwrap());
     }
 
     #[test]

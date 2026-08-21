@@ -80,7 +80,7 @@ use radar_core::{
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::iq::IqSweep;
+use crate::iq::{IqCalibration, IqSweep, PulseLayout};
 use estimator::{
     DwellGeometry, DwellWeights, GateEstimate, MomentCalibration, SnrCensor, estimate_gate,
 };
@@ -204,6 +204,37 @@ pub enum IqMomentError {
     #[error("dwell of {requested} pulses exceeds the {available} pulses in the sweep")]
     DwellExceedsSweep { requested: usize, available: usize },
     #[error(
+        "native ray spans require one {native}-pulse dwell per ray (requested {requested} pulses, \
+         stride {stride}); crossing rays would combine antenna positions and subdividing them \
+         would create duplicate-azimuth rows"
+    )]
+    NativeRayDwellRequired {
+        requested: usize,
+        stride: usize,
+        native: usize,
+    },
+    #[error(
+        "native ray span {index} starts at {start} with length {len}, outside the {available} \
+         pulses in the sweep"
+    )]
+    InvalidPulseSpan {
+        index: usize,
+        start: usize,
+        len: usize,
+        available: usize,
+    },
+    #[error(
+        "native ray span {index} has {actual} pulses against {expected} in the first ray; \
+         variable native ray lengths are not supported"
+    )]
+    NonUniformPulseSpans {
+        index: usize,
+        actual: usize,
+        expected: usize,
+    },
+    #[error("native ray span {index} overlaps or precedes the previous span")]
+    OverlappingPulseSpans { index: usize },
+    #[error(
         "pulse {pulse_index} has {actual} recorded bins but the sweep declares {expected} range bins"
     )]
     RangeBinCountMismatch {
@@ -275,6 +306,8 @@ pub struct ProcessingReport {
     pub stride: usize,
     pub taper: Taper,
     pub censor: SnrCensor,
+    /// Whether the requested SNR censor could actually be applied.
+    pub snr_application: SnrApplication,
     pub gates: usize,
     pub burst_samples_dropped: usize,
     pub dual_pol: bool,
@@ -295,6 +328,18 @@ pub struct ProcessingReport {
     pub below_noise_samples: usize,
     /// Worst departure of a recorded bin from the uniform ladder, metres.
     pub worst_range_bin_deviation_m: f32,
+}
+
+/// How the SNR control affected this processing run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SnrApplication {
+    Applied {
+        threshold_db: f32,
+    },
+    Off,
+    /// The source carries no measured receiver-noise reference, so SNR is not
+    /// computable and a threshold cannot honestly be applied.
+    UnavailableNoNoiseCalibration,
 }
 
 impl ProcessingReport {
@@ -365,21 +410,15 @@ pub fn process_sweep(sweep: &IqSweep, config: &MomentConfig) -> Result<Processed
     let geometry = DwellGeometry {
         wavelength_m: f64::from(sweep.wavelength_m),
         prt_s: f64::from(sweep.pulses[0].prt_seconds),
+        doppler_phase_convention: sweep.doppler_phase_convention,
     };
-    let calibration = MomentCalibration {
-        dbz0_db: sweep.dbz_calibration,
-        noise_dbm: sweep.noise_dbm,
-        saturation_dbm: sweep.saturation_dbm,
-        zdr_offset_db: config.zdr_offset_db,
-        phidp_offset_deg: config.phidp_offset_deg,
-        gaseous_attenuation_db_per_km: config.gaseous_attenuation_db_per_km,
-    };
+    let calibration = moment_calibration(sweep, config);
     let weights = DwellWeights::new(config.taper, config.dwell.pulses);
 
     let mut rows: Vec<(Radial, Vec<GateEstimate>)> = (0..plan.dwells)
         .into_par_iter()
         .map(|dwell| {
-            let start = dwell * config.dwell.stride;
+            let start = plan.dwell_starts[dwell];
             let pulses = &sweep.pulses[start..start + config.dwell.pulses];
             let radial = dwell_radial(pulses, start, &geometry, &plan);
             let estimates = dwell_estimates(
@@ -410,7 +449,13 @@ pub fn process_sweep(sweep: &IqSweep, config: &MomentConfig) -> Result<Processed
         .flat_map(|(_, estimates)| estimates)
         .collect();
 
-    cut.moments = build_moment_grids(&estimates, &plan, config);
+    cut.moments = build_moment_grids(&estimates, &plan, config, calibration);
+
+    let snr_application = match (calibration, config.censor) {
+        (MomentCalibration::RelativeStoredIq, _) => SnrApplication::UnavailableNoNoiseCalibration,
+        (_, SnrCensor::Off) => SnrApplication::Off,
+        (_, SnrCensor::MinDb(threshold_db)) => SnrApplication::Applied { threshold_db },
+    };
 
     let report = ProcessingReport {
         pulses_available: sweep.pulses.len(),
@@ -420,6 +465,7 @@ pub fn process_sweep(sweep: &IqSweep, config: &MomentConfig) -> Result<Processed
         stride: config.dwell.stride,
         taper: config.taper,
         censor: config.censor,
+        snr_application,
         gates: plan.gates,
         burst_samples_dropped: config.burst_samples,
         dual_pol: plan.dual_pol,
@@ -471,18 +517,12 @@ pub fn sweep_gate_spectrum(
     let geometry = DwellGeometry {
         wavelength_m: f64::from(sweep.wavelength_m),
         prt_s: f64::from(sweep.pulses[0].prt_seconds),
+        doppler_phase_convention: sweep.doppler_phase_convention,
     };
-    let calibration = MomentCalibration {
-        dbz0_db: sweep.dbz_calibration,
-        noise_dbm: sweep.noise_dbm,
-        saturation_dbm: sweep.saturation_dbm,
-        zdr_offset_db: config.zdr_offset_db,
-        phidp_offset_deg: config.phidp_offset_deg,
-        gaseous_attenuation_db_per_km: config.gaseous_attenuation_db_per_km,
-    };
+    let calibration = moment_calibration(sweep, config);
     let weights = DwellWeights::new(config.taper, config.dwell.pulses);
 
-    let start = dwell_index * config.dwell.stride;
+    let start = plan.dwell_starts[dwell_index];
     let pulses = &sweep.pulses[start..start + config.dwell.pulses];
     let bin = gate_index + plan.burst_samples;
     let samples: Vec<Complex> = pulses
@@ -538,6 +578,7 @@ const REFUSED_MAJOR_MODES: [(u32, &str); 2] = [
 #[derive(Clone, Debug)]
 struct SweepPlan {
     dwells: usize,
+    dwell_starts: Vec<usize>,
     gates: usize,
     burst_samples: usize,
     pulses_used: usize,
@@ -689,8 +730,69 @@ fn validate(sweep: &IqSweep, config: &MomentConfig) -> Result<SweepPlan> {
     }
 
     let stride = config.dwell.stride.max(1);
-    let dwells = (sweep.pulses.len() - config.dwell.pulses) / stride + 1;
-    let pulses_used = (dwells - 1) * stride + config.dwell.pulses;
+    let (dwell_starts, pulses_used) = match &sweep.pulse_layout {
+        PulseLayout::Continuous => {
+            let dwells = (sweep.pulses.len() - config.dwell.pulses) / stride + 1;
+            let starts: Vec<usize> = (0..dwells).map(|dwell| dwell * stride).collect();
+            let used = (dwells - 1) * stride + config.dwell.pulses;
+            (starts, used)
+        }
+        PulseLayout::Rays(spans) => {
+            let Some(first) = spans.first().copied() else {
+                return Err(IqMomentError::NoPulses);
+            };
+            if first.len == 0 {
+                return Err(IqMomentError::InvalidPulseSpan {
+                    index: 0,
+                    start: first.start,
+                    len: first.len,
+                    available: sweep.pulses.len(),
+                });
+            }
+            if config.dwell.pulses != first.len || stride != first.len {
+                return Err(IqMomentError::NativeRayDwellRequired {
+                    requested: config.dwell.pulses,
+                    stride,
+                    native: first.len,
+                });
+            }
+            let mut previous_end = None;
+            let mut starts = Vec::with_capacity(spans.len());
+            for (index, span) in spans.iter().copied().enumerate() {
+                let Some(end) = span.end() else {
+                    return Err(IqMomentError::InvalidPulseSpan {
+                        index,
+                        start: span.start,
+                        len: span.len,
+                        available: sweep.pulses.len(),
+                    });
+                };
+                if end > sweep.pulses.len() || span.len == 0 {
+                    return Err(IqMomentError::InvalidPulseSpan {
+                        index,
+                        start: span.start,
+                        len: span.len,
+                        available: sweep.pulses.len(),
+                    });
+                }
+                if span.len != first.len {
+                    return Err(IqMomentError::NonUniformPulseSpans {
+                        index,
+                        actual: span.len,
+                        expected: first.len,
+                    });
+                }
+                if previous_end.is_some_and(|previous| span.start < previous) {
+                    return Err(IqMomentError::OverlappingPulseSpans { index });
+                }
+                previous_end = Some(end);
+                starts.push(span.start);
+            }
+            let used = spans.len().saturating_mul(first.len);
+            (starts, used)
+        }
+    };
+    let dwells = dwell_starts.len();
 
     let mean_elevation_deg = sweep
         .pulses
@@ -701,6 +803,7 @@ fn validate(sweep: &IqSweep, config: &MomentConfig) -> Result<SweepPlan> {
 
     Ok(SweepPlan {
         dwells,
+        dwell_starts,
         gates,
         burst_samples: config.burst_samples,
         pulses_used,
@@ -793,13 +896,22 @@ fn build_moment_grids(
     estimates: &[GateEstimate],
     plan: &SweepPlan,
     config: &MomentConfig,
+    calibration: MomentCalibration,
 ) -> BTreeMap<MomentType, MomentGrid> {
-    let mut moments: Vec<(MomentType, MomentExtractor)> = vec![
-        (MomentType::Reflectivity, |value| value.reflectivity_dbz),
-        (MomentType::Velocity, |value| value.velocity_mps),
-        (MomentType::SpectrumWidth, |value| value.spectrum_width_mps),
-    ];
-    if plan.dual_pol {
+    let mut moments: Vec<(MomentType, MomentExtractor)> =
+        if matches!(calibration, MomentCalibration::RelativeStoredIq) {
+            vec![
+                (MomentType::RelativePower, |value| value.power_h_db),
+                (MomentType::Velocity, |value| value.velocity_mps),
+            ]
+        } else {
+            vec![
+                (MomentType::Reflectivity, |value| value.reflectivity_dbz),
+                (MomentType::Velocity, |value| value.velocity_mps),
+                (MomentType::SpectrumWidth, |value| value.spectrum_width_mps),
+            ]
+        };
+    if plan.dual_pol && !matches!(calibration, MomentCalibration::RelativeStoredIq) {
         moments.push((MomentType::DifferentialReflectivity, |value| {
             value.differential_reflectivity_db
         }));
@@ -811,9 +923,11 @@ fn build_moment_grids(
         }));
     }
     if config.emit_diagnostic_moments {
-        moments.push((MomentType::Unknown("SNR".to_owned()), |value| {
-            value.snr_h_db
-        }));
+        if !matches!(calibration, MomentCalibration::RelativeStoredIq) {
+            moments.push((MomentType::Unknown("SNR".to_owned()), |value| {
+                value.snr_h_db
+            }));
+        }
         moments.push((MomentType::Unknown("SQI".to_owned()), |value| value.sqi));
     }
 
@@ -823,6 +937,8 @@ fn build_moment_grids(
             let values: Vec<f32> = estimates.iter().map(extract).collect();
             let grid = MomentGrid {
                 moment: moment.clone(),
+                producer_description: None,
+                producer_units: None,
                 gate_range: plan.gate_range.clone(),
                 // `MomentGrid::scaled_value` returns an `f32` cell verbatim, so
                 // scale and offset are inert for this storage; they are set to
@@ -849,6 +965,24 @@ fn build_moment_grids(
             (moment, grid)
         })
         .collect()
+}
+
+fn moment_calibration(sweep: &IqSweep, config: &MomentConfig) -> MomentCalibration {
+    match sweep.calibration {
+        IqCalibration::Absolute {
+            noise_dbm,
+            dbz_calibration,
+            saturation_dbm,
+        } => MomentCalibration::absolute(
+            dbz_calibration,
+            noise_dbm,
+            saturation_dbm,
+            config.zdr_offset_db,
+            config.phidp_offset_deg,
+            config.gaseous_attenuation_db_per_km,
+        ),
+        IqCalibration::RelativeStoredIq => MomentCalibration::RelativeStoredIq,
+    }
 }
 
 #[cfg(test)]

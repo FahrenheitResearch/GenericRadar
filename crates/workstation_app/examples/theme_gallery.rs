@@ -118,6 +118,7 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod current_view_export;
     pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
@@ -152,9 +153,9 @@ mod source {
 }
 
 pub(crate) use source::{
-    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
-    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
-    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
+    iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
+    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
     product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
     units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
@@ -947,7 +948,7 @@ mod sheet {
     /// The label strip: which theme this is, in the theme's own ink, and
     /// exactly which axes it was photographed at. A sheet a reviewer cannot
     /// identify from the image alone is a sheet that gets attributed to the
-    /// wrong branch.
+    /// wrong theme variant.
     fn caption(ui: &mut egui::Ui, appearance: &Appearance) {
         let spec: &ThemeSpec = appearance.theme;
         bevel::raised_frame(ui, |ui| {
@@ -1358,10 +1359,10 @@ mod toolbar {
     /// The consequence is worth stating plainly, because it is easy to get
     /// backwards: **the PNGs this module writes must not be compared by
     /// checksum.** Two builds whose bars are identical in every colour will
-    /// still produce different md5s here. When the eight-theme catalog was
-    /// merged, the shipped dark bar's md5 changed and the shipped light
-    /// bar's did not; that difference was three pixels of ±1/255 on glyph
-    /// edges and meant nothing about either palette. The artifact that IS
+    /// still produce different md5s here. In a measured comparison, the
+    /// shipped dark bar's md5 changed while the shipped light bar's did not;
+    /// that difference was three pixels of ±1/255 on glyph edges and meant
+    /// nothing about either palette. The artifact that IS
     /// byte-comparable is the sample panel from `render_frame`, which builds
     /// a fresh context per image - that one is identical across builds, and
     /// it is what a "did this theme change?" question should be settled
@@ -1986,9 +1987,9 @@ mod toolbar {
     /// `WorkstationApp::ui` and the `clear_color` override from its
     /// `impl eframe::App` left all sixteen PNGs byte-identical, the bare-
     /// ground assertion passing, and all sixteen theme contract tests green.
-    /// That deletion is the field failure itself — it is how the ground was
-    /// lost the first time, when the per-frame `panel_fill` override was
-    /// removed as the theme landed.
+    /// Removing those calls therefore reproduces the missing-ground failure
+    /// without changing this harness's images. The full-application check
+    /// below is what covers their call sites.
     ///
     /// So this drives the real `<WorkstationApp as eframe::App>::ui` over a
     /// full window and reads its own shape list, and asks the real
@@ -2116,13 +2117,9 @@ mod toolbar {
 ///
 /// This is the densest chrome the application draws — a category list, a
 /// search strip, rows of combos, sliders, checkboxes and text fields, help
-/// paragraphs in weak ink, a status footer — and until now nothing
-/// photographed it. Every theme author who wanted to see their palette on it
-/// wrote a throwaway harness and deleted it again rather than edit a shared
-/// example while other branches were open. That is a gap in the proof kit,
-/// not a preference: weak help text on a busy page is exactly where a
-/// palette's secondary ink fails first, and the contact sheet's sample panel
-/// has no equivalent of it.
+/// paragraphs in weak ink, and a status footer. It specifically covers weak
+/// help text on a busy page, where a palette's secondary ink is under the most
+/// pressure and the contact sheet's sample panel has no equivalent.
 ///
 /// It is drawn through `settings_ui::draw_settings_window`, the shipped
 /// function, on a settings store of this run's own so no saved values can

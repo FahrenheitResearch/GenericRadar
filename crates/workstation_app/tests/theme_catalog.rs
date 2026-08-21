@@ -3,12 +3,9 @@
 //!
 //! `tests/theme_contract.rs` pins the LANGUAGE - the bevel arithmetic, the
 //! square corners, the founding pair's numbers. This file pins the
-//! FRAMEWORK, and it is written for a situation that is about to happen:
-//! several themes arriving on several branches at once, each written by
-//! somebody who cannot see the others. Nothing here names a theme except the
-//! two founding entries; everything else iterates
-//! `theme::catalog::THEMES` crossed with `theme::Accent::ALL`, so a theme
-//! registered tomorrow is measured by the tests written today.
+//! FRAMEWORK. Nothing here names a theme except the two founding entries;
+//! everything else iterates `theme::catalog::THEMES` crossed with
+//! `theme::Accent::ALL`, so every registered theme receives the same checks.
 //!
 //! # The floors, and why each one is where it is
 //!
@@ -100,8 +97,7 @@ fn the_catalog_is_a_mergeable_alphabetical_list_of_unique_ids() {
     assert_eq!(
         ids, sorted,
         "the registration list in src/theme/catalog.rs is out of alphabetical order.\n\
-         It is sorted so that themes arriving on parallel branches merge without \
-         anybody having to read the file: {ids:?}"
+         Alphabetical order keeps catalog ordering deterministic: {ids:?}"
     );
     let mut unique = sorted.clone();
     unique.dedup();
@@ -268,9 +264,8 @@ fn pairings(p: &Palette) -> Vec<Pairing> {
 /// THE audit. Every registered theme, crossed with every accent, measured
 /// against every pairing the chrome paints.
 ///
-/// This is the test that lets six theme authors work in parallel without a
-/// reviewer measuring anything by hand. A failure names the theme, the
-/// accent, the pairing, the ratio and the two colours.
+/// This provides complete automatic coverage of the catalog. A failure names
+/// the theme, the accent, the pairing, the ratio and the two colours.
 #[test]
 fn every_theme_and_accent_clears_its_contrast_floor() {
     let mut failures = Vec::new();

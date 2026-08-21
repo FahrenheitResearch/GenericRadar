@@ -1,14 +1,10 @@
 //! Architectural constraints on the workstation binary.
 //!
-//! There is deliberately NO line-count limit here, and one should not be added
-//! back. An earlier version of this file capped every module at 2000 lines and
-//! `main.rs` at 300. It did not produce small modules; it produced modules that
-//! stopped at exactly the limit - seven files landed between 1927 and 2000
-//! lines, `app.rs` at precisely 2000 - and it charged the same rent for a
-//! `#[cfg(test)]` block as for shipped code, so the cheapest way to stay under
-//! it was to write fewer tests or to scatter a file for arithmetic reasons
-//! rather than for a reason a reader would recognise. Module size is a
-//! judgement call, and it is made by whoever is reading the module.
+//! No line-count limit is enforced. File length cannot distinguish shipped code
+//! from a `#[cfg(test)]` block, and splitting at an arithmetic threshold does
+//! not establish a coherent component boundary. Modules are organized by
+//! responsibility; the machine-checked constraint here is the dependency
+//! firewall below.
 //!
 //! What remains is the dependency firewall, which is a real architectural
 //! boundary rather than a proxy for one: it says which crates the workstation

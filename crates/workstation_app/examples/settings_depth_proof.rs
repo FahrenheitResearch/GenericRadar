@@ -103,17 +103,14 @@ enum Scene {
     /// the controls that save and switch. Not a page of knobs, so the only
     /// way to know it reads as a page is to look at it.
     Profiles,
-    /// One of the pages the settings audit added, drawn in this window. The
-    /// three surfaces met for the first time in this integration and nothing
-    /// short of a photograph says whether an audited page looks like a page.
+    /// A cross-cutting settings page, drawn in the real window so its layout is
+    /// visible rather than inferred from the registry.
     AuditPage,
-    /// A search that lands on rows the audit added. The window branch built
-    /// search; the audit added the rows; nothing but a photograph shows a
-    /// reader that typing a word reaches them.
+    /// A search that lands on rows from that page, showing that typing a word
+    /// reaches them through the same search surface as every other setting.
     SearchAudit,
-    /// The Data page, which the audit and the window branch both edited: the
-    /// window gave it headings, the audit added a row to it, and the row
-    /// belongs under a heading of its own.
+    /// The Data page with headings, including the playback row under its own
+    /// heading.
     AuditSections,
 }
 
@@ -180,7 +177,7 @@ fn founding() -> [Appearance; 2] {
 
 fn shots() -> Vec<Shot> {
     let mut shots = Vec::new();
-    // The four states the brief names, in both themes, at 1× and 2×.
+    // The core layout states, in both themes, at 1× and 2×.
     for scene in [
         Scene::Default,
         Scene::Ungrouped,
@@ -493,8 +490,8 @@ fn seeded_store(scene: Scene) -> SettingsStore {
                 SettingValue::Float(1.6),
             );
         }
-        // The audit's pages with real values on them, so the modified marks
-        // are on rows the audit added rather than only on older pages.
+        // A cross-cutting page with real values on it, so this scene exercises
+        // modified marks on its rows as well as on older pages.
         Scene::AuditPage => {
             store.set(
                 keys::annotation::CATEGORY,
@@ -627,10 +624,10 @@ fn ui_state(scene: Scene) -> settings_ui::SettingsUi {
             // `seed_profile_files`, called once from `main`.
             state.open_category(keys::profiles::CATEGORY);
         }
-        // The audit's biggest new page: ten rows that used to be constants in
-        // `pane_canvas.rs`.
+        // The largest cross-cutting page: ten rows that control annotation
+        // behavior previously fixed in `pane_canvas.rs`.
         Scene::AuditPage => state.open_category(keys::annotation::CATEGORY),
-        // "ring" is on the audit's own page and nowhere else.
+        // "ring" occurs on this page and nowhere else.
         Scene::SearchAudit => state.open_search("ring"),
         Scene::AuditSections => state.open_category(keys::data::CATEGORY),
     }

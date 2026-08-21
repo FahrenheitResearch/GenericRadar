@@ -1,6 +1,5 @@
-//! The unified visual language of the workstation: Windows 95, but modern —
-//! and, since the appearance framework landed, a language with more than one
-//! set of colours in it.
+//! The unified visual language of the workstation: Windows 95, but modern,
+//! with a catalog of colour themes.
 //!
 //! # The shape of this module
 //!
@@ -76,9 +75,9 @@
 //! Contrast floors are tested, not asserted in prose: primary text ≥ 7:1 on
 //! face and well, all other live foregrounds ≥ 4.5:1, flat borders ≥ 3:1,
 //! bevel edges ≥ 1.3:1 against the face they sculpt (W3C WCAG 2.2, 2023,
-//! SC 1.4.3 / 1.4.11). The audit runs over EVERY registered theme crossed
-//! with EVERY accent, which is what lets themes arrive on parallel branches
-//! without a reviewer measuring anything by hand.
+//! SC 1.4.3 / 1.4.11). The audit runs over every registered theme crossed
+//! with every accent, so new catalog entries receive the full measurement
+//! set automatically.
 //!
 //! # Metrics
 //!
@@ -173,8 +172,8 @@ fn state_id() -> egui::Id {
 ///
 /// Both egui theme slots are styled — so anything that later flips the
 /// preference still lands on this language, never on stock egui — and the
-/// preference is set to the chosen theme's ground. One call at startup and
-/// one per appearance change is the entire integration.
+/// preference is set to the chosen theme's ground. Call this at startup and
+/// after each appearance change.
 pub fn apply(ctx: &egui::Context, appearance: &Appearance) {
     install(ctx, appearance);
     ctx.set_theme(match appearance.theme.ground {

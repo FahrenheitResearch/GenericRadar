@@ -389,6 +389,8 @@ pub fn upsample_moment_grid(cut: &ElevationCut, grid: &MomentGrid) -> Option<Int
     Some(InterpolatedGrid {
         grid: MomentGrid {
             moment: grid.moment.clone(),
+            producer_description: grid.producer_description.clone(),
+            producer_units: grid.producer_units.clone(),
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -445,6 +447,8 @@ mod tests {
         };
         let grid = MomentGrid {
             moment,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -755,8 +759,8 @@ mod tests {
     /// millisecond count. A millisecond count measures the machine, not this
     /// code: these passes take about 3.3 / 2.3 / 8.0 / 10.4 ms on an idle
     /// 32-core box, and the `< 2000 ms` ceiling this replaced -- a 240x
-    /// margin -- still went red at 2584.71 ms with several cargo builds
-    /// running beside it, on a branch that had not touched this crate at all.
+    /// margin -- still went red at 2584.71 ms under heavy concurrent host
+    /// load, without any change to this crate.
     /// A threshold raised until it stops failing is the same flake with a
     /// longer fuse, so there is no absolute time threshold here: machine
     /// speed and machine load divide out of a ratio.
@@ -1724,6 +1728,8 @@ mod real_data_tests {
             }
             let coarse = MomentGrid {
                 moment: MomentType::Reflectivity,
+                producer_description: None,
+                producer_units: None,
                 gate_range: GateRange {
                     first_gate_m: grid.gate_range.first_gate_m + 3 * 250 / 2,
                     gate_spacing_m: 1000,

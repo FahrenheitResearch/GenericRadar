@@ -120,9 +120,9 @@ fn text_colors(shapes: &[egui::Shape]) -> Vec<egui::Color32> {
 
 // --- Readout & annotation, measured on the frame ---------------------------
 //
-// These are the end-to-end half of the settings audit: not "the value reached
-// a struct" but "the pane painted something different because of it". Every
-// assertion here reads the shapes `draw_pane` actually emitted.
+// These are the end-to-end settings checks: not "the value reached a struct"
+// but "the pane painted something different because of it". Every assertion
+// here reads the shapes `draw_pane` actually emitted.
 
 /// Ring radii, in screen points, off the emitted circles.
 ///
@@ -977,12 +977,12 @@ mod the_picker_itself {
 /// ground on purpose, so that a statement cannot be tuned down by picking a
 /// different look. That is a claim about paint, and it was made when there
 /// were two themes and eight arrived. These measure it, with the same WCAG
-/// arithmetic `tests/theme_catalog.rs` audits the chrome with, so a number
+/// arithmetic `tests/theme_catalog.rs` uses for the chrome, so a number
 /// here and a number there mean the same thing.
 ///
-/// This module used to audit a full-width FILTERED band as well: its deep-red
+/// This module used to test a full-width FILTERED band as well: its deep-red
 /// ground against its near-white ink, and the invariance of that pair across
-/// the catalog. That band no longer exists, so those two audits have no
+/// the catalog. That band no longer exists, so those two checks have no
 /// subject and are gone; the claims they made - "the
 /// indicator that says gates are hidden is readable" and "it does not follow
 /// the theme" - are re-pointed here onto the pane header, which is where the

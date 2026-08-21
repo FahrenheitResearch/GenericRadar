@@ -78,6 +78,7 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod current_view_export;
     pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
@@ -113,9 +114,9 @@ mod source {
 
 #[allow(unused_imports)]
 pub(crate) use source::{
-    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
-    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
-    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
+    iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
+    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
     product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
     units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
@@ -358,8 +359,8 @@ fn run(input: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // feeds it (see `frame`), and the zoom is left to the theme. Calling
         // `set_pixels_per_point` for the display instead would be overwritten
         // by the next `theme::apply`, because `set_pixels_per_point` and
-        // `set_zoom_factor` write the same field: that is what silently
-        // reduced this proof's 2x capture to 1x when the theme wave landed.
+        // `set_zoom_factor` write the same field, which would silently reduce
+        // this proof's 2x capture to 1x.
         //
         // Computed rather than read back: `Context::pixels_per_point` answers
         // for the pass that has already run, and nothing has run yet here.

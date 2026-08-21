@@ -130,8 +130,8 @@ fn save_change_switch_away_and_back_restores_the_document_exactly() {
     store.set("map", "basemap_style", SettingValue::Text("slate".into()));
     store.set("map", "site_markers", SettingValue::Bool(false));
     store.set("data", "poll_seconds", SettingValue::Int(15));
-    // A setting from a branch this build has not merged yet: nothing here
-    // knows what it means, and the profile still has to carry it.
+    // A setting this build does not recognize: nothing here knows what it
+    // means, and the profile still has to carry it.
     store.set(
         "gate_filter",
         "min_dbz",

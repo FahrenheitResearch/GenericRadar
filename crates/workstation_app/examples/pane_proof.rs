@@ -50,6 +50,7 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod current_view_export;
     pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
@@ -85,9 +86,9 @@ mod source {
 
 #[allow(unused_imports)]
 pub(crate) use source::{
-    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
-    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
-    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
+    iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
+    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
     product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
     units, user_tables, vol3d, vrot, warnings_service, xsection,
 };

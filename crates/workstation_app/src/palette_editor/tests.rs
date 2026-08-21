@@ -994,8 +994,8 @@ fn a_name_this_build_already_ships_is_refused_before_anything_is_written() {
 ///
 /// The file is unreachable from the UI while it carries that name, and this
 /// build has nowhere to say so: there is no faults or notices surface in the
-/// window for a palette directory. Recording that here rather than inventing
-/// one, so the gap is a known one - see the branch notes.
+/// window for a palette directory. This test records the limitation without
+/// inventing a second reporting surface.
 #[test]
 fn a_hand_made_file_named_after_a_preset_loses_the_name_and_keeps_its_bytes() {
     let dir = scratch_dir("shipped-shadow");
@@ -2212,7 +2212,7 @@ fn the_preview_ground_is_dark_in_both_theme_variants() {
 /// pure-white 60 dBZ band vanished on the one control that has to show it.
 ///
 /// Read off the shapes the real window painted, in both variants, rather than
-/// off the source: what a reviewer sees is what got painted.
+/// off the source: the visible result is what matters.
 #[test]
 fn the_strip_stands_on_the_same_ground_as_the_preview_in_both_theme_variants() {
     let (dark, light) = super::ui::preview_ground();

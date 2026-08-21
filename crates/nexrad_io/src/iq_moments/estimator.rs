@@ -67,62 +67,140 @@
 
 use super::fft::Complex;
 use super::taper::Taper;
+use crate::iq::DopplerPhaseConvention;
 
-/// Calibration constants applied to a dwell, all of which travel with the
-/// sweep rather than being hard-coded.
+/// The meaning of a logarithmic power value produced from stored I/Q.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerReference {
+    /// Absolute received power.
+    AbsoluteDbm,
+    /// Power relative to one squared unit in the stored I/Q integers.
+    RelativeStoredIqSquared,
+}
+
+impl PowerReference {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AbsoluteDbm => "dBm",
+            Self::RelativeStoredIqSquared => "dB re stored I/Q unit²",
+        }
+    }
+}
+
+/// Calibration constants applied to a dwell. Relative acquisitions are a
+/// distinct variant so a missing radar constant or noise floor cannot be
+/// filled with a plausible-looking numeric placeholder.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MomentCalibration {
-    /// SIGMET/IRIS dBZ0: the reflectivity of a target at 1 km range that
-    /// returns a signal power equal to the receiver noise power. The RVP8/RVP900
-    /// `fDBzCalib` header field is exactly this quantity, so it maps straight in.
-    ///
-    /// The reference point is worth stating explicitly because the other common
-    /// convention - dBZ at 1 km for 0 dBm of received power - differs from it by
-    /// the noise power, which is 80 dB. A constant quoted that way converts as
-    /// `dbz0_db = quoted + noise_dbm`.
-    ///
-    /// Measured, not asserted, on the reference file: over its first 64-pulse
-    /// dwell the convective core peaks at 66.7 dBZ at 11.5 km, and over the
-    /// whole file read as one 1830-pulse dwell at 65.1 dBZ at 13.5 km, against
-    /// a declared noise power of -80.5555 dBm and a saturation level of
-    /// +6 dBm. There are two ways to get that core wrong and they differ from
-    /// each other, so both are worth naming:
-    ///
-    /// * Reading -35.5 as if it were 0 dBm-referenced - that is, building
-    ///   reflectivity on received power in dBm rather than on SNR - moves every
-    ///   gate down by `noise_dbm`, 80.56 dB, and puts the core at -14 dBZ.
-    /// * Building it on the decoded I/Q power directly, in the normalised scale
-    ///   where a magnitude of 1.0 is `saturation_dbm`, moves it down by a
-    ///   further 6 dB - `noise_dbm - saturation_dbm`, 86.56 dB in all - and
-    ///   puts the core at -20 dBZ.
-    ///
-    /// Either is exactly the kind of plausible-looking wrong field this module
-    /// is written to avoid; `crates/nexrad_io/tests/iq_moments_real.rs` fails on
-    /// both.
-    pub dbz0_db: f32,
-    /// Receiver noise power, dBm, `[horizontal, vertical]`.
-    pub noise_dbm: [f32; 2],
-    /// The dBm corresponding to a decoded I/Q magnitude of 1.0. RVP8
-    /// `fSaturationDBM`.
-    pub saturation_dbm: f32,
-    /// `D_cal` added to differential reflectivity.
-    pub zdr_offset_db: f32,
-    /// `phi_cal` added to differential phase, degrees, before wrapping.
-    pub phidp_offset_deg: f32,
-    /// Two-way gaseous attenuation, dB per km of range, added back into
-    /// reflectivity. Defaults to zero so that nothing is applied unasked; the
-    /// WSR-88D applies a fixed two-way value of about 0.016 dB per km at low
-    /// elevation angles in a standard atmosphere (Doviak and Zrnic 1993,
-    /// section 3.3).
-    pub gaseous_attenuation_db_per_km: f32,
+pub enum MomentCalibration {
+    Absolute {
+        /// SIGMET/IRIS dBZ0: the reflectivity of a target at 1 km range that
+        /// returns a signal power equal to the receiver noise power. The RVP8/RVP900
+        /// `fDBzCalib` header field is exactly this quantity, so it maps straight in.
+        ///
+        /// The reference point is worth stating explicitly because the other common
+        /// convention - dBZ at 1 km for 0 dBm of received power - differs from it by
+        /// the noise power, which is 80 dB. A constant quoted that way converts as
+        /// `dbz0_db = quoted + noise_dbm`.
+        ///
+        /// Measured, not asserted, on the reference file: over its first 64-pulse
+        /// dwell the convective core peaks at 66.7 dBZ at 11.5 km, and over the
+        /// whole file read as one 1830-pulse dwell at 65.1 dBZ at 13.5 km, against
+        /// a declared noise power of -80.5555 dBm and a saturation level of
+        /// +6 dBm. There are two ways to get that core wrong and they differ from
+        /// each other, so both are worth naming:
+        ///
+        /// * Reading -35.5 as if it were 0 dBm-referenced - that is, building
+        ///   reflectivity on received power in dBm rather than on SNR - moves every
+        ///   gate down by `noise_dbm`, 80.56 dB, and puts the core at -14 dBZ.
+        /// * Building it on the decoded I/Q power directly, in the normalised scale
+        ///   where a magnitude of 1.0 is `saturation_dbm`, moves it down by a
+        ///   further 6 dB - `noise_dbm - saturation_dbm`, 86.56 dB in all - and
+        ///   puts the core at -20 dBZ.
+        ///
+        /// Either is exactly the kind of plausible-looking wrong field this module
+        /// is written to avoid; `crates/nexrad_io/tests/iq_moments_real.rs` fails on
+        /// both.
+        dbz0_db: f32,
+        /// Receiver noise power, dBm, `[horizontal, vertical]`.
+        noise_dbm: [f32; 2],
+        /// The dBm corresponding to a decoded I/Q magnitude of 1.0. RVP8
+        /// `fSaturationDBM`.
+        saturation_dbm: f32,
+        /// `D_cal` added to differential reflectivity.
+        zdr_offset_db: f32,
+        /// `phi_cal` added to differential phase, degrees, before wrapping.
+        phidp_offset_deg: f32,
+        /// Two-way gaseous attenuation, dB per km of range, added back into
+        /// reflectivity. Defaults to zero so that nothing is applied unasked; the
+        /// WSR-88D applies a fixed two-way value of about 0.016 dB per km at low
+        /// elevation angles in a standard atmosphere (Doviak and Zrnic 1993,
+        /// section 3.3).
+        gaseous_attenuation_db_per_km: f32,
+    },
+    /// Stored receiver units only. No receiver-noise, dBm, dBZ or calibrated
+    /// polarimetric quantity may be derived from this variant.
+    RelativeStoredIq,
 }
 
 impl MomentCalibration {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn absolute(
+        dbz0_db: f32,
+        noise_dbm: [f32; 2],
+        saturation_dbm: f32,
+        zdr_offset_db: f32,
+        phidp_offset_deg: f32,
+        gaseous_attenuation_db_per_km: f32,
+    ) -> Self {
+        Self::Absolute {
+            dbz0_db,
+            noise_dbm,
+            saturation_dbm,
+            zdr_offset_db,
+            phidp_offset_deg,
+            gaseous_attenuation_db_per_km,
+        }
+    }
+
+    #[must_use]
+    pub const fn power_reference(self) -> PowerReference {
+        match self {
+            Self::Absolute { .. } => PowerReference::AbsoluteDbm,
+            Self::RelativeStoredIq => PowerReference::RelativeStoredIqSquared,
+        }
+    }
+
+    #[must_use]
+    pub const fn power_db_offset(self) -> f32 {
+        match self {
+            Self::Absolute { saturation_dbm, .. } => saturation_dbm,
+            Self::RelativeStoredIq => 0.0,
+        }
+    }
+
+    #[must_use]
+    pub fn noise_dbm(self, channel: usize) -> Option<f32> {
+        match self {
+            Self::Absolute { noise_dbm, .. } => Some(noise_dbm[channel.min(1)]),
+            Self::RelativeStoredIq => None,
+        }
+    }
+
     /// Noise power of a channel in the same normalised linear units the decoded
     /// I/Q samples carry (magnitude 1.0 is `saturation_dbm`).
-    pub fn noise_linear(&self, channel: usize) -> f64 {
-        let dbm = f64::from(self.noise_dbm[channel.min(1)]);
-        10f64.powf((dbm - f64::from(self.saturation_dbm)) / 10.0)
+    pub fn noise_linear(self, channel: usize) -> Option<f64> {
+        match self {
+            Self::Absolute {
+                noise_dbm,
+                saturation_dbm,
+                ..
+            } => {
+                let dbm = f64::from(noise_dbm[channel.min(1)]);
+                Some(10f64.powf((dbm - f64::from(saturation_dbm)) / 10.0))
+            }
+            Self::RelativeStoredIq => None,
+        }
     }
 }
 
@@ -272,12 +350,20 @@ impl DwellWeights {
 pub struct DwellGeometry {
     pub wavelength_m: f64,
     pub prt_s: f64,
+    pub doppler_phase_convention: DopplerPhaseConvention,
 }
 
 impl DwellGeometry {
     /// `v_a = lambda / 4 T`.
     pub fn nyquist_velocity_mps(&self) -> f64 {
         self.wavelength_m / (4.0 * self.prt_s)
+    }
+
+    /// Convert the argument of `x[k] * conj(x[k + 1])` into signed velocity.
+    pub fn velocity_from_lag_phase(&self, phase_rad: f64) -> f64 {
+        self.doppler_phase_convention.velocity_multiplier() * self.wavelength_m
+            / (4.0 * std::f64::consts::PI * self.prt_s)
+            * phase_rad
     }
 }
 
@@ -289,16 +375,16 @@ impl DwellGeometry {
 /// so a censored gate arrives at the renderer as an empty pixel with no
 /// translation step in between.
 ///
-/// Every *moment* is censored together. The diagnostics - `power_h_dbm`,
+/// Every *moment* is censored together. The diagnostics - `power_h_db`,
 /// `snr_h_db`, `snr_v_db` and `sqi` - are not, because they are what explains a
 /// censored gate and none of them can be misread as weather.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GateEstimate {
     pub range_m: f32,
-    /// Total received power in the horizontal channel, dBm, before noise
-    /// subtraction. Never censored - it is the first thing you want to read
-    /// when a gate *is* censored.
-    pub power_h_dbm: f32,
+    /// Total received power before noise subtraction. Read its reference from
+    /// [`Self::power_reference`]; a relative file must never be labelled dBm.
+    pub power_h_db: f32,
+    pub power_reference: PowerReference,
     pub snr_h_db: f32,
     pub snr_v_db: f32,
     /// `|R(1)| / R(0)`, the normalised coherency, sometimes NCP. Near 1 for
@@ -351,7 +437,8 @@ impl GateEstimate {
     fn blank(range_m: f32) -> Self {
         Self {
             range_m,
-            power_h_dbm: f32::NAN,
+            power_h_db: f32::NAN,
+            power_reference: PowerReference::RelativeStoredIqSquared,
             snr_h_db: f32::NAN,
             snr_v_db: f32::NAN,
             sqi: f32::NAN,
@@ -386,11 +473,39 @@ pub fn estimate_gate(
         return GateEstimate::blank(range_m);
     }
 
-    let noise_h = calibration.noise_linear(0);
-    let noise_v = calibration.noise_linear(1);
-
     let r0h = weights.lag0(h);
     let r1h = weights.lag1(h);
+    let mut estimate = GateEstimate::blank(range_m);
+    estimate.power_reference = calibration.power_reference();
+    estimate.power_h_db = (to_db(r0h) + f64::from(calibration.power_db_offset())) as f32;
+    estimate.sqi = if r0h > 0.0 {
+        (r1h.norm() / r0h) as f32
+    } else {
+        f32::NAN
+    };
+
+    // A relative cube has no receiver-noise measurement. Its received-power
+    // field and lag-1 phase remain meaningful, but SNR censoring, dBZ, width
+    // and calibrated dual-pol products do not. Returning here is the guard
+    // against those absent capabilities quietly acquiring zero-valued
+    // calibration constants.
+    if matches!(calibration, MomentCalibration::RelativeStoredIq) {
+        estimate.below_noise = false;
+        estimate.censored = false;
+        estimate.velocity_mps = if r1h.norm() > 0.0 {
+            geometry.velocity_from_lag_phase(r1h.arg()) as f32
+        } else {
+            f32::NAN
+        };
+        return estimate;
+    }
+
+    let noise_h = calibration
+        .noise_linear(0)
+        .expect("absolute calibration carries horizontal noise");
+    let noise_v = calibration
+        .noise_linear(1)
+        .expect("absolute calibration carries vertical noise");
     let signal_h = r0h - noise_h;
     let snr_h = if noise_h > 0.0 {
         signal_h / noise_h
@@ -399,14 +514,7 @@ pub fn estimate_gate(
     };
     let snr_h_db = to_db(snr_h);
 
-    let mut estimate = GateEstimate::blank(range_m);
-    estimate.power_h_dbm = (to_db(r0h) + f64::from(calibration.saturation_dbm)) as f32;
     estimate.snr_h_db = snr_h_db as f32;
-    estimate.sqi = if r0h > 0.0 {
-        (r1h.norm() / r0h) as f32
-    } else {
-        f32::NAN
-    };
 
     // Velocity obeys the censor exactly like every other moment. It is
     // tempting to exempt it - `arg R(1)` is an angle, not a magnitude, so it
@@ -431,15 +539,24 @@ pub fn estimate_gate(
     }
     estimate.censored = false;
 
-    estimate.velocity_mps =
-        (geometry.wavelength_m / (4.0 * std::f64::consts::PI * geometry.prt_s) * r1h.arg()) as f32;
+    estimate.velocity_mps = geometry.velocity_from_lag_phase(r1h.arg()) as f32;
 
     // Z = 10 log10(S/N) + dBZ0 + 20 log10(r_km) + gaseous attenuation.
     let range_km = (f64::from(range_m).max(1.0)) / 1000.0;
+    let MomentCalibration::Absolute {
+        dbz0_db,
+        zdr_offset_db,
+        phidp_offset_deg,
+        gaseous_attenuation_db_per_km,
+        ..
+    } = *calibration
+    else {
+        unreachable!("relative calibration returned before calibrated moments")
+    };
     estimate.reflectivity_dbz = (snr_h_db
-        + f64::from(calibration.dbz0_db)
+        + f64::from(dbz0_db)
         + 20.0 * range_km.log10()
-        + f64::from(calibration.gaseous_attenuation_db_per_km) * range_km)
+        + f64::from(gaseous_attenuation_db_per_km) * range_km)
         as f32;
 
     // W = (lambda / 2 sqrt(2) pi T) sqrt(ln(S / |R(1)|)), Zrnic 1977. The log
@@ -476,9 +593,8 @@ pub fn estimate_gate(
         estimate.snr_v_db = snr_v_db as f32;
 
         if signal_v > 0.0 && !censor.hides(snr_v_db) {
-            estimate.differential_reflectivity_db = (10.0 * (signal_h / signal_v).log10()
-                + f64::from(calibration.zdr_offset_db))
-                as f32;
+            estimate.differential_reflectivity_db =
+                (10.0 * (signal_h / signal_v).log10() + f64::from(zdr_offset_db)) as f32;
 
             let c0 = weights.cross_lag0(h, v);
 
@@ -496,7 +612,7 @@ pub fn estimate_gate(
                 f32::NAN
             };
 
-            let phi = c0.arg().to_degrees() + f64::from(calibration.phidp_offset_deg);
+            let phi = c0.arg().to_degrees() + f64::from(phidp_offset_deg);
             estimate.differential_phase_deg = wrap_degrees(phi) as f32;
         }
     }
@@ -527,20 +643,14 @@ mod tests {
     use super::*;
 
     fn calibration() -> MomentCalibration {
-        MomentCalibration {
-            dbz0_db: -35.5,
-            noise_dbm: [-80.0, -80.0],
-            saturation_dbm: 6.0,
-            zdr_offset_db: 0.0,
-            phidp_offset_deg: 0.0,
-            gaseous_attenuation_db_per_km: 0.0,
-        }
+        MomentCalibration::absolute(-35.5, [-80.0, -80.0], 6.0, 0.0, 0.0, 0.0)
     }
 
     fn geometry() -> DwellGeometry {
         DwellGeometry {
             wavelength_m: 0.1108,
             prt_s: 833.375e-6,
+            doppler_phase_convention: DopplerPhaseConvention::default(),
         }
     }
 
@@ -586,6 +696,45 @@ mod tests {
                 estimate.velocity_mps
             );
         }
+    }
+
+    #[test]
+    fn relative_amplitude_rescaling_moves_power_but_not_velocity_or_fake_calibration() {
+        let geometry = geometry();
+        let weights = DwellWeights::new(Taper::Rectangular, 32);
+        let low = tone(32, 7.25, 1.0, &geometry);
+        let high = tone(32, 7.25, 10.0, &geometry);
+        let low = estimate_gate(
+            &low,
+            &[],
+            &weights,
+            &geometry,
+            &MomentCalibration::RelativeStoredIq,
+            SnrCensor::MinDb(20.0),
+            1_000.0,
+        );
+        let high = estimate_gate(
+            &high,
+            &[],
+            &weights,
+            &geometry,
+            &MomentCalibration::RelativeStoredIq,
+            SnrCensor::MinDb(20.0),
+            1_000.0,
+        );
+
+        assert!((high.power_h_db - low.power_h_db - 20.0).abs() < 1.0e-4);
+        assert!((high.velocity_mps - low.velocity_mps).abs() < 1.0e-5);
+        assert!((low.velocity_mps - 7.25).abs() < 0.01);
+        assert_eq!(low.power_reference, PowerReference::RelativeStoredIqSquared);
+        assert!(low.snr_h_db.is_nan());
+        assert!(low.reflectivity_dbz.is_nan());
+        assert!(low.spectrum_width_mps.is_nan());
+        assert!(
+            !low.censored,
+            "an unavailable SNR censor must not hide data"
+        );
+        assert!(!low.below_noise, "no unmeasured noise floor may be implied");
     }
 
     #[test]
@@ -793,7 +942,7 @@ mod tests {
         // run past the ceiling by 11 m/s.
         let calibration = calibration();
         let pulses = 64usize;
-        let amplitude = (calibration.noise_linear(0) * (1.0 + 100.0)).sqrt();
+        let amplitude = (calibration.noise_linear(0).unwrap() * (1.0 + 100.0)).sqrt();
         let mut phase = 0.0f64;
         let samples: Vec<Complex> = (0..pulses)
             .map(|k| {
@@ -813,7 +962,7 @@ mod tests {
             30_000.0,
         );
         // The dwell really is one the unclamped formula would run away on.
-        let signal = weights.lag0(&samples) - calibration.noise_linear(0);
+        let signal = weights.lag0(&samples) - calibration.noise_linear(0).unwrap();
         let unclamped = geometry.wavelength_m
             / (2.0 * std::f64::consts::SQRT_2 * std::f64::consts::PI * geometry.prt_s)
             * (signal / weights.lag1(&samples).norm()).ln().sqrt();
@@ -836,7 +985,7 @@ mod tests {
         // Half the noise power: R(0) < N, so S is negative and no moment
         // exists. `Off` declines to apply a threshold; it cannot invent a
         // signal the dwell did not measure.
-        let amplitude = (calibration.noise_linear(0) * 0.5).sqrt();
+        let amplitude = (calibration.noise_linear(0).unwrap() * 0.5).sqrt();
         let h = tone(64, 4.0, amplitude, &geometry);
         let estimate = estimate_gate(
             &h,
@@ -852,7 +1001,7 @@ mod tests {
         assert!(estimate.reflectivity_dbz.is_nan());
         assert!(estimate.velocity_mps.is_nan());
         // The diagnostics still explain it.
-        assert!(estimate.power_h_dbm.is_finite());
+        assert!(estimate.power_h_db.is_finite());
         assert!(estimate.sqi.is_finite());
 
         // A gate with real signal is neither, whatever the censor says.
@@ -860,7 +1009,7 @@ mod tests {
             &tone(
                 64,
                 4.0,
-                (calibration.noise_linear(0) * 100.0).sqrt(),
+                (calibration.noise_linear(0).unwrap() * 100.0).sqrt(),
                 &geometry,
             ),
             &[],
@@ -879,7 +1028,7 @@ mod tests {
             &tone(
                 64,
                 4.0,
-                (calibration.noise_linear(0) * (1.0 + 10f64.powf(0.1))).sqrt(),
+                (calibration.noise_linear(0).unwrap() * (1.0 + 10f64.powf(0.1))).sqrt(),
                 &geometry,
             ),
             &[],
@@ -922,7 +1071,7 @@ mod tests {
         // The synthetic tone carries no noise of its own, so the amplitude is
         // set to the TOTAL power the estimator will see: noise plus a signal
         // 1 dB above it. After the estimator subtracts the noise, SNR is 1 dB.
-        let noise = calibration.noise_linear(0);
+        let noise = calibration.noise_linear(0).unwrap();
         let amplitude = (noise * (1.0 + 10f64.powf(0.1))).sqrt();
         let h = tone(64, 4.0, amplitude, &geometry);
         let hidden = estimate_gate(
@@ -942,7 +1091,7 @@ mod tests {
         assert!(hidden.velocity_mps.is_nan());
         // The diagnostics survive censoring, which is the point of censoring
         // rather than dropping.
-        assert!(hidden.power_h_dbm.is_finite());
+        assert!(hidden.power_h_db.is_finite());
         assert!(hidden.snr_h_db.is_finite());
         assert!(hidden.sqi.is_finite());
 

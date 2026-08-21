@@ -2,7 +2,7 @@
 //! refusals that keep a wrong field off the screen.
 
 use super::*;
-use crate::iq::IqPulse;
+use crate::iq::{IqCalibration, IqPulse};
 
 const WAVELENGTH_M: f32 = 0.1108;
 const PRT_S: f32 = 833.375e-6;
@@ -114,15 +114,17 @@ impl SweepBuilder {
             site: "TST".to_owned(),
             time_utc: 1_369_079_161,
             wavelength_m: WAVELENGTH_M,
-            pulse_width_s: 1.5e-6,
+            pulse_width_s: Some(1.5e-6),
             gate_spacing_m: Some(self.gate_spacing_m),
             first_gate_m: self.first_bin_m,
             range_bins: (0..bins)
                 .map(|bin| self.first_bin_m + self.gate_spacing_m * bin as f32)
                 .collect(),
-            noise_dbm: [NOISE_DBM, NOISE_DBM],
-            dbz_calibration: -35.5,
-            saturation_dbm: SATURATION_DBM,
+            calibration: IqCalibration::Absolute {
+                noise_dbm: [NOISE_DBM, NOISE_DBM],
+                dbz_calibration: -35.5,
+                saturation_dbm: SATURATION_DBM,
+            },
             pulses,
             burst_samples: self.burst_samples,
             ..IqSweep::default()
@@ -222,7 +224,12 @@ fn the_reflectivity_grid_carries_the_range_correction_gate_by_gate() {
     for (gate, estimate) in dwell.iter().enumerate() {
         let range_km = f64::from(estimate.range_m) / 1000.0;
         let expected = SweepBuilder::snr_db_of(gate)
-            + f64::from(sweep.dbz_calibration)
+            + f64::from(
+                sweep
+                    .calibration
+                    .dbz_calibration()
+                    .expect("synthetic sweep is calibrated"),
+            )
             + 20.0 * range_km.log10();
         assert!(
             (f64::from(estimate.reflectivity_dbz) - expected).abs() < 0.25,
@@ -259,7 +266,7 @@ fn the_snr_threshold_censors_weak_gates_and_off_shows_what_it_was_hiding() {
     assert!(censored[first_hidden].reflectivity_dbz.is_nan());
     assert!(uncensored[first_hidden].reflectivity_dbz.is_finite());
     // The diagnostic that explains the censoring survives it.
-    assert!(censored[first_hidden].power_h_dbm.is_finite());
+    assert!(censored[first_hidden].power_h_db.is_finite());
 
     // And the censored cells reach the renderer as NaN, which its f32 path
     // skips - no sentinel value, no second convention.
@@ -636,7 +643,7 @@ fn gates_with_no_signal_above_the_noise_are_counted_apart_from_the_censor() {
     assert!(dwell[16].below_noise && dwell[16].censored);
     assert!(dwell[16].reflectivity_dbz.is_nan());
     // The diagnostics that explain it survive.
-    assert!(dwell[16].power_h_dbm.is_finite());
+    assert!(dwell[16].power_h_db.is_finite());
     assert!(!dwell[0].below_noise && !dwell[0].censored);
 
     // With the operational threshold the same gates are still below the noise,
@@ -673,7 +680,7 @@ fn a_gate_spectrum_peaks_at_the_velocity_the_pulse_pair_estimate_reports() {
             sweep_gate_spectrum(&sweep, &config, 0, gate, 0).expect("spectrum for a real gate");
         assert_eq!(spectrum.velocities_mps.len(), config.dwell.pulses);
         let peak = spectrum
-            .power_dbm
+            .power_db
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))

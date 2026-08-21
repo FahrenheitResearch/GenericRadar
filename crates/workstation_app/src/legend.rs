@@ -45,7 +45,7 @@ use std::sync::Arc;
 use color_tables::{ColorTable, Rgba8};
 use eframe::egui;
 use product_engine::ticks::nice_ticks;
-use product_engine::{DisplayDomain, ValueRange};
+use product_engine::{DisplayDomain, DisplayUnit, ValueRange};
 
 /// The most ticks a bar may carry before the ladder is thinned.
 ///
@@ -214,8 +214,26 @@ pub struct LegendLayout {
     pub span: ValueRange,
     /// Ascending by value, and therefore by [`LegendTick::fraction`].
     pub ticks: Vec<LegendTick>,
-    /// The unit the labels are in. Empty for a dimensionless product.
+    /// The compact pane-legend unit the labels are in. Empty for a
+    /// dimensionless product.
+    ///
+    /// This may be shorter than [`DisplayUnit::label`], which is also used in
+    /// readouts where there is room to spell out a reference completely.
     pub unit_label: &'static str,
+}
+
+/// The unit text that fits under a pane's colour bar.
+///
+/// Relative I/Q power is deliberately not called dBm or dBZ: the source has
+/// neither an absolute receiver-power calibration nor a radar constant. Its
+/// full readout label, `dB re stored I/Q unit²`, remains the product engine's
+/// label; the pane legend uses the compact but still explicitly relative form
+/// so this one unit cannot double the panel's radar coverage.
+fn legend_unit_label(unit: DisplayUnit) -> &'static str {
+    match unit {
+        DisplayUnit::RelativeIqPowerDb => "dB (rel)",
+        _ => unit.label(),
+    }
 }
 
 /// The engine-value span a legend should show: the product's declared domain
@@ -306,7 +324,7 @@ pub fn legend_layout(domain: &DisplayDomain, table: &ColorTable) -> Option<Legen
     Some(LegendLayout {
         span,
         ticks,
-        unit_label: domain.display_unit.label(),
+        unit_label: legend_unit_label(domain.display_unit),
     })
 }
 
@@ -1065,6 +1083,23 @@ mod tests {
             "a symmetric velocity domain puts zero at the middle of the bar, got {}",
             zero.fraction
         );
+    }
+
+    #[test]
+    fn relative_iq_power_has_a_compact_but_still_explicitly_relative_pane_unit() {
+        let domain = builtin_domain("PWR_REL");
+        assert_eq!(
+            domain.display_unit.label(),
+            "dB re stored I/Q unit²",
+            "readouts keep the complete reference"
+        );
+
+        let layout = legend_layout(&domain, &builtin_table_for("PWR_REL"))
+            .expect("relative power has a legend");
+        assert_eq!(layout.unit_label, "dB (rel)");
+        assert!(layout.unit_label.contains("rel"));
+        assert_ne!(layout.unit_label, "dBm");
+        assert_ne!(layout.unit_label, "dBZ");
     }
 
     #[test]

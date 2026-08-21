@@ -351,7 +351,7 @@ pub(crate) fn previous_sweep_for(
 /// extension of `5_PPI_v1` - so they are matched by their `swp.` naming
 /// convention instead; see [`looks_like_radar_file`].
 const RADAR_FILE_EXTENSIONS: &[&str] = &[
-    "ar2v", "bz2", "gz", "h5", "hd5", "hdf", "msg31", "nc", "raw", "v06", "v08", "zip",
+    "ar2v", "bz2", "gz", "h5", "hd5", "hdf", "mat", "msg31", "nc", "raw", "v06", "v08", "zip",
 ];
 
 /// Whether a path is worth handing to the decoder.
@@ -378,29 +378,39 @@ pub(crate) fn looks_like_radar_file(path: &std::path::Path) -> bool {
     }
 }
 
-/// Pick which of a drop's paths to open.
+/// Pick the radar candidates out of a drop.
 ///
-/// Dropping a selection rather than a single file is normal - an analyst
-/// grabs a volume and the screenshot sitting next to it - so this takes the
-/// first plausible radar file rather than simply the first file, and one
-/// stray `.png` cannot clear the session.
+/// Dropping a selection rather than a single file is normal. Every plausible
+/// radar path is retained for a file playlist while a screenshot or notes
+/// beside them are ignored.
 ///
 /// If nothing in the drop looks like radar data, the first path is returned
 /// anyway. A decoder error naming the file the analyst dropped is more use
 /// than a drop target that silently does nothing, which reads as a bug.
+pub(crate) fn choose_dropped_radar_files(
+    paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut all = Vec::new();
+    let mut radar = Vec::new();
+    for path in paths {
+        if looks_like_radar_file(&path) {
+            radar.push(path.clone());
+        }
+        all.push(path);
+    }
+    if radar.is_empty() {
+        all.into_iter().take(1).collect()
+    } else {
+        radar
+    }
+}
+
+/// The first candidate, retained for single-file decoder-path tests.
+#[cfg(test)]
 pub(crate) fn choose_dropped_radar_file(
     paths: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
-    let mut first = None;
-    for path in paths {
-        if looks_like_radar_file(&path) {
-            return Some(path);
-        }
-        if first.is_none() {
-            first = Some(path);
-        }
-    }
-    first
+    choose_dropped_radar_files(paths).into_iter().next()
 }
 
 #[cfg(test)]
@@ -436,6 +446,25 @@ mod tests {
     }
 
     #[test]
+    fn every_radar_file_in_a_drop_becomes_a_playlist_candidate_in_drop_order() {
+        let dropped = [
+            "notes.txt",
+            "KTLX19990503_233631",
+            "screenshot.png",
+            "KTLX19990503_234201",
+        ]
+        .into_iter()
+        .map(PathBuf::from);
+        assert_eq!(
+            choose_dropped_radar_files(dropped),
+            vec![
+                PathBuf::from("KTLX19990503_233631"),
+                PathBuf::from("KTLX19990503_234201"),
+            ]
+        );
+    }
+
+    #[test]
     fn accepts_every_container_the_routing_seam_can_identify() {
         for name in [
             "KDVN20260819_192802_V06",
@@ -448,6 +477,7 @@ mod tests {
             "T_PAGZ35.hdf",
             "polrad.hd5",
             "cfrad.20211011_223602_DOW8_RHI.nc",
+            "iq_OUPRIME_20100510_224711_e00.12_prt2.mat",
             "deployment.zip",
             "volume.bz2",
             // Real DORADE sweepfiles, whose names are dotted field lists.
@@ -492,6 +522,17 @@ mod tests {
             Some(PathBuf::from(
                 "deployment/swp.1090509143923.NOXPRVP.0.0.5_PPI_v1"
             ))
+        );
+    }
+
+    #[test]
+    fn a_matlab_iq_cube_wins_a_drop_over_non_radar_files() {
+        let dropped = ["case/notes.txt", "case/scan.mat", "case/screenshot.png"]
+            .into_iter()
+            .map(PathBuf::from);
+        assert_eq!(
+            choose_dropped_radar_file(dropped),
+            Some(PathBuf::from("case/scan.mat"))
         );
     }
 

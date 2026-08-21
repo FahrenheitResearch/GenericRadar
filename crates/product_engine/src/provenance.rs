@@ -110,6 +110,28 @@ pub const NEXRAD_LEVEL_II_ICD: LiteratureCitation = LiteratureCitation {
     doi_or_url: "https://www.roc.noaa.gov/public-documents/icds/2620010P.pdf",
 };
 
+/// The DOW6/7 dual-frequency processing design: two complete radar chains,
+/// independently producing moments before their products are merged
+/// downstream.
+pub const DIXON_ET_AL_2013: LiteratureCitation = LiteratureCitation {
+    authors: "Dixon, M., E. Loew, J. Wurman, and K. Kosiba",
+    year: 2013,
+    title: "Signal Processing in the DOWs Using Pentek Processors",
+    venue: "36th Conference on Radar Meteorology, AMS, paper 16B.5",
+    doi_or_url: "https://ams.confex.com/ams/36Radar/webprogram/Paper229282.html",
+};
+
+/// The published DOW field dictionary. It defines DBM as received power in
+/// dBm and DBZ as equivalent reflectivity factor in dBZ for the horizontal
+/// and vertical receiver channels.
+pub const NASA_DOW_OLYMPEX_GUIDE_2017: LiteratureCitation = LiteratureCitation {
+    authors: "NASA Global Hydrology Resource Center DAAC",
+    year: 2017,
+    title: "Data User Guide: GPM Ground Validation Doppler on Wheels (DOW) OLYMPEX Radar Data",
+    venue: "GPM Ground Validation data documentation",
+    doi_or_url: "https://ghrc.nsstc.nasa.gov/uso/ds_details/inactive/gpmdowolyx/gpmdowolyx_dataset_v1.pdf",
+};
+
 /// The continuity approach the velocity unfolder in `render2d` follows: walk
 /// outward along a radial from a trusted seed and add Nyquist intervals to keep
 /// successive gates continuous.

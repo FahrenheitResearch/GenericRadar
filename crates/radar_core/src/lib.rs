@@ -153,19 +153,178 @@ impl From<u8> for RadialStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum MomentType {
     Reflectivity,
+    /// Uncalibrated power relative to one squared stored I/Q unit.
+    RelativePower,
     Velocity,
     SpectrumWidth,
     DifferentialReflectivity,
     CorrelationCoefficient,
     DifferentialPhase,
     SpecificDifferentialPhase,
+    /// Producer-defined research-radar products whose identity is known more
+    /// precisely than an arbitrary string.
+    Research(ResearchMoment),
     Unknown(String),
+}
+
+/// Research-radar products that must remain distinct from the operational
+/// moment set.
+///
+/// DOW6 and DOW7 are dual-frequency systems. Their `1`, `2`, and `M` products
+/// are separate first-frequency, second-frequency, and downstream-merged
+/// fields; collapsing all six reflectivity names onto [`MomentType::Reflectivity`]
+/// would silently discard five grids when a sweep carries the complete set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ResearchMoment {
+    DowReceivedPower {
+        receiver: RadarReceiverChannel,
+        frequency: DowFrequencyProduct,
+    },
+    DowEquivalentReflectivity {
+        receiver: RadarReceiverChannel,
+        frequency: DowFrequencyProduct,
+    },
+}
+
+/// Receiver channel encoded by the `H` or `V` in a DOW product name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum RadarReceiverChannel {
+    Horizontal,
+    Vertical,
+}
+
+/// Frequency leg encoded by the final character of a DOW product name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum DowFrequencyProduct {
+    Frequency1,
+    Frequency2,
+    /// The producer's downstream merge, not an inferred arithmetic mean.
+    Merged,
+}
+
+impl ResearchMoment {
+    /// Resolve an exact producer token. Callers normalize case and whitespace;
+    /// this function deliberately does not accept aliases that could collapse
+    /// two independently sampled fields.
+    pub fn from_producer_name(name: &str) -> Option<Self> {
+        use DowFrequencyProduct::{Frequency1, Frequency2, Merged};
+        use RadarReceiverChannel::{Horizontal, Vertical};
+
+        let moment = match name {
+            "DBMH1" => Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            },
+            "DBMH2" => Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            },
+            "DBMHM" => Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Merged,
+            },
+            "DBMV1" => Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency1,
+            },
+            "DBMV2" => Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency2,
+            },
+            "DBMVM" => Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Merged,
+            },
+            "DBZH1" => Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            },
+            "DBZH2" => Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            },
+            "DBZHM" => Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Merged,
+            },
+            "DBZV1" => Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency1,
+            },
+            "DBZV2" => Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency2,
+            },
+            "DBZVM" => Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Merged,
+            },
+            _ => return None,
+        };
+        Some(moment)
+    }
+
+    pub const fn short_name(self) -> &'static str {
+        use DowFrequencyProduct::{Frequency1, Frequency2, Merged};
+        use RadarReceiverChannel::{Horizontal, Vertical};
+        match self {
+            Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            } => "DBMH1",
+            Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            } => "DBMH2",
+            Self::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Merged,
+            } => "DBMHM",
+            Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency1,
+            } => "DBMV1",
+            Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency2,
+            } => "DBMV2",
+            Self::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Merged,
+            } => "DBMVM",
+            Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            } => "DBZH1",
+            Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            } => "DBZH2",
+            Self::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Merged,
+            } => "DBZHM",
+            Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency1,
+            } => "DBZV1",
+            Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency2,
+            } => "DBZV2",
+            Self::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Merged,
+            } => "DBZVM",
+        }
+    }
 }
 
 impl MomentType {
     pub fn from_nexrad_name(name: &str) -> Self {
         match name.trim() {
             "REF" => Self::Reflectivity,
+            "PWR_REL" => Self::RelativePower,
             "VEL" => Self::Velocity,
             "SW" => Self::SpectrumWidth,
             "ZDR" => Self::DifferentialReflectivity,
@@ -179,6 +338,7 @@ impl MomentType {
     pub fn from_nexrad_bytes(name: &[u8]) -> Self {
         match name {
             b"REF" => return Self::Reflectivity,
+            b"PWR_REL" => return Self::RelativePower,
             b"VEL" => return Self::Velocity,
             b"SW " | b"SW" => return Self::SpectrumWidth,
             b"ZDR" => return Self::DifferentialReflectivity,
@@ -190,6 +350,7 @@ impl MomentType {
 
         match trim_ascii_name(name) {
             b"REF" => Self::Reflectivity,
+            b"PWR_REL" => Self::RelativePower,
             b"VEL" => Self::Velocity,
             b"SW" => Self::SpectrumWidth,
             b"ZDR" => Self::DifferentialReflectivity,
@@ -203,12 +364,14 @@ impl MomentType {
     pub fn short_name(&self) -> &str {
         match self {
             Self::Reflectivity => "REF",
+            Self::RelativePower => "PWR_REL",
             Self::Velocity => "VEL",
             Self::SpectrumWidth => "SW",
             Self::DifferentialReflectivity => "ZDR",
             Self::CorrelationCoefficient => "RHO",
             Self::DifferentialPhase => "PHI",
             Self::SpecificDifferentialPhase => "KDP",
+            Self::Research(moment) => moment.short_name(),
             Self::Unknown(name) => name.as_str(),
         }
     }
@@ -330,6 +493,15 @@ pub fn format_snr_threshold_db(threshold_db: f32) -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MomentGrid {
     pub moment: MomentType,
+    /// Acquisition-system description attached to this exact field, when its
+    /// container supplies one (for example DORADE PARM bytes 16..56).
+    #[serde(default)]
+    pub producer_description: Option<String>,
+    /// Acquisition-system unit token attached to this exact field. Kept as
+    /// text because unknown research fields must not have units inferred from
+    /// their mnemonic.
+    #[serde(default)]
+    pub producer_units: Option<String>,
     pub gate_range: GateRange,
     pub scale: f32,
     pub offset: f32,
@@ -355,6 +527,8 @@ impl MomentGrid {
     ) -> Self {
         Self {
             moment,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale,
             offset,
@@ -377,6 +551,8 @@ impl MomentGrid {
     ) -> Self {
         Self {
             moment,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale,
             offset,
@@ -947,6 +1123,80 @@ mod tests {
             MomentType::from_nexrad_bytes(b"\0VEL"),
             MomentType::Velocity
         );
+    }
+
+    #[test]
+    fn relative_power_has_one_stable_source_name() {
+        assert_eq!(
+            MomentType::from_nexrad_name(" PWR_REL "),
+            MomentType::RelativePower
+        );
+        assert_eq!(
+            MomentType::from_nexrad_bytes(b"PWR_REL\0"),
+            MomentType::RelativePower
+        );
+        assert_eq!(MomentType::RelativePower.short_name(), "PWR_REL");
+    }
+
+    #[test]
+    fn research_moments_keep_every_producer_name_distinct() {
+        use DowFrequencyProduct::{Frequency1, Frequency2, Merged};
+        use RadarReceiverChannel::{Horizontal, Vertical};
+
+        let moments = [
+            ResearchMoment::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            },
+            ResearchMoment::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            },
+            ResearchMoment::DowReceivedPower {
+                receiver: Horizontal,
+                frequency: Merged,
+            },
+            ResearchMoment::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency1,
+            },
+            ResearchMoment::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Frequency2,
+            },
+            ResearchMoment::DowReceivedPower {
+                receiver: Vertical,
+                frequency: Merged,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency1,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Frequency2,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Horizontal,
+                frequency: Merged,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency1,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Frequency2,
+            },
+            ResearchMoment::DowEquivalentReflectivity {
+                receiver: Vertical,
+                frequency: Merged,
+            },
+        ];
+        let names: std::collections::BTreeSet<&str> =
+            moments.iter().map(|moment| moment.short_name()).collect();
+        assert_eq!(names.len(), moments.len());
+        assert_eq!(names.first(), Some(&"DBMH1"));
     }
 
     #[test]

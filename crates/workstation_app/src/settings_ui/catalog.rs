@@ -48,9 +48,9 @@ pub mod keys {
         /// RETIRED, and not to be reused: `map/range_rings`.
         ///
         /// It was declared `pending_wiring` for a range-ring layer that had in
-        /// fact always been drawn, and it stayed declared after this audit
-        /// shipped the live ladder as `annotation/ring_ladder`. The window
-        /// therefore offered TWO rows labelled "Range rings", the dead one
+        /// fact always been drawn, and it remained after the live ladder became
+        /// `annotation/ring_ladder`. The window therefore offered TWO rows
+        /// labelled "Range rings", the dead one
         /// reading "Off" above the live one, and a search for "range rings"
         /// found the lie first. The row is gone; the id is recorded here so
         /// nobody gives it a second meaning, because a settings file written
@@ -331,8 +331,8 @@ pub fn register_into(registry: &mut SettingsRegistry) {
     registry.register(xsection_category());
     registry.register(timeseries_category());
     // Last, because it is the page about the other pages: a named snapshot of
-    // everything above it, including the four categories registered here by
-    // the audit.
+    // everything above it, including Units, Data & network, Readout &
+    // annotation, and Cross-sections.
     registry.register(profiles_category());
 }
 
@@ -934,12 +934,10 @@ fn data_category() -> SettingsCategory {
             .help("Memory ceiling for the volume timeline.")
             .group("History held in memory"),
             // The loop's speed sits beside the loop's depth: the two rows
-            // above decide how much there is to play, this decides how fast
-            // it plays. It was the audit's own strongest near-miss, left out
-            // on the argument that a loop speed belongs on the toolbar - but
-            // the toolbar is the surface this application deliberately keeps
-            // quiet, and a control that exists in neither place is the one
-            // outcome the philosophy does not ask for.
+            // above decide how much there is to play, this decides how fast it
+            // plays. The toolbar is the surface this application deliberately
+            // keeps quiet, so the settings page is the durable home for this
+            // control.
             //
             // Its own heading rather than the history one, and declared here
             // rather than at the end of the page, because sections are runs
@@ -1424,7 +1422,7 @@ fn timeseries_category() -> SettingsCategory {
         vec![
             SettingSpec::new(
                 k::DWELL_PULSES,
-                "Pulses per dwell",
+                "Preferred pulses per dwell",
                 integer(
                     limit::MIN_DWELL,
                     limit::MAX_DWELL,
@@ -1433,13 +1431,15 @@ fn timeseries_category() -> SettingsCategory {
                 ),
             )
             .help(
-                "How many transmitted pulses are averaged into one radial. This is the \
-                 trade the radar made once, at scan time, and never wrote down. A long \
-                 dwell averages more pulses, so the moments are steadier and the \
-                 spectrum is finer in velocity, over a wider smear of azimuth; a short \
-                 one resolves the storm's own changes and gives more radials, from \
-                 noisier estimates. Dwells do not overlap, so the radial count is the \
-                 pulse count divided by this.",
+                "For a continuous pulse stream, how many transmitted pulses are averaged \
+                 into one radial. This is the trade the radar made once, at scan time, \
+                 and never wrote down. A long dwell averages more pulses, so the moments \
+                 are steadier and the spectrum is finer in velocity, over a wider smear \
+                 of azimuth; a short one resolves the storm's own changes and gives more \
+                 radials, from noisier estimates. Dwells do not overlap, so the radial \
+                 count is the pulse count divided by this. A source that preserves \
+                 measured ray boundaries ignores this preference and keeps one native \
+                 ray per dwell; the pane header names the dwell actually in use.",
             ),
             SettingSpec::new(
                 k::WINDOW,
@@ -1476,7 +1476,9 @@ fn timeseries_category() -> SettingsCategory {
                  comparable. All the way left applies no threshold, which is the only way \
                  to see what the operational one was throwing away. Gates with no power \
                  above the receiver noise stay blank either way: that is a measurement, \
-                 not a threshold.",
+                 not a threshold. A source with no measured receiver-noise reference \
+                 cannot produce a signal-to-noise ratio and ignores this preference; the \
+                 pane header states that receiver noise is unavailable.",
             ),
             SettingSpec::new(
                 k::SPECTRUM_CHANNEL,
@@ -1526,10 +1528,10 @@ mod tests {
     /// One row in the whole window is named "Range rings", and it is the live
     /// one.
     ///
-    /// The defect this closes: `map/range_rings` was declared for a
-    /// range-ring layer that had in fact always been drawn, and it survived
-    /// the audit that shipped the real ladder as `annotation/ring_ladder`. A
-    /// search for "range rings" returned two rows - a greyed Map one reading
+    /// The defect this closes: `map/range_rings` was declared for a range-ring
+    /// layer that had in fact always been drawn, and it remained after the real
+    /// ladder became `annotation/ring_ladder`. A search for "range rings"
+    /// returned two rows - a greyed Map one reading
     /// "Off" above a live Readout & annotation one - and the dead one came
     /// first, so the honest reading of the window was that the control did
     /// nothing.
@@ -1704,10 +1706,10 @@ mod tests {
     #[test]
     fn the_pages_that_had_grown_into_a_wall_carry_headings() {
         let registry = registry();
-        // The last two arrived with the audit, after the window branch had
-        // already broken the first two into sections. Readout & annotation
-        // shipped as ten ungrouped rows - photographed as exactly the wall
-        // this machinery exists to prevent - and Data & network as six.
+        // Readout & annotation has ten rows and Data & network has six; both
+        // need the same grouping already used by the other long pages. Without
+        // it, the settings appear as the wall of controls this machinery exists
+        // to prevent.
         //
         // The minimum is per page rather than one number for all of them:
         // the six rows of Data & network divide honestly into two, and

@@ -33,6 +33,7 @@ use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{InterpolatedGrid, UpsampleFactors, upsample_moment_grid};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
+    ResearchMoment,
 };
 use rayon::prelude::*;
 pub use smooth::smooth_moment_grid;
@@ -288,6 +289,24 @@ pub fn render_moment_png(
 ) -> Result<()> {
     let image = render_moment_image(volume, cut_index, moment, options)?;
     image.save(out_path)?;
+    Ok(())
+}
+
+/// Write an already-rendered RGBA8 image to PNG.
+///
+/// The workstation owns window capture because eframe owns the composited
+/// pixels; PNG encoding stays here beside the other image output so the thin
+/// application crate does not acquire an image-codec dependency of its own.
+pub fn write_rgba_png(pixels: &[u8], width: u32, height: u32, out_path: &Path) -> Result<()> {
+    ensure_rgba_buffer(pixels, width, height)?;
+    image::save_buffer_with_format(
+        out_path,
+        pixels,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+        image::ImageFormat::Png,
+    )?;
     Ok(())
 }
 
@@ -3557,10 +3576,11 @@ fn censors(censor: Option<&GateFilterMask>, row: usize, gate: usize) -> bool {
 /// hottest loop in this crate: one candidate walk per pixel per rebuild, with a
 /// body of a few nanoseconds. Asking `Option<&GateFilterMask>` inside that walk
 /// is not free even when the answer is always no - measured on a real KDVN
-/// volume with the filter OFF, against 2e5ecf1, a per-candidate `Option` test
+/// volume with the filter OFF, against the uncensored baseline, a
+/// per-candidate `Option` test
 /// cost `geometry_cache_resolve` +39% to +52% and `sample_cache_build` +13% to
 /// +23% across four viewport and product combinations, while
-/// `decode_from_bytes`, which neither commit touches, stayed inside 1.4%.
+/// the unchanged `decode_from_bytes` control stayed inside 1.4%.
 /// Hoisting the `Option` into a register recovered the second of those and none
 /// of the first; deleting the test recovered both, which is what identified it.
 ///
@@ -3800,6 +3820,8 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
 
     MomentGrid {
         moment: MomentType::Velocity,
+        producer_description: source.producer_description.clone(),
+        producer_units: source.producer_units.clone(),
         gate_range: source.gate_range.clone(),
         scale: DEALIASED_VELOCITY_SCALE,
         offset: DEALIASED_VELOCITY_OFFSET,
@@ -4293,9 +4315,10 @@ impl AzimuthLookup {
     /// reliably on the same cache line, so a per-candidate `censors` puts a
     /// second line in the dependency chain of a loop whose whole body is a few
     /// nanoseconds. Measured on a real KDVN volume with the filter OFF, against
-    /// 2e5ecf1: `geometry_cache_resolve` +34% to +48% and `sample_cache_build`
+    /// the uncensored baseline: `geometry_cache_resolve` +34% to +48% and
+    /// `sample_cache_build`
     /// +13% to +23%, reproducible across four viewport/product combinations
-    /// while `decode_from_bytes` - which neither commit touches - stayed within
+    /// while the unchanged `decode_from_bytes` control stayed within
     /// 1.4%. The raster arms did not move, because they do more work per
     /// candidate and already touch the values array.
     ///
@@ -4581,12 +4604,21 @@ pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
     // rather than silently join them.
     match moment {
         MomentType::Reflectivity => ColorTableFamily::Reflectivity,
+        // This is uncalibrated stored-I/Q power, not dBZ. A reflectivity table
+        // would visually claim a calibration the source file does not carry.
+        MomentType::RelativePower => ColorTableFamily::Generic,
         MomentType::Velocity => ColorTableFamily::Velocity,
         MomentType::SpectrumWidth => ColorTableFamily::SpectrumWidth,
         MomentType::DifferentialReflectivity => ColorTableFamily::DifferentialReflectivity,
         MomentType::CorrelationCoefficient => ColorTableFamily::CorrelationCoefficient,
         MomentType::DifferentialPhase => ColorTableFamily::DifferentialPhase,
         MomentType::SpecificDifferentialPhase => ColorTableFamily::SpecificDifferentialPhase,
+        MomentType::Research(ResearchMoment::DowReceivedPower { .. }) => {
+            ColorTableFamily::ReceivedPower
+        }
+        MomentType::Research(ResearchMoment::DowEquivalentReflectivity { .. }) => {
+            ColorTableFamily::Reflectivity
+        }
         // Only genuinely unclassified moments. Every cached WSR-88D volume
         // carries `Unknown("CFP")`, clutter filter power, which has no family
         // of its own yet.
@@ -4597,11 +4629,34 @@ pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use radar_core::{GateRange, MomentRow, RadarSite, RadarVolume, Radial};
+    use radar_core::{
+        DowFrequencyProduct, GateRange, MomentRow, RadarReceiverChannel, RadarSite, RadarVolume,
+        Radial,
+    };
 
     #[test]
     fn base_layer_starts_visible() {
         assert!(RenderLayer::base(MomentType::Reflectivity).visible);
+    }
+
+    #[test]
+    fn research_power_and_reflectivity_use_their_physical_color_families() {
+        let received = MomentType::Research(ResearchMoment::DowReceivedPower {
+            receiver: RadarReceiverChannel::Horizontal,
+            frequency: DowFrequencyProduct::Frequency1,
+        });
+        let reflectivity = MomentType::Research(ResearchMoment::DowEquivalentReflectivity {
+            receiver: RadarReceiverChannel::Vertical,
+            frequency: DowFrequencyProduct::Merged,
+        });
+        assert_eq!(
+            color_family_for_moment(&received),
+            ColorTableFamily::ReceivedPower
+        );
+        assert_eq!(
+            color_family_for_moment(&reflectivity),
+            ColorTableFamily::Reflectivity
+        );
     }
 
     #[test]
@@ -4677,6 +4732,8 @@ mod tests {
         });
         let grid = MomentGrid {
             moment: MomentType::Velocity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -5464,6 +5521,25 @@ mod tests {
     }
 
     #[test]
+    fn rgba_png_writer_rejects_bad_shape_and_writes_decodable_pixels() {
+        let bad = write_rgba_png(&[0; 15], 2, 2, Path::new("unused.png"))
+            .expect_err("a short RGBA buffer must be refused before disk access");
+        assert!(matches!(bad, RenderError::BufferSizeMismatch { .. }));
+
+        let path =
+            std::env::temp_dir().join(format!("render2d-rgba-png-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pixels = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        write_rgba_png(&pixels, 2, 2, &path).expect("write RGBA PNG");
+        let decoded = image::open(&path).expect("decode written PNG").to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn viewport_cache_rejects_different_volume() {
         let volume = test_volume();
         let other_volume = test_volume();
@@ -5569,6 +5645,8 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Velocity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -5883,9 +5961,9 @@ mod tests {
         (rendered.image.into_raw(), rendered.report)
     }
 
-    /// The pin for the fall-through. Revert `AzimuthLookup::censors` - or build
-    /// the lookup from the censored copy instead of the sweep as it arrived -
-    /// and this fails with thousands of recoloured pixels.
+    /// The pin for the fall-through. If `AzimuthLookup::censors` is bypassed,
+    /// or the lookup is built from the censored copy instead of the sweep as it
+    /// arrived, this fails with thousands of recoloured pixels.
     #[test]
     fn a_censored_gate_is_never_replaced_by_the_beam_beside_it() {
         let (plain, plain_report) = overlapping_beam_raster(&GateFilter::OFF);
@@ -6463,8 +6541,8 @@ mod tests {
 
         // And the geometry-cache resolve, which an independent measurement put
         // at +2.9% against the pre-filter base on REF cut 0 - the one figure
-        // that came out over the 2% budget. This arm asks the only question
-        // this branch can answer for it: what does the CENSOR cost that walk?
+        // that came out over the 2% budget. This measurement asks the focused
+        // question: what does the CENSOR cost that walk?
         // It is answered against the walk itself rather than against another
         // build, so nothing about the machine's other work is in the number.
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)

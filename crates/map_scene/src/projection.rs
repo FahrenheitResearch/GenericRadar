@@ -1715,8 +1715,8 @@ mod tests {
     /// THE GUARDS DO NOT TOUCH THE CASE THE FEATURE WAS WRITTEN FOR.
     ///
     /// A Portland radar looking at 40N 75W: the whole complaint, and the
-    /// number every other proof on this branch is anchored to. Both guards are
-    /// at 1 there - the centre is 5560 km from the pole and north is drawn 32
+    /// number every related proof in this module is anchored to. Both guards
+    /// are at 1 there - the centre is 5560 km from the pole and north is drawn 32
     /// degrees off screen-up, well inside `NORTH_UP_FULL_DEG` - so the
     /// correction has to be the one it always was, to the bit.
     #[test]
@@ -2144,18 +2144,14 @@ mod tests {
         );
     }
 
-    /// WHAT THIS FILE SAYS ABOUT ITSELF HAS TO BE TRUE.
+    /// Verifies repository references and site-catalogue statements in this
+    /// module's documentation.
     ///
-    /// Two claims in the doc comments above were not, and both sent a reader
-    /// chasing something that does not exist: the turn-rate bound was said to
-    /// be pinned by a `north_up_bound.rs` integration test that has never been
-    /// a file in this repository, and the polar hold's recovery
-    /// distance was justified by calling PABR "the highest-latitude radar in
-    /// the shipped catalogue" when PABR is not in that catalogue at all.
-    ///
-    /// So this reads the file back and checks both kinds of claim: every
-    /// repository path it names must exist, and the PABR sentence must be the
-    /// one that is true.
+    /// The test reads this source, checks that every named path under `crates/`
+    /// ending in `.rs` exists, confirms the turn-rate bound names its regression
+    /// test, and requires the polar-hold justification to identify PAPD as the
+    /// northernmost row in the shipped catalogue. PABR remains a useful external
+    /// stress site, but it is not a row in that catalogue.
     #[test]
     fn every_path_and_site_claim_in_this_file_is_true() {
         const SOURCE: &str = include_str!("projection.rs");

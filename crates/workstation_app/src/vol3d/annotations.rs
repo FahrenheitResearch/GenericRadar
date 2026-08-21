@@ -99,9 +99,8 @@
 //! the WGSL camera; the second is what keeps a ladder that runs off a zoomed-in
 //! pane clipped to the pane instead of drawn over the panel beside it.
 
-// Finished drawing code is "never used" until the pane calls it, and clippy
-// runs with `-D warnings`. Delete this attribute in the commit that pastes the
-// call above into `vol3d/pane.rs`.
+// Keep dead-code warnings local to this self-contained drawing module so its
+// geometry helpers can also be compiled independently of the pane call site.
 #![allow(dead_code)]
 
 use eframe::egui;

@@ -1422,6 +1422,8 @@ mod tests {
             moment.clone(),
             radar_core::MomentGrid {
                 moment,
+                producer_description: None,
+                producer_units: None,
                 gate_range,
                 scale: 1.0,
                 offset: 0.0,

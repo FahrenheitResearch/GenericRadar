@@ -1,6 +1,6 @@
 //! The product chooser: grouped, searchable, and driven from the keyboard.
 //!
-//! What this replaces is a flat `ComboBox` of all seventeen products in one
+//! What this replaces is a flat `ComboBox` of every product in one
 //! undifferentiated column. Nothing on screen said what a product measured,
 //! what unit it came back in, or whether the volume on screen could draw it at
 //! all, and reaching any of it needed a mouse. During a warning that is the
@@ -1059,21 +1059,22 @@ mod tests {
             );
             let unique: BTreeSet<&str> = listed.iter().copied().collect();
             assert_eq!(unique.len(), listed.len(), "a product is listed twice");
-            assert_eq!(listed.len(), 17);
+            assert_eq!(listed.len(), DisplayProduct::ALL.len());
         }
     }
 
     #[test]
     fn the_rows_follow_the_registry_group_order() {
         // Hand-written from the registry's declaration order: base moment,
-        // then the velocity family, then dual-pol, then the volume products,
-        // then hail. If the registry reorders, this is the test that says so.
+        // then velocity, dual-pol, research-radar, volume and hail products.
+        // If the registry reorders, this is the test that says so.
         let availability = ProductAvailabilityIndex::unrestricted();
         assert_eq!(
             ids(&all_entries(&availability)),
             [
-                "REF", "VEL", "DVEL", "SRV", "DSRV", "SW", "ZDR", "RHO", "PHI", "KDP", "CREF",
-                "ET18", "VIL", "VILD", "MESH", "POH", "POSH"
+                "REF", "PWR_REL", "VEL", "DVEL", "SRV", "DSRV", "SW", "ZDR", "RHO", "PHI", "KDP",
+                "DBMH1", "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM", "DBZH1", "DBZH2", "DBZHM",
+                "DBZV1", "DBZV2", "DBZVM", "CREF", "ET18", "VIL", "VILD", "MESH", "POH", "POSH"
             ]
         );
     }
@@ -1130,6 +1131,7 @@ mod tests {
         let registry = ProductRegistry::builtin();
         let summary = |id: &str| range_summary(registry.get(id).expect("product exists"));
         assert_eq!(summary("REF"), "-32.0 to 94.5 dBZ");
+        assert_eq!(summary("PWR_REL"), "-5.0 to 95.0 dB re stored I/Q unit²");
         // Velocity is stored in m/s and read in knots: 64 m/s is 124.4 kt,
         // and the domain asks for whole knots.
         assert_eq!(summary("VEL"), "-124 to 124 kt");
@@ -1179,7 +1181,7 @@ mod tests {
         for blank in ["", " ", "   ", "\t", "\n "] {
             assert_eq!(
                 filtered(blank, &availability).len(),
-                17,
+                DisplayProduct::ALL.len(),
                 "{blank:?} hid a row"
             );
         }
@@ -1244,22 +1246,26 @@ mod tests {
     #[test]
     fn arrows_move_the_focus_enter_chooses_and_the_ends_clamp() {
         let mut picker = Harness::open(DisplayProduct::Reflectivity);
-        // REF is first; one step down is VEL, the second row of the list.
-        let outcome = picker.keys(&[egui::Key::ArrowDown, egui::Key::Enter]);
+        // Navigate to the product by identity: adding another base moment must
+        // not turn this into a test of VEL's absolute row number.
+        picker.arrow_down_to(DisplayProduct::Velocity);
+        let outcome = picker.keys(&[egui::Key::Enter]);
         assert_eq!(outcome.product, Some(DisplayProduct::Velocity));
         assert!(outcome.dismissed, "choosing a product asks to close");
 
-        // Forty steps down a seventeen-row list. Wrapping would put an analyst
-        // holding the arrow key back at reflectivity without them noticing
+        // More steps than there are products. Wrapping would put an analyst
+        // holding the arrow key back near reflectivity without them noticing
         // they had passed the product they wanted.
         picker.state.opened(DisplayProduct::Reflectivity);
-        let mut events: Vec<egui::Event> =
-            (0..40).map(|_| key_event(egui::Key::ArrowDown)).collect();
+        let last = all_entries(&picker.availability)
+            .last()
+            .expect("the picker has products")
+            .product;
+        let mut events: Vec<egui::Event> = (0..DisplayProduct::ALL.len() + 10)
+            .map(|_| key_event(egui::Key::ArrowDown))
+            .collect();
         events.push(key_event(egui::Key::Enter));
-        assert_eq!(
-            picker.frame(events).product,
-            Some(DisplayProduct::ProbabilityOfSevereHail)
-        );
+        assert_eq!(picker.frame(events).product, Some(last));
     }
 
     #[test]
@@ -1271,7 +1277,7 @@ mod tests {
             .state
             .collapsed
             .insert(ProductGroup::VelocityAnalysis);
-        let outcome = picker.keys(&[egui::Key::ArrowDown]);
+        let outcome = picker.arrow_down_to(DisplayProduct::Velocity);
         assert_eq!(outcome.product, None);
         assert_eq!(picker.state.focused(), Some(DisplayProduct::Velocity));
         assert!(
@@ -1360,7 +1366,11 @@ mod tests {
             )),
         );
         let entries = all_entries(&availability);
-        assert_eq!(entries.len(), 17, "an unavailable product must stay listed");
+        assert_eq!(
+            entries.len(),
+            DisplayProduct::ALL.len(),
+            "an unavailable product must stay listed"
+        );
         let zdr = entries
             .iter()
             .find(|entry| entry.product == DisplayProduct::DifferentialReflectivity)
@@ -1491,6 +1501,37 @@ mod tests {
     }
 
     #[test]
+    fn relative_power_alone_does_not_unlock_reflectivity_products() {
+        let capabilities = capabilities_of(vec![
+            measured_cut(0, 0.5, &[MomentType::RelativePower], None),
+            measured_cut(1, 1.5, &[MomentType::RelativePower], None),
+        ]);
+        let availability = ProductAvailabilityIndex::from_capabilities(&capabilities);
+        assert!(
+            availability
+                .get(DisplayProduct::RelativePower)
+                .is_available()
+        );
+        for product in [
+            DisplayProduct::Reflectivity,
+            DisplayProduct::CompositeReflectivity,
+            DisplayProduct::EchoTop18,
+            DisplayProduct::Vil,
+            DisplayProduct::VilDensity,
+            DisplayProduct::Mesh,
+            DisplayProduct::ProbabilityOfHail,
+            DisplayProduct::ProbabilityOfSevereHail,
+        ] {
+            assert_eq!(
+                availability.get(product).unavailable_reason(),
+                Some(&UnavailableReason::MissingMoment(MomentType::Reflectivity)),
+                "{} became available from uncalibrated power",
+                product.id()
+            );
+        }
+    }
+
+    #[test]
     fn a_single_tilt_cannot_integrate_a_column() {
         let availability = ProductAvailabilityIndex::from_capabilities(&reflectivity_only(1));
         assert_eq!(
@@ -1569,6 +1610,12 @@ mod tests {
             palette_family(DisplayProduct::CompositeReflectivity),
             Some(ColorTableFamily::Reflectivity)
         );
+        // Relative stored-I/Q power must never borrow reflectivity's visual
+        // language: it has no radar constant and is not dBZ.
+        assert_eq!(
+            palette_family(DisplayProduct::RelativePower),
+            Some(ColorTableFamily::Generic)
+        );
         // Each dual-polarimetric moment now draws from its own family. It used
         // to draw from Generic, whose ramp spans 0..100 - so ZDR, which lives
         // on -13..20 dB, rendered as one flat colour. This assertion is what
@@ -1589,6 +1636,14 @@ mod tests {
         assert_eq!(
             palette_family(DisplayProduct::SpecificDifferentialPhase),
             Some(ColorTableFamily::SpecificDifferentialPhase)
+        );
+        assert_eq!(
+            palette_family(DisplayProduct::DowReceivedPowerH1),
+            Some(ColorTableFamily::ReceivedPower)
+        );
+        assert_eq!(
+            palette_family(DisplayProduct::DowReflectivityVMerged),
+            Some(ColorTableFamily::Reflectivity)
         );
         // VIL draws on a ramp built for kg/m2; a dBZ table is not an option.
         assert_eq!(palette_family(DisplayProduct::Vil), None);
@@ -1647,8 +1702,9 @@ mod tests {
             "velocity tables offered for reflectivity"
         );
 
-        // Arrow onto velocity: one frame to move the focus, one to draw it.
-        picker.keys(&[egui::Key::ArrowDown]);
+        // Arrow onto velocity by identity, then give egui one frame to retain
+        // the newly drawn palette-row responses.
+        picker.arrow_down_to(DisplayProduct::Velocity);
         picker.idle();
         assert_eq!(picker.state.focused(), Some(DisplayProduct::Velocity));
         assert_eq!(
@@ -1999,6 +2055,19 @@ Color:  60 220  60  60   255 255 255
             self.frame(keys.iter().copied().map(key_event).collect())
         }
 
+        /// Walk down until the keyboard focus reaches `target`, without
+        /// baking the registry position of that product into a test.
+        fn arrow_down_to(&mut self, target: DisplayProduct) -> ProductPickerOutcome {
+            let mut outcome = ProductPickerOutcome::default();
+            for _ in 0..=DisplayProduct::ALL.len() {
+                if self.state.focused() == Some(target) {
+                    return outcome;
+                }
+                outcome = self.keys(&[egui::Key::ArrowDown]);
+            }
+            panic!("could not reach {} by arrowing down", target.id());
+        }
+
         /// Lay the picker out, then press and release on one widget's own rect.
         fn click(&mut self, id: egui::Id) -> ProductPickerOutcome {
             self.idle();
@@ -2171,7 +2240,12 @@ Color:  60 220  60  60   255 255 255
             let capabilities = VolumeCapabilities::analyze(&volume);
             let availability = ProductAvailabilityIndex::from_capabilities(&capabilities);
             let entries = all_entries(&availability);
-            assert_eq!(entries.len(), 17, "{}", path.display());
+            assert_eq!(
+                entries.len(),
+                DisplayProduct::ALL.len(),
+                "{}",
+                path.display()
+            );
             let greyed: Vec<String> = entries
                 .iter()
                 .filter_map(|entry| {

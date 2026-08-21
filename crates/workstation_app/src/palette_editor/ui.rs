@@ -1356,6 +1356,9 @@ fn preview_section(
 fn preview_moment(family: ColorTableFamily) -> Option<MomentType> {
     match family {
         ColorTableFamily::Reflectivity => Some(MomentType::Reflectivity),
+        // Received power has six independent DOW source moments; choosing one
+        // as the universal preview would blank the editor for the other five.
+        ColorTableFamily::ReceivedPower => None,
         ColorTableFamily::Velocity => Some(MomentType::Velocity),
         ColorTableFamily::SpectrumWidth => Some(MomentType::SpectrumWidth),
         ColorTableFamily::DifferentialReflectivity => Some(MomentType::DifferentialReflectivity),

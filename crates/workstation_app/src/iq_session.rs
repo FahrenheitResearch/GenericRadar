@@ -42,12 +42,12 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
-use nexrad_io::iq::IqSweep;
+use nexrad_io::iq::{IqCalibration, IqSweep, PulseLayout};
 use nexrad_io::iq_moments::estimator::SnrCensor;
 use nexrad_io::iq_moments::spectrum::DopplerSpectrum;
 use nexrad_io::iq_moments::taper::Taper;
 use nexrad_io::iq_moments::{
-    DwellPlan, MomentConfig, ProcessedSweep, process_sweep, sweep_gate_spectrum,
+    DwellPlan, MomentConfig, ProcessedSweep, SnrApplication, process_sweep, sweep_gate_spectrum,
 };
 use radar_core::{RadarSite, RadarVolume};
 
@@ -165,6 +165,7 @@ impl IqSession {
         controls: IqControls,
     ) -> Result<Self, String> {
         let site_id = site_id_of(&sweep.site);
+        let controls = controls_for_sweep(&sweep, controls);
         let processed = run(&sweep, controls)?;
         Ok(Self {
             sweep: Arc::new(sweep),
@@ -205,6 +206,18 @@ impl IqSession {
         &self.source_label
     }
 
+    /// Native pulses per ray when the acquisition carries hard ray
+    /// boundaries. Such sessions use exactly one dwell per ray.
+    pub fn native_dwell_pulses(&self) -> Option<usize> {
+        native_dwell_pulses(&self.sweep)
+    }
+
+    /// Whether the source carries a receiver-noise reference from which SNR
+    /// can be computed.
+    pub fn snr_available(&self) -> bool {
+        matches!(self.sweep.calibration, IqCalibration::Absolute { .. })
+    }
+
     /// Time of the first pulse.
     pub fn time_utc(&self) -> DateTime<Utc> {
         Utc.timestamp_opt(self.sweep.time_utc, 0)
@@ -216,6 +229,7 @@ impl IqSession {
     /// choices are the ones already on screen, so a settings change that did
     /// not touch this page costs nothing.
     pub fn set_controls(&mut self, controls: IqControls) -> Result<bool, String> {
+        let controls = controls_for_sweep(&self.sweep, controls);
         if controls == self.controls {
             return Ok(false);
         }
@@ -266,14 +280,42 @@ impl IqSession {
     /// know which is which.
     pub fn provenance(&self) -> String {
         let report = &self.processed.report;
+        let dwell = match self.native_dwell_pulses() {
+            Some(native) => format!(
+                "{} native {native}-pulse rays (dwell fixed to each measured ray)",
+                report.dwells
+            ),
+            None => format!("{}-pulse dwells", report.pulses_per_dwell),
+        };
+        let power = match self.sweep.calibration {
+            IqCalibration::Absolute { .. } => String::new(),
+            IqCalibration::RelativeStoredIq => {
+                "; power is relative (dB re stored I/Q unit²); absolute receiver power and \
+                 calibrated reflectivity are unavailable"
+                    .to_owned()
+            }
+        };
         format!(
-            "moments computed here from {} pulses: {}-pulse dwells, {} window, {}",
+            "moments computed here from {} pulses: {dwell}, {} window, {}{power}",
             report.pulses_available,
-            report.pulses_per_dwell,
             report.taper.label(),
-            censor_words(report.censor),
+            snr_words(report.snr_application),
         )
     }
+}
+
+fn native_dwell_pulses(sweep: &IqSweep) -> Option<usize> {
+    let PulseLayout::Rays(spans) = &sweep.pulse_layout else {
+        return None;
+    };
+    spans.first().map(|span| span.len)
+}
+
+fn controls_for_sweep(sweep: &IqSweep, mut controls: IqControls) -> IqControls {
+    if let Some(native) = native_dwell_pulses(sweep) {
+        controls.dwell_pulses = native;
+    }
+    controls
 }
 
 /// Run the estimator, turning a refusal into words an analyst can act on.
@@ -283,7 +325,7 @@ fn run(sweep: &IqSweep, controls: IqControls) -> Result<ProcessedSweep, String> 
     // pulse-paired are refused by name rather than producing a plausible wrong
     // velocity field. `iMajorMode` 12 is batch / staggered PRT and 15 is SZ-2
     // phase coding; see `nexrad_io::iq_moments`.
-    config.declared_major_mode = u32::try_from(sweep.major_mode).ok();
+    config.declared_major_mode = sweep.major_mode.and_then(|mode| u32::try_from(mode).ok());
     process_sweep(sweep, &config).map_err(|error| error.to_string())
 }
 
@@ -292,6 +334,16 @@ fn censor_words(censor: SnrCensor) -> String {
     match censor {
         SnrCensor::Off => "no SNR threshold".to_owned(),
         SnrCensor::MinDb(db) => format!("gates below {db:.1} dB SNR left blank"),
+    }
+}
+
+fn snr_words(application: SnrApplication) -> String {
+    match application {
+        SnrApplication::Applied { threshold_db } => censor_words(SnrCensor::MinDb(threshold_db)),
+        SnrApplication::Off => censor_words(SnrCensor::Off),
+        SnrApplication::UnavailableNoNoiseCalibration => {
+            "SNR unavailable: source has no receiver-noise calibration".to_owned()
+        }
     }
 }
 
@@ -490,6 +542,67 @@ mod tests {
         assert!(session.provenance().contains("128-pulse dwells"));
     }
 
+    #[test]
+    fn native_relative_rays_lock_the_dwell_and_never_claim_snr_or_calibration() {
+        use nexrad_io::iq::{IqCalibration, PulseLayout, PulseSpan};
+        use radar_core::MomentType;
+
+        let mut sweep = coherent_sweep();
+        sweep.calibration = IqCalibration::RelativeStoredIq;
+        sweep.pulse_layout = PulseLayout::Rays(
+            (0..8)
+                .map(|ray| PulseSpan {
+                    start: ray * 32,
+                    len: 32,
+                })
+                .collect(),
+        );
+        let mut session = IqSession::from_sweep(sweep, "relative", IqControls::default())
+            .expect("native rays process");
+
+        assert_eq!(session.controls().dwell_pulses, 32);
+        assert_eq!(session.native_dwell_pulses(), Some(32));
+        assert_eq!(session.processed().report.dwells, 8);
+        assert!(!session.snr_available());
+        assert!(
+            session
+                .processed()
+                .cut
+                .moments
+                .contains_key(&MomentType::RelativePower)
+        );
+        assert!(
+            session
+                .processed()
+                .cut
+                .moments
+                .contains_key(&MomentType::Velocity)
+        );
+        assert!(
+            !session
+                .processed()
+                .cut
+                .moments
+                .contains_key(&MomentType::Reflectivity)
+        );
+
+        let provenance = session.provenance();
+        assert!(provenance.contains("native 32-pulse rays"), "{provenance}");
+        assert!(provenance.contains("SNR unavailable"), "{provenance}");
+        assert!(provenance.contains("power is relative"), "{provenance}");
+        assert!(!provenance.contains("dBm"), "{provenance}");
+        assert!(!provenance.contains("dBZ"), "{provenance}");
+
+        let changed = IqControls {
+            dwell_pulses: 128,
+            taper: Taper::Hamming,
+            ..IqControls::default()
+        };
+        assert!(session.set_controls(changed).expect("taper reprocesses"));
+        assert_eq!(session.controls().dwell_pulses, 32);
+        assert_eq!(session.controls().taper, Taper::Hamming);
+    }
+
     /// A refusal is reported and does not destroy the session. An analyst who
     /// drags the dwell past the end of the record gets a message and keeps the
     /// field they had.
@@ -509,7 +622,7 @@ mod tests {
 
     /// A sweep of coherent tones, enough pulses for a 128-pulse dwell.
     fn coherent_sweep() -> IqSweep {
-        use nexrad_io::iq::IqPulse;
+        use nexrad_io::iq::{IqCalibration, IqPulse};
         const PRT_S: f32 = 833.375e-6;
         let gates = 12;
         let pulses = (0..256)
@@ -534,13 +647,15 @@ mod tests {
             site: "KOUN_RVP".to_owned(),
             time_utc: 1_369_079_161,
             wavelength_m: 0.1108,
-            pulse_width_s: 1.5e-6,
+            pulse_width_s: Some(1.5e-6),
             gate_spacing_m: Some(500.0),
             first_gate_m: 1_000.0,
             range_bins: (0..gates).map(|bin| 1_000.0 + 500.0 * bin as f32).collect(),
-            noise_dbm: [-80.5555, -80.5955],
-            dbz_calibration: -35.5,
-            saturation_dbm: 6.0,
+            calibration: IqCalibration::Absolute {
+                noise_dbm: [-80.5555, -80.5955],
+                dbz_calibration: -35.5,
+                saturation_dbm: 6.0,
+            },
             pulses,
             ..IqSweep::default()
         }

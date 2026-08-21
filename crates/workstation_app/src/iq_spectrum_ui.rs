@@ -12,10 +12,10 @@
 //! plot, because the pulses it is computed from were thrown away at scan time.
 //!
 //! So this is the readout the feature is for, and it is drawn to be read rather
-//! than to be decorative: a real axis in m/s, a real axis in dBm, the receiver
-//! noise floor drawn where it actually is, and the estimator's own mean
-//! velocity marked on the same axis so the summary and the thing it summarises
-//! can be compared by eye.
+//! than to be decorative: a real axis in m/s, a power axis labelled with its
+//! actual reference, the receiver noise floor when the source measured one,
+//! and the estimator's own mean velocity marked on the same axis so the
+//! summary and the thing it summarises can be compared by eye.
 //!
 //! # What it will not do
 //!
@@ -149,8 +149,12 @@ pub fn draw_gate_spectrum(painter: &egui::Painter, pane_rect: egui::Rect, gate: 
         return;
     }
 
-    let Some(spectrum) = gate.spectrum.as_ref().filter(|s| !s.power_dbm.is_empty()) else {
-        // The honest branch, and the one that matters most. There is no plot
+    let Some(spectrum) = gate
+        .spectrum
+        .as_ref()
+        .filter(|s| s.power_db.iter().any(|power| power.is_finite()))
+    else {
+        // The no-data case is the one that matters most. There is no plot
         // because there is nothing to plot, and the panel says which kind of
         // nothing rather than drawing the receiver.
         painter.text(
@@ -196,7 +200,8 @@ fn plot_rect(panel: egui::Rect) -> egui::Rect {
     )
 }
 
-/// Power extent the plot is drawn over, as `(low, high)` in dBm.
+/// Power extent the plot is drawn over on the spectrum's declared logarithmic
+/// reference.
 ///
 /// Anchored on the noise floor rather than on the minimum bin: the lowest bin
 /// of a real spectrum is a deep null that carries no information, and scaling
@@ -204,19 +209,31 @@ fn plot_rect(panel: egui::Rect) -> egui::Rect {
 /// noise means the height of the trace above the baseline IS the signal-to-noise
 /// ratio, which is the quantity being judged.
 fn power_extent(spectrum: &DopplerSpectrum) -> (f32, f32) {
-    let peak = spectrum
-        .power_dbm
+    let mut finite = spectrum
+        .power_db
         .iter()
         .copied()
-        .filter(|value| value.is_finite())
-        .fold(f32::NEG_INFINITY, f32::max);
-    let noise = if spectrum.noise_per_bin_dbm.is_finite() {
-        spectrum.noise_per_bin_dbm
-    } else {
-        peak - MIN_SPAN_DB
+        .filter(|value| value.is_finite());
+    let Some(first) = finite.next() else {
+        // A zero-valued dwell becomes -infinity in logarithmic units. It is
+        // normally withheld by `draw_gate_spectrum`, but keep this helper
+        // finite as well so a future caller cannot turn one empty gate into
+        // infinite plot coordinates.
+        let baseline = spectrum
+            .noise_per_bin_db
+            .filter(|noise| noise.is_finite())
+            .unwrap_or(0.0);
+        return (baseline - HEADROOM_DB, baseline + MIN_SPAN_DB + HEADROOM_DB);
     };
-    let low = noise - HEADROOM_DB;
-    let high = peak.max(noise + MIN_SPAN_DB) + HEADROOM_DB;
+    let (minimum, peak) = finite.fold((first, first), |(minimum, peak), value| {
+        (minimum.min(value), peak.max(value))
+    });
+    let baseline = spectrum
+        .noise_per_bin_db
+        .filter(|noise| noise.is_finite())
+        .unwrap_or(minimum);
+    let low = baseline - HEADROOM_DB;
+    let high = peak.max(baseline + MIN_SPAN_DB) + HEADROOM_DB;
     (low, high)
 }
 
@@ -240,7 +257,7 @@ fn draw_plot(
     let x_of = |velocity: f32| {
         plot.left() + plot.width() * (velocity + nyquist) / (2.0 * nyquist).max(f32::EPSILON)
     };
-    let y_of = |power_dbm: f32| plot.bottom() - plot.height() * (power_dbm - low) / span;
+    let y_of = |power_db: f32| plot.bottom() - plot.height() * (power_db - low) / span;
 
     // Frame first, so the trace is drawn over it.
     painter.rect_stroke(
@@ -260,13 +277,13 @@ fn draw_plot(
         egui::Stroke::new(1.0, PANEL_EDGE),
     );
 
-    // The receiver noise floor per bin. `noise_per_bin_dbm` and not
-    // `noise_dbm`: the two differ by 10 log10(n) - about 18 dB at a 64-pulse
+    // The receiver noise floor per bin. `noise_per_bin_db` and not
+    // `noise_db`: the two differ by 10 log10(n) - about 18 dB at a 64-pulse
     // dwell - and the per-bin figure is the one a spectrum bin is measured
     // against. Drawing the other would put the floor 18 dB above the trace and
     // suggest every gate was noise.
-    if spectrum.noise_per_bin_dbm.is_finite() {
-        let noise_y = y_of(spectrum.noise_per_bin_dbm);
+    if let Some(noise_per_bin_db) = spectrum.noise_per_bin_db {
+        let noise_y = y_of(noise_per_bin_db);
         if plot.y_range().contains(noise_y) {
             dashed_horizontal(painter, plot, noise_y, NOISE_INK);
         }
@@ -285,12 +302,8 @@ fn draw_plot(
     // and leaves the area under the curve empty on the other. On a plot whose
     // whole claim is that area reads as power, that is the fill lying about
     // the quantity it exists to convey.
-    let mut outline: Vec<egui::Pos2> = Vec::with_capacity(spectrum.power_dbm.len());
-    for (velocity, power) in spectrum
-        .velocities_mps
-        .iter()
-        .zip(spectrum.power_dbm.iter())
-    {
+    let mut outline: Vec<egui::Pos2> = Vec::with_capacity(spectrum.power_db.len());
+    for (velocity, power) in spectrum.velocities_mps.iter().zip(spectrum.power_db.iter()) {
         if !power.is_finite() {
             continue;
         }
@@ -378,7 +391,7 @@ fn draw_plot(
     painter.text(
         egui::pos2(plot.center().x, baseline + AXIS_FONT_SIZE + 1.0),
         egui::Align2::CENTER_TOP,
-        "m/s",
+        format!("m/s · {}", spectrum.power_reference.label()),
         egui::FontId::monospace(AXIS_FONT_SIZE),
         AXIS_INK,
     );
@@ -445,9 +458,10 @@ fn dashed_horizontal(painter: &egui::Painter, plot: egui::Rect, y: f32, ink: egu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexrad_io::iq_moments::estimator::PowerReference;
     use nexrad_io::iq_moments::taper::Taper;
 
-    fn spectrum(power: Vec<f32>, noise_per_bin_dbm: f32) -> DopplerSpectrum {
+    fn spectrum(power: Vec<f32>, noise_per_bin_db: f32) -> DopplerSpectrum {
         let bins = power.len();
         let nyquist = 33.2f32;
         DopplerSpectrum {
@@ -456,12 +470,21 @@ mod tests {
             velocities_mps: (0..bins)
                 .map(|bin| -nyquist + 2.0 * nyquist * bin as f32 / bins as f32)
                 .collect(),
-            power_dbm: power,
-            noise_dbm: noise_per_bin_dbm + 18.0,
-            noise_per_bin_dbm,
+            power_db: power,
+            power_reference: PowerReference::AbsoluteDbm,
+            noise_db: Some(noise_per_bin_db + 18.0),
+            noise_per_bin_db: Some(noise_per_bin_db),
             taper: Taper::Rectangular,
             equivalent_noise_bandwidth_bins: 1.0,
         }
+    }
+
+    fn relative_spectrum(power: Vec<f32>) -> DopplerSpectrum {
+        let mut spectrum = spectrum(power, -80.0);
+        spectrum.power_reference = PowerReference::RelativeStoredIqSquared;
+        spectrum.noise_db = None;
+        spectrum.noise_per_bin_db = None;
+        spectrum
     }
 
     /// The trace's height above the baseline has to BE the signal-to-noise
@@ -498,6 +521,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_relative_spectrum_labels_its_reference_and_has_no_noise_rule() {
+        let spectrum = relative_spectrum(vec![10.0, 20.0, 30.0, 20.0]);
+        let gate = GateSpectrum {
+            spectrum: Some(spectrum),
+            estimator_velocity_mps: Some(0.0),
+            range_m: 1_000.0,
+            channel: 0,
+            absence: None,
+        };
+        let painted = paint(test_pane(), &gate, 1.0);
+        assert!(
+            painted.text_containing("dB re stored I/Q unit²").is_some(),
+            "relative spectra must name their actual power reference"
+        );
+        assert!(
+            painted.text_containing("dBm").is_none(),
+            "relative spectra must never claim absolute receiver power"
+        );
+    }
+
+    #[test]
+    fn an_all_zero_relative_gate_has_no_infinite_plot_extent_or_fake_trace() {
+        let spectrum = relative_spectrum(vec![f32::NEG_INFINITY; 32]);
+        let (low, high) = power_extent(&spectrum);
+        assert!(low.is_finite() && high.is_finite() && high > low);
+
+        let gate = GateSpectrum {
+            spectrum: Some(spectrum),
+            estimator_velocity_mps: None,
+            range_m: 1_000.0,
+            channel: 0,
+            absence: None,
+        };
+        let painted = paint(test_pane(), &gate, 1.0);
+        assert!(painted.text_containing("no signal at this gate").is_some());
+        assert!(
+            painted.fill.is_empty(),
+            "an empty dwell must not draw a trace"
+        );
+    }
+
     /// The noise floor drawn must be the PER-BIN one. The two differ by
     /// 10 log10(n) - about 18 dB at 64 pulses - and drawing the whole-dwell
     /// figure would put the floor above the trace of a real echo and suggest
@@ -506,14 +571,14 @@ mod tests {
     fn the_noise_rule_is_the_per_bin_floor_and_lands_inside_the_plot() {
         let spectrum = spectrum(vec![-60.0f32; 64], -80.0);
         assert!(
-            spectrum.noise_dbm > spectrum.noise_per_bin_dbm,
+            spectrum.noise_db.unwrap() > spectrum.noise_per_bin_db.unwrap(),
             "fixture is wrong: the whole-dwell floor is the higher number"
         );
         let (low, high) = power_extent(&spectrum);
         assert!(
-            (low..=high).contains(&spectrum.noise_per_bin_dbm),
+            (low..=high).contains(&spectrum.noise_per_bin_db.unwrap()),
             "the per-bin floor {} is outside the drawn extent {low}..{high}",
-            spectrum.noise_per_bin_dbm
+            spectrum.noise_per_bin_db.unwrap()
         );
     }
 
@@ -654,9 +719,9 @@ mod tests {
     /// sight-line from bin 0 to the peak, which is ink ABOVE a trace that is
     /// sitting on the noise floor twenty bins away from any signal.
     ///
-    /// So this asserts the task's own sentence: ink under the peak, none in a
-    /// bin far from it - and then, harder, that the top of the ink in a column
-    /// IS the trace in that column.
+    /// This asserts the visual contract: ink under the peak, none in a bin far
+    /// from it - and then, harder, that the top of the ink in a column IS the
+    /// trace in that column.
     #[test]
     fn the_fill_is_the_area_under_the_trace_and_not_a_fan_from_the_first_bin() {
         const BINS: usize = 64;

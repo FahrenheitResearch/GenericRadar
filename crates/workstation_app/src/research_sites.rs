@@ -131,8 +131,8 @@ pub const RESEARCH_SITES: &[ResearchSite] = &[
     // on the same Norman campus. It is the only other radar in NOAA's own
     // NEXRAD station table that the operational feed does not carry, and a
     // record from it would otherwise be refused for the same reason KOUN was.
-    // Its own time series has not been observed in the archive branch this
-    // feature was written against; it is here because it is sourceable and
+    // Its own time series has not been observed among the NSSL archive files
+    // examined for this reader; it is here because it is sourceable and
     // because the alternative is a second POSITION UNKNOWN, not because a file
     // from it has been read.
     ResearchSite {

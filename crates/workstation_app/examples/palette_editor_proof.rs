@@ -55,6 +55,7 @@ mod source {
     pub mod annotation;
     pub mod app;
     pub mod app_support;
+    pub mod current_view_export;
     pub mod file_browser;
     pub mod gate_filter_ui;
     pub mod hazards;
@@ -92,9 +93,9 @@ mod source {
 // modules resolves; this example itself only reaches for a few of them.
 #[allow(unused_imports)]
 pub(crate) use source::{
-    annotation, app, app_support, file_browser, gate_filter_ui, hazards, iq_session,
-    iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning, north_up,
-    palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
+    annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
+    iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
+    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
     product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
     units, user_tables, vol3d, vrot, warnings_service, xsection,
 };
@@ -466,7 +467,7 @@ fn differing(left: &[u8], right: &[u8]) -> usize {
 
 /// Window size for the photographs, in points. Wide enough that the stop list
 /// and the preview column both get their real width rather than the narrow
-/// fallback, which is what a reviewer needs to see.
+/// fallback, which is the layout this photograph is meant to verify.
 ///
 /// 1024 and not a rounder 1000 because the readback below copies whole rows:
 /// wgpu requires `bytes_per_row` to be a multiple of 256, so the pixel width
@@ -504,9 +505,8 @@ fn photograph_window(volume: &RadarVolume, out_dir: &Path) {
         return;
     };
 
-    // Every registered theme, not the two by name: the editor window is
-    // chrome like any other, and a theme that lands on a branch of its own
-    // gets photographed here without this file being edited.
+    // Every registered theme, not two named variants: adding a theme to the
+    // catalog automatically adds it to this visual coverage.
     for theme in theme::catalog::THEMES {
         for scale in [1.0_f32, 2.0] {
             let appearance = Appearance::by_id(theme.id);
@@ -549,7 +549,7 @@ fn render_window(
     // The AWIPS table is ramp pairs the whole way down, so one row has its
     // second colour cleared before the shutter. The photograph then shows both
     // states of that column - a set pair and the placeholder that says there
-    // is none - which is what a reviewer needs to tell them apart at a glance.
+    // is none - so the photograph distinguishes them at a glance.
     if let Some(table) = state.table_mut()
         && let Some(id) = table.stops().get(6).map(|stop| stop.id)
         && let Some(stop) = table.stop_mut(id)

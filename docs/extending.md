@@ -1,13 +1,10 @@
 # Extending GenericRadar
 
-How a new capability — a data
-provider, a derived product, an overlay, a whole module ported from BowEcho —
-plugs into this workspace so that it appears in the application, appears in
-the master settings window, persists its state, and passes the gates. It is
-written for an agent doing the work: exact seams, exact files, no narrative.
-
-Baseline for this document: the settings system landed with the
-`settings` crate rewrite and `workstation_app/src/settings_ui.rs`.
+How a new capability — a data provider, a derived product, an overlay, or a
+whole module ported from BowEcho — plugs into this workspace so that it appears
+in the application and master settings window, persists its state, and passes
+the gates. The current settings implementation is split between the `settings`
+crate and `workstation_app/src/settings_ui.rs`.
 
 ---
 
@@ -128,7 +125,7 @@ Short pages should stay ungrouped. A heading over three toggles is noise.
 Your crate does **not** read the store. The composition root (`app.rs`) does,
 and pushes plain values into your API — the same way `render2d` receives a
 `DisplayQuality` and `analyst_runtime::VolumeHistory` receives a
-`HistoryPolicy` today:
+`HistoryPolicy` behavior:
 
 ```rust
 // app.rs, on outcome.changed containing ("mycrate", "update_seconds"):
@@ -187,7 +184,7 @@ cut policy, computation). The panes hold a `Copy` handle:
 `workstation_app/src/product.rs::DisplayProduct`, an adapter its own header
 calls temporary.
 
-To add a product today:
+To add a product:
 
 1. Declare the descriptor in `product_engine`'s registry (units, domain,
    moment, computation). Cite primary literature in the descriptor or the
@@ -473,18 +470,14 @@ Plus the standing rules that are not commands:
   a workstation dependency without the allowlist comment, the gate is red by
   design.
 
-## 6. Current temporary scaffolding (delete-on-wiring)
+## 6. Independent settings UI checks
 
-Until the human-owned `mod settings_ui;` wiring lands in
-`workstation_app/src/main.rs`, the settings window is compiled and tested via
-`crates/settings/tests/workstation_settings_ui.rs` (a `#[path]` include of
-the real source) and photographed via
-`crates/settings/examples/settings_preview.rs`. When the wiring lands:
+The settings window is part of `workstation_app` and also has two focused
+entry points. `crates/settings/tests/workstation_settings_ui.rs` includes the
+real source by path so its `#[cfg(test)]` modules run independently of the full
+application. `crates/settings/examples/settings_preview.rs` opens and
+photographs the same window over a real settings store.
 
-* keep the example (it remains the fastest way to photograph the window),
-* delete the harness test **or** leave it as a second compile — but if it is
-  deleted, move its three proof tests into `settings_ui`'s own `#[cfg(test)]`
-  modules first,
-* do not "simplify" the explicit `#[path = "settings_ui/…"]` child-module
-  attributes in `settings_ui.rs`; the comment above them says why they
-  resolve identically in both homes.
+Keep the explicit `#[path = "settings_ui/…"]` child-module attributes in
+`settings_ui.rs`: they make those child modules resolve identically from the
+application and from the focused harness.

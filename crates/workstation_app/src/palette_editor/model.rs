@@ -68,12 +68,13 @@ pub struct EditorStop {
 /// because those are the only two the palette parser rescales; `dBZ` and `m/s`
 /// are labels on numbers that are already engine values. [`Self::Unstated`]
 /// writes no `Units:` row at all, which is the honest choice for correlation
-/// coefficient or differential phase - neither is measured in any of the four.
+/// coefficient or differential phase - neither is measured in any listed unit.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum EditorUnits {
     #[default]
     Unstated,
     Dbz,
+    Dbm,
     MetresPerSecond,
     Knots,
     MilesPerHour,
@@ -81,9 +82,10 @@ pub enum EditorUnits {
 
 impl EditorUnits {
     /// Every choice, in the order a combo should offer them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Unstated,
         Self::Dbz,
+        Self::Dbm,
         Self::MetresPerSecond,
         Self::Knots,
         Self::MilesPerHour,
@@ -94,6 +96,7 @@ impl EditorUnits {
         match self {
             Self::Unstated => "(none)",
             Self::Dbz => "dBZ",
+            Self::Dbm => "dBm",
             Self::MetresPerSecond => "m/s",
             Self::Knots => "kt",
             Self::MilesPerHour => "mph",
@@ -105,6 +108,7 @@ impl EditorUnits {
         match self {
             Self::Unstated => None,
             Self::Dbz => Some("dBZ"),
+            Self::Dbm => Some("dBm"),
             Self::MetresPerSecond => Some("m/s"),
             Self::Knots => Some("kt"),
             Self::MilesPerHour => Some("mph"),
@@ -118,7 +122,7 @@ impl EditorUnits {
     /// `m/s` are 1.0 here rather than absent.
     pub fn to_engine(self) -> f32 {
         match self {
-            Self::Unstated | Self::Dbz | Self::MetresPerSecond => 1.0,
+            Self::Unstated | Self::Dbz | Self::Dbm | Self::MetresPerSecond => 1.0,
             Self::Knots => KNOT_TO_MPS,
             Self::MilesPerHour => MPH_TO_MPS,
         }
@@ -138,6 +142,7 @@ impl EditorUnits {
             "kt" | "kts" | "knot" | "knots" => Self::Knots,
             "mph" | "mi/h" => Self::MilesPerHour,
             "dbz" => Self::Dbz,
+            "dbm" => Self::Dbm,
             "m/s" | "mps" | "ms" => Self::MetresPerSecond,
             _ => Self::Unstated,
         }
@@ -147,6 +152,7 @@ impl EditorUnits {
     pub fn default_for(family: ColorTableFamily) -> Self {
         match family {
             ColorTableFamily::Reflectivity => Self::Dbz,
+            ColorTableFamily::ReceivedPower => Self::Dbm,
             ColorTableFamily::Velocity | ColorTableFamily::SpectrumWidth => Self::MetresPerSecond,
             _ => Self::Unstated,
         }
@@ -701,6 +707,7 @@ impl EditorTable {
 pub fn product_token(family: ColorTableFamily) -> Option<&'static str> {
     match family {
         ColorTableFamily::Reflectivity => Some("BR"),
+        ColorTableFamily::ReceivedPower => Some("DBM"),
         ColorTableFamily::Velocity => Some("BV"),
         ColorTableFamily::SpectrumWidth => Some("SW"),
         ColorTableFamily::DifferentialReflectivity => Some("ZDR"),
@@ -716,6 +723,9 @@ pub fn product_token(family: ColorTableFamily) -> Option<&'static str> {
 pub fn family_from_product_token(token: &str) -> Option<ColorTableFamily> {
     match token.trim().to_ascii_uppercase().as_str() {
         "BR" | "REF" | "N0Q" | "DBZ" => Some(ColorTableFamily::Reflectivity),
+        "DBM" | "DBMH1" | "DBMH2" | "DBMHM" | "DBMV1" | "DBMV2" | "DBMVM" => {
+            Some(ColorTableFamily::ReceivedPower)
+        }
         "BV" | "VEL" | "SRV" | "N0U" => Some(ColorTableFamily::Velocity),
         "SW" | "SPW" => Some(ColorTableFamily::SpectrumWidth),
         "ZDR" => Some(ColorTableFamily::DifferentialReflectivity),

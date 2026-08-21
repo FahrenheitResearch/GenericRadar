@@ -54,7 +54,7 @@
 //! written only when a listing SUCCEEDED, so a folder that could not be read
 //! is never the one the next session opens on.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -157,6 +157,7 @@ pub fn short_format_name(format: SupportedVolumeFormat) -> &'static str {
     match format {
         SupportedVolumeFormat::NexradLevel2 => "NEXRAD Level II",
         SupportedVolumeFormat::NexradLevel1TimeSeries => "NEXRAD Level 1 (I/Q)",
+        SupportedVolumeFormat::MatlabIqCube => "MATLAB I/Q",
         SupportedVolumeFormat::OdimH5 => "ODIM_H5",
         SupportedVolumeFormat::Dorade => "DORADE",
         SupportedVolumeFormat::CfRadial1 => "CfRadial 1.x",
@@ -412,7 +413,12 @@ pub struct FileBrowser {
     location_text: String,
     entries: Vec<Entry>,
     state: ListingState,
-    selected: Option<usize>,
+    /// Selected rows, in listing order. Directories are always selected
+    /// alone; files may be Ctrl/Command- or Shift-selected into a playlist.
+    selected: BTreeSet<usize>,
+    /// The row keyboard navigation and Shift-selection extend from.
+    selection_focus: Option<usize>,
+    selection_anchor: Option<usize>,
     /// Set when the selection moved by keyboard, so the row is scrolled into
     /// view on the next pass. A mouse-driven selection is already visible.
     scroll_to_selection: bool,
@@ -440,7 +446,9 @@ impl FileBrowser {
             location_text: String::new(),
             entries: Vec::new(),
             state: ListingState::Reading,
-            selected: None,
+            selected: BTreeSet::new(),
+            selection_focus: None,
+            selection_anchor: None,
             scroll_to_selection: false,
             scroll_offset: 0.0,
             notice: None,
@@ -474,7 +482,12 @@ impl FileBrowser {
     #[cfg(test)]
     pub fn select_named(&mut self, name: &str) -> bool {
         let found = self.entries.iter().position(|entry| entry.name == name);
-        self.selected = found;
+        self.selected.clear();
+        if let Some(index) = found {
+            self.selected.insert(index);
+        }
+        self.selection_focus = found;
+        self.selection_anchor = found;
         found.is_some()
     }
 
@@ -520,7 +533,9 @@ impl FileBrowser {
         self.directory = directory;
         self.location_text = self.directory.display().to_string();
         self.entries.clear();
-        self.selected = None;
+        self.selected.clear();
+        self.selection_focus = None;
+        self.selection_anchor = None;
         self.scroll_offset = 0.0;
         self.state = ListingState::Reading;
         self.generation += 1;
@@ -604,11 +619,75 @@ impl FileBrowser {
 
     /// Select a row by index; out of range clears the selection.
     pub fn select(&mut self, index: usize) {
-        self.selected = (index < self.entries.len()).then_some(index);
+        self.selected.clear();
+        self.selection_focus = (index < self.entries.len()).then_some(index);
+        self.selection_anchor = self.selection_focus;
+        if self.selection_focus.is_some() {
+            self.selected.insert(index);
+        }
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
-        self.selected.and_then(|index| self.entries.get(index))
+        (self.selected.len() == 1)
+            .then(|| self.selected.first().copied())
+            .flatten()
+            .and_then(|index| self.entries.get(index))
+    }
+
+    fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Apply conventional file-list selection semantics. A folder cannot be
+    /// mixed into a file playlist; choosing one always makes it the sole row.
+    fn select_with_modifiers(&mut self, index: usize, modifiers: egui::Modifiers) {
+        if index >= self.entries.len() {
+            self.selected.clear();
+            self.selection_focus = None;
+            self.selection_anchor = None;
+            return;
+        }
+        if self.entries[index].directory {
+            self.select(index);
+            return;
+        }
+
+        let toggle = modifiers.command || modifiers.ctrl;
+        if modifiers.shift {
+            let anchor = self
+                .selection_anchor
+                .or(self.selection_focus)
+                .unwrap_or(index);
+            if !toggle {
+                self.selected.clear();
+            }
+            let (start, end) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
+            for candidate in start..=end {
+                if !self.entries[candidate].directory {
+                    self.selected.insert(candidate);
+                }
+            }
+            self.selection_focus = Some(index);
+            return;
+        }
+
+        if toggle {
+            if !self.selected.remove(&index) {
+                self.selected.insert(index);
+            }
+            self.selection_focus = self
+                .selected
+                .contains(&index)
+                .then_some(index)
+                .or_else(|| self.selected.last().copied());
+            self.selection_anchor = self.selection_focus;
+        } else {
+            self.select(index);
+        }
     }
 
     /// Go to the parent folder. Pure path arithmetic - it never asks the
@@ -632,8 +711,8 @@ impl FileBrowser {
             .is_some_and(|parent| !parent.as_os_str().is_empty())
     }
 
-    /// Act on the selected row: walk into a folder, or hand back a file to
-    /// open.
+    /// Act on the selected rows: walk into one folder, or hand back the files
+    /// to open as a sequence in their visible listing order.
     ///
     /// The file is checked for still being there first, and that check is
     /// not ceremony: a live archive gains and loses files while a listing is
@@ -641,23 +720,35 @@ impl FileBrowser {
     /// the folder re-read underneath it, and a decode failure said in the
     /// status line after the window has closed is the difference between a
     /// browser and a trapdoor.
-    pub fn activate_selection(&mut self) -> Option<PathBuf> {
-        let entry = self.selected_entry()?.clone();
-        let path = self.directory.join(&entry.name);
-        if entry.directory {
-            self.go_to(path);
+    pub fn activate_selection(&mut self) -> Option<Vec<PathBuf>> {
+        let indices = self.selected.iter().copied().collect::<Vec<_>>();
+        if indices.is_empty() {
             return None;
         }
-        if let Err(error) = std::fs::metadata(&path) {
-            self.notice = Some(format!(
-                "{} is no longer there ({error}). The folder has been read again.",
-                entry.name
-            ));
-            self.refresh();
-            return None;
+        if indices.len() == 1 {
+            let entry = self.entries.get(indices[0])?.clone();
+            if entry.directory {
+                self.go_to(self.directory.join(entry.name));
+                return None;
+            }
+        }
+
+        let mut paths = Vec::with_capacity(indices.len());
+        for index in indices {
+            let entry = self.entries.get(index)?.clone();
+            let path = self.directory.join(&entry.name);
+            if let Err(error) = std::fs::metadata(&path) {
+                self.notice = Some(format!(
+                    "{} is no longer there ({error}). The folder has been read again.",
+                    entry.name
+                ));
+                self.refresh();
+                return None;
+            }
+            paths.push(path);
         }
         self.notice = None;
-        Some(path)
+        Some(paths)
     }
 
     /// Move the selection by `delta` rows, clamped to the list.
@@ -666,12 +757,12 @@ impl FileBrowser {
             return;
         }
         let last = self.entries.len() as isize - 1;
-        let next = match self.selected {
+        let next = match self.selection_focus {
             Some(current) => (current as isize + delta).clamp(0, last),
             None if delta >= 0 => 0,
             None => last,
         };
-        self.selected = Some(next as usize);
+        self.select(next as usize);
         self.scroll_to_selection = true;
     }
 
@@ -679,7 +770,7 @@ impl FileBrowser {
     /// `view_height`, moving as little as possible. `None` when there is
     /// nothing to bring into view.
     fn scroll_offset_for_selection(&self, row_height: f32, view_height: f32) -> Option<f32> {
-        let selected = self.selected?;
+        let selected = self.selection_focus?;
         let top = selected as f32 * row_height;
         let bottom = top + row_height;
         let mut offset = self.scroll_offset;
@@ -741,12 +832,12 @@ pub struct FileBrowserInput<'a> {
 /// What the window decided this frame.
 #[derive(Default)]
 pub struct FileBrowserOutcome {
-    /// A file the analyst chose. The caller loads it exactly as it loads a
-    /// typed path or a drop.
-    pub open: Option<PathBuf>,
+    /// Files the analyst chose, in visible file-name order. One path is an
+    /// ordinary load; several are a sequence of separate timeline frames.
+    pub open: Vec<PathBuf>,
 }
 
-/// The Open… window. Returns the file to load, if one was chosen.
+/// The Open… window. Returns the ordered files to load, if any were chosen.
 pub fn draw_file_browser(
     context: &egui::Context,
     browser: &mut FileBrowser,
@@ -764,7 +855,7 @@ pub fn draw_file_browser(
     let max_width = (screen.width() - 24.0).clamp(280.0, 1_100.0);
     let max_height = (screen.height() - 48.0).max(240.0);
     let mut open = browser.open;
-    egui::Window::new("Open a radar file")
+    egui::Window::new("Open radar files")
         .open(&mut open)
         .default_size([760.0_f32.min(max_width), 520.0])
         .max_size([max_width, max_height])
@@ -783,7 +874,7 @@ pub fn draw_file_browser(
     if !browser.open {
         open = false;
     }
-    if outcome.open.is_some() {
+    if !outcome.open.is_empty() {
         open = false;
     }
     // The folder is worth remembering the moment it has been read
@@ -852,10 +943,15 @@ fn draw_actions(ui: &mut egui::Ui, browser: &mut FileBrowser, outcome: &mut File
     // them: it is a sentence, and a sentence beside a button sets the
     // window's minimum width to its own length.
     let selected = browser.selected_entry().cloned();
-    let line = match &selected {
-        Some(entry) if entry.directory => format!("{} - a folder.", entry.name),
-        Some(entry) => format!("{} - {}", entry.name, entry.identity.sentence()),
-        None => "Nothing selected. Click a row; double-click, or Enter, opens it.".to_owned(),
+    let selected_count = browser.selected_count();
+    let line = match (&selected, selected_count) {
+        (_, count) if count > 1 => format!(
+            "{count} files selected. They load in file-name order as separate timeline frames."
+        ),
+        (Some(entry), _) if entry.directory => format!("{} - a folder.", entry.name),
+        (Some(entry), _) => format!("{} - {}", entry.name, entry.identity.sentence()),
+        _ => "Nothing selected. Ctrl/Command-click or Shift-click selects a file playlist."
+            .to_owned(),
     };
     ui.add(egui::Label::new(egui::RichText::new(line).small().weak()).wrap());
     if let Some(notice) = browser.notice.clone() {
@@ -869,16 +965,17 @@ fn draw_actions(ui: &mut egui::Ui, browser: &mut FileBrowser, outcome: &mut File
         );
     }
     ui.horizontal(|ui| {
-        let label = match &selected {
-            Some(entry) if entry.directory => "Open folder",
-            _ => "Open",
+        let label = match (&selected, selected_count) {
+            (Some(entry), 1) if entry.directory => "Open folder".to_owned(),
+            (_, count) if count > 1 => format!("Open {count} files as playlist"),
+            _ => "Open".to_owned(),
         };
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new(label))
+            .add_enabled(selected_count > 0, egui::Button::new(label))
             .clicked()
-            && let Some(path) = browser.activate_selection()
+            && let Some(paths) = browser.activate_selection()
         {
-            outcome.open = Some(path);
+            outcome.open = paths;
         }
         if ui.button("Cancel").clicked() {
             browser.open = false;
@@ -972,7 +1069,7 @@ fn draw_listing(
     let scroll_to = std::mem::take(&mut browser.scroll_to_selection);
     let mut clicked = None;
     let mut double_clicked = None;
-    let selected = browser.selected;
+    let selected = browser.selected.clone();
     // Taken out of the browser for the pass so the rows can be drawn while
     // the browser itself stays borrowable; put straight back below.
     let entries = std::mem::take(&mut browser.entries);
@@ -991,13 +1088,13 @@ fn draw_listing(
                 let response = draw_row(
                     ui,
                     &entries[index],
-                    selected == Some(index),
+                    selected.contains(&index),
                     &columns,
                     row_height,
                     input.units,
                 );
                 if response.clicked() {
-                    clicked = Some(index);
+                    clicked = Some((index, ui.input(|input| input.modifiers)));
                 }
                 if response.double_clicked() {
                     double_clicked = Some(index);
@@ -1007,15 +1104,15 @@ fn draw_listing(
         browser.scroll_offset = output.state.offset.y;
     });
     browser.entries = entries;
-    if let Some(index) = clicked {
-        browser.select(index);
+    if let Some((index, modifiers)) = clicked {
+        browser.select_with_modifiers(index, modifiers);
     }
     if let Some(index) = double_clicked {
         browser.select(index);
         activate = true;
     }
-    if activate && let Some(path) = browser.activate_selection() {
-        outcome.open = Some(path);
+    if activate && let Some(paths) = browser.activate_selection() {
+        outcome.open = paths;
     }
 }
 
@@ -1227,6 +1324,7 @@ mod tests {
         let formats = [
             SupportedVolumeFormat::NexradLevel2,
             SupportedVolumeFormat::NexradLevel1TimeSeries,
+            SupportedVolumeFormat::MatlabIqCube,
             SupportedVolumeFormat::OdimH5,
             SupportedVolumeFormat::Dorade,
             SupportedVolumeFormat::CfRadial1,
@@ -1304,6 +1402,11 @@ mod tests {
         )
         .expect("write the decoy");
         std::fs::write(dir.join("empty"), b"").expect("write the empty file");
+        std::fs::write(
+            dir.join("research-cube.without-mat-extension"),
+            b"MATLAB 5.0 MAT-file synthetic header",
+        )
+        .expect("write MATLAB signature");
 
         assert_eq!(
             identify(&dir.join("KDVN20260819_192802_V06")),
@@ -1314,6 +1417,11 @@ mod tests {
             FileIdentity::Unrecognised
         );
         assert_eq!(identify(&dir.join("empty")), FileIdentity::Unrecognised);
+        assert_eq!(
+            identify(&dir.join("research-cube.without-mat-extension")),
+            FileIdentity::Radar(SupportedVolumeFormat::MatlabIqCube),
+            "MATLAB identity comes from the Level 5 header, not the suffix"
+        );
         let missing = identify(&dir.join("never-written"));
         assert!(
             matches!(missing, FileIdentity::Unreadable(_)),
@@ -1437,6 +1545,55 @@ mod tests {
             "{notice}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_selection_returns_a_filename_ordered_file_playlist() {
+        let dir = scratch("playlist");
+        for name in ["KTLX_003", "KTLX_001", "KTLX_002"] {
+            std::fs::write(dir.join(name), b"AR2V0006.473").expect("write a listed volume");
+        }
+        let mut browser = FileBrowser::new(egui::Context::default());
+        browser.go_to(dir.clone());
+        pump(&mut browser);
+
+        assert!(browser.select_named("KTLX_003"));
+        let first = browser
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "KTLX_001")
+            .expect("first file is listed");
+        let middle = browser
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "KTLX_002")
+            .expect("middle file is listed");
+        browser.select_with_modifiers(
+            first,
+            egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        browser.select_with_modifiers(
+            middle,
+            egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        let chosen = browser
+            .activate_selection()
+            .expect("three selected files become a playlist");
+        assert_eq!(
+            chosen,
+            ["KTLX_001", "KTLX_002", "KTLX_003"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The scan runs off the UI thread and streams back; this is the loop a

@@ -13,10 +13,22 @@ API keys, no telemetry.
   ODIM_H5 polar volumes; DORADE sweepfiles and mobile deployment zips
   (DOW, COW, RaXPol, NOXP); CfRadial 1.x in either container, classic
   netCDF or netCDF-4/HDF5; GR2Analyst-style `.msg31` exports; and Vaisala
-  RVP8/RVP900 Level 1 time series
+  RVP8/RVP900 Level 1 time series; plus MATLAB Level 5/v7 OU-PRIME I/Q cubes,
+  including a gzip wrapper
+- An in-app browser for NOAA/NSSL's public KOUN RVP Level 1 archive, with
+  background download progress, cancellation, non-overwriting writes to
+  Downloads, and optional open-after-download
+- Multiple local files can be selected or dropped together. They are decoded
+  independently into a filename-ordered timeline; a bad file does not stop
+  the rest, and data from different radar positions is never silently combined
+- **Export current view** writes the fully composited application window as a
+  non-overwriting PNG directly to Downloads
 - Up to four linked panes: reflectivity, velocity (dealiased and
   storm-relative), spectrum width, ZDR, CC, PHI, KDP, and derived products
   (CREF, ET, VIL, VILD, MESH, POH/POSH)
+- Native DOW frequency/receiver-chain products DBMH1/2/M, DBMV1/2/M,
+  DBZH1/2/M and DBZV1/2/M, with received power kept in dBm and equivalent
+  reflectivity kept in dBZ
 - Gate filters on the 2D panes: a reflectivity floor, velocity gated on its
   companion reflectivity sweep, RhoHV censoring, range-folded gates, and a
   near-range cutoff, with presets. A pane that is hiding gates says so on its
@@ -43,6 +55,11 @@ API keys, no telemetry.
   pulse-pair processing, with the dwell length, the window (rectangular, von
   Hann, Hamming, Blackman) and the SNR threshold under the analyst's control,
   and a Doppler spectrum for a chosen gate
+- Calibration-free OU-PRIME cubes are kept honest: the application shows
+  relative stored-I/Q power rather than fabricated dBm or dBZ, and does not
+  invent an SNR threshold. Their measured 32-pulse ray boundaries fix the
+  dwell length; the Window control still re-estimates the field, while the
+  preferred-dwell and SNR sliders intentionally cannot change that source
 - A file browser drawn in the application's own chrome, on every platform,
   which identifies each file by reading it rather than by its name - so a
   volume stored with no extension still says what it is
@@ -76,6 +93,9 @@ from its name.
 - Warnings and site metadata: NOAA/NWS api.weather.gov
 - Imagery: USGS The National Map (public domain);
   © OpenStreetMap contributors, under the Open Database License (ODbL)
+- Research Level 1 downloads: NOAA/NSSL KOUN THREDDS archive. Research-radar
+  I/Q holdings are distributed among operators; this browser is not presented
+  as a universal archive.
 
 This repository also redistributes real radar files as decoder test fixtures,
 including material used under CC BY 4.0 from EUMETNET OPERA / AEMET, EUMETNET

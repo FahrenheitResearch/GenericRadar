@@ -5,6 +5,7 @@ use eframe::egui;
 mod annotation;
 mod app;
 mod app_support;
+mod current_view_export;
 mod file_browser;
 mod gate_filter_ui;
 mod hazards;

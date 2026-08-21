@@ -119,6 +119,37 @@ pub fn builtin_reflectivity_table() -> ColorTable {
     awips_wilson_reflectivity_table().rendered(TableRendering::Smooth)
 }
 
+/// The NCAR/LROSE `dbmlow.colors` table used by the DOW6 and DOW7 DBM
+/// products, translated from its X11 colour names to their standard RGB
+/// values. The source is an operational display definition, not a palette
+/// inferred from the product name:
+/// <https://github.com/NCAR/lrose-displays/blob/master/color_scales/dbmlow.colors>.
+pub fn builtin_received_power_table() -> ColorTable {
+    banded_preset(
+        "NCAR DOW Received Power",
+        vec![
+            stop(-120.0, 77, 77, 77),
+            stop(-110.0, 176, 48, 96),
+            stop(-105.0, 153, 50, 204),
+            stop(-100.0, 0, 0, 255),
+            stop(-95.0, 65, 105, 225),
+            stop(-90.0, 0, 191, 255),
+            stop(-85.0, 0, 250, 154),
+            stop(-80.0, 34, 139, 34),
+            stop(-75.0, 190, 190, 190),
+            stop(-70.0, 238, 154, 73),
+            stop(-60.0, 255, 215, 0),
+            stop(-50.0, 255, 255, 0),
+            stop(-40.0, 255, 140, 105),
+            stop(-30.0, 255, 99, 71),
+            stop(-20.0, 255, 64, 64),
+            stop(-10.0, 255, 0, 0),
+            stop(0.0, 178, 34, 34),
+            stop(20.0, 178, 34, 34),
+        ],
+    )
+}
+
 pub fn builtin_velocity_table() -> ColorTable {
     generic_radar_velocity_table().rendered(TableRendering::Smooth)
 }
@@ -188,6 +219,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
             tornado_debris_reflectivity_table(),
             clean_light_reflectivity_table(),
         ],
+        ColorTableFamily::ReceivedPower => vec![builtin_received_power_table()],
         ColorTableFamily::Velocity => vec![
             builtin_velocity_table(),
             tornado_velocity_table(),

@@ -14,14 +14,16 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use radar_core::{MomentType, ProductId};
+use radar_core::{
+    DowFrequencyProduct, MomentType, ProductId, RadarReceiverChannel, ResearchMoment,
+};
 
 use crate::availability::AvailabilityRule;
 use crate::domain::{DisplayDomain, PlausibleRange, TickHint, ValueRange};
 use crate::provenance::{
-    AMBURN_WOLF_1997, AlgorithmMetadata, AlgorithmStatus, BERGEN_ALBERS_1988, FOOTE_ET_AL_2005,
-    GREENE_CLARK_1972, LAKSHMANAN_ET_AL_2013, NEXRAD_LEVEL_II_ICD, WALDVOGEL_ET_AL_1979,
-    WITT_ET_AL_1998,
+    AMBURN_WOLF_1997, AlgorithmMetadata, AlgorithmStatus, BERGEN_ALBERS_1988, DIXON_ET_AL_2013,
+    FOOTE_ET_AL_2005, GREENE_CLARK_1972, LAKSHMANAN_ET_AL_2013, LiteratureCitation,
+    NASA_DOW_OLYMPEX_GUIDE_2017, NEXRAD_LEVEL_II_ICD, WALDVOGEL_ET_AL_1979, WITT_ET_AL_1998,
 };
 use crate::units::{
     AffineTransform, DisplayUnit, KILOGRAMS_PER_CUBIC_METER_TO_GRAMS, METERS_PER_SECOND_TO_KNOTS,
@@ -37,6 +39,7 @@ pub enum ProductGroup {
     Base,
     VelocityAnalysis,
     DualPolarization,
+    ResearchRadar,
     VolumeReflectivity,
     Hail,
     Kinematics,
@@ -44,10 +47,11 @@ pub enum ProductGroup {
 }
 
 impl ProductGroup {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Base,
         Self::VelocityAnalysis,
         Self::DualPolarization,
+        Self::ResearchRadar,
         Self::VolumeReflectivity,
         Self::Hail,
         Self::Kinematics,
@@ -59,6 +63,7 @@ impl ProductGroup {
             Self::Base => "Base",
             Self::VelocityAnalysis => "Velocity Analysis",
             Self::DualPolarization => "Dual Polarization",
+            Self::ResearchRadar => "Research Radar",
             Self::VolumeReflectivity => "Volume Reflectivity",
             Self::Hail => "Hail",
             Self::Kinematics => "Kinematics",
@@ -308,6 +313,109 @@ const RAW_VELOCITY_RANGE: ValueRange = ValueRange::new(-64.0, 64.0);
 /// value legitimately leaves the encoded domain.
 const UNFOLDED_VELOCITY_RANGE: ValueRange = ValueRange::new(-100.0, 100.0);
 
+/// Primary account of OU-PRIME and the 10 May 2010 observation in the MAT file.
+///
+/// This source identifies the radar and observing campaign. The MAT cube itself
+/// supplies neither a radar constant nor a receiver-noise measurement, and a
+/// published radar description is not a per-file calibration. The product
+/// below therefore remains explicitly relative and must not be promoted to
+/// reflectivity.
+const PALMER_ET_AL_2011: LiteratureCitation = LiteratureCitation {
+    authors: "Palmer, R. D., and coauthors",
+    year: 2011,
+    title: "Observations of the 10 May 2010 Tornado Outbreak Using OU-PRIME: Potential for New Science with High-Resolution Polarimetric Radar",
+    venue: "Bulletin of the American Meteorological Society, 92, 871-891",
+    doi_or_url: "10.1175/2011BAMS3125.1",
+};
+
+fn dow_received_power_descriptor(
+    id: &'static str,
+    display_name: &'static str,
+    implementation_id: &'static str,
+    receiver: RadarReceiverChannel,
+    frequency: DowFrequencyProduct,
+) -> ProductDescriptor {
+    let moment = MomentType::Research(ResearchMoment::DowReceivedPower {
+        receiver,
+        frequency,
+    });
+    ProductDescriptor {
+        id: ProductId(id.to_owned()),
+        aliases: &[],
+        short_name: id,
+        display_name,
+        group: ProductGroup::ResearchRadar,
+        computation: ProductComputation::BaseMoment(moment.clone()),
+        domain: DisplayDomain {
+            engine_unit: PhysicalUnit::Dbm,
+            display_unit: DisplayUnit::Dbm,
+            display_from_engine: AffineTransform::IDENTITY,
+            // NCAR's operational DOW6/7 display configurations select
+            // `dbmlow.colors` for every DBM1/2/M field; that table is defined
+            // from -120 through +20 dBm. This is the sourced presentation
+            // span, not a fabricated physical clipping threshold.
+            // https://github.com/NCAR/lrose-displays/blob/master/color_scales/dbmlow.colors
+            declared_engine_range: ValueRange::new(-120.0, 20.0),
+            plausible: PlausibleRange::new(-120.0, 20.0, f32::MIN, f32::MAX),
+            tick_hint: TickHint::DEFAULT,
+            decimals: 1,
+        },
+        availability: AvailabilityRule::RequiresMoment(moment),
+        cut_policy: CutSelectionPolicy::LongestUnfoldedRange,
+        default_palette: PaletteKey("dbm"),
+        algorithm: AlgorithmMetadata::new(
+            implementation_id,
+            1,
+            AlgorithmStatus::OperationalDefinition,
+            &[DIXON_ET_AL_2013, NASA_DOW_OLYMPEX_GUIDE_2017],
+        ),
+        visibility: ProductVisibility::Normal,
+    }
+}
+
+fn dow_reflectivity_descriptor(
+    id: &'static str,
+    display_name: &'static str,
+    implementation_id: &'static str,
+    receiver: RadarReceiverChannel,
+    frequency: DowFrequencyProduct,
+) -> ProductDescriptor {
+    let moment = MomentType::Research(ResearchMoment::DowEquivalentReflectivity {
+        receiver,
+        frequency,
+    });
+    ProductDescriptor {
+        id: ProductId(id.to_owned()),
+        aliases: &[],
+        short_name: id,
+        display_name,
+        group: ProductGroup::ResearchRadar,
+        computation: ProductComputation::BaseMoment(moment.clone()),
+        domain: DisplayDomain {
+            engine_unit: PhysicalUnit::Dbz,
+            display_unit: DisplayUnit::Dbz,
+            display_from_engine: AffineTransform::IDENTITY,
+            // The exact NCAR DOW6/7 layer definitions select `dbz.colors`,
+            // whose authored span is -30 through +100 dBZ.
+            // https://github.com/NCAR/lrose-displays/blob/master/color_scales/dbz.colors
+            declared_engine_range: ValueRange::new(-30.0, 100.0),
+            plausible: PlausibleRange::new(-30.0, 100.0, f32::MIN, f32::MAX),
+            tick_hint: TickHint::DEFAULT,
+            decimals: 1,
+        },
+        availability: AvailabilityRule::RequiresMoment(moment),
+        cut_policy: CutSelectionPolicy::LongestUnfoldedRange,
+        default_palette: PaletteKey("ref"),
+        algorithm: AlgorithmMetadata::new(
+            implementation_id,
+            1,
+            AlgorithmStatus::OperationalDefinition,
+            &[DIXON_ET_AL_2013, NASA_DOW_OLYMPEX_GUIDE_2017],
+        ),
+        visibility: ProductVisibility::Normal,
+    }
+}
+
 fn builtin_descriptors() -> Vec<ProductDescriptor> {
     vec![
         ProductDescriptor {
@@ -335,6 +443,40 @@ fn builtin_descriptors() -> Vec<ProductDescriptor> {
                 1,
                 AlgorithmStatus::OperationalDefinition,
                 &[NEXRAD_LEVEL_II_ICD],
+            ),
+            visibility: ProductVisibility::Normal,
+        },
+        ProductDescriptor {
+            id: ProductId("PWR_REL".to_owned()),
+            aliases: &["relative_power", "uncalibrated_power", "stored_iq_power"],
+            short_name: "PWR_REL",
+            display_name: "Relative Power",
+            group: ProductGroup::Base,
+            computation: ProductComputation::BaseMoment(MomentType::RelativePower),
+            domain: DisplayDomain {
+                engine_unit: PhysicalUnit::RelativeIqPowerDb,
+                display_unit: DisplayUnit::RelativeIqPowerDb,
+                display_from_engine: AffineTransform::IDENTITY,
+                // Measured from the OU-PRIME cube: -0.14..92.09 dB relative
+                // to one squared stored I/Q unit. The rounded endpoints retain
+                // the observation with headroom without implying calibration.
+                declared_engine_range: ValueRange::new(-5.0, 95.0),
+                // Stored receiver units are format-local, so the hard bounds
+                // only catch a decode-scale failure; they are not physics.
+                plausible: PlausibleRange::new(-5.0, 95.0, -200.0, 200.0),
+                tick_hint: TickHint::DEFAULT,
+                decimals: 1,
+            },
+            availability: AvailabilityRule::RequiresMoment(MomentType::RelativePower),
+            // This is lag-zero power from Doppler I/Q, not calibrated
+            // surveillance reflectivity.
+            cut_policy: CutSelectionPolicy::VelocityLeg,
+            default_palette: PaletteKey("generic"),
+            algorithm: AlgorithmMetadata::new(
+                "base.relative_power.stored_iq",
+                1,
+                AlgorithmStatus::OperationalDefinition,
+                &[PALMER_ET_AL_2011],
             ),
             visibility: ProductVisibility::Normal,
         },
@@ -574,6 +716,90 @@ fn builtin_descriptors() -> Vec<ProductDescriptor> {
             ),
             visibility: ProductVisibility::Normal,
         },
+        dow_received_power_descriptor(
+            "DBMH1",
+            "DOW H-Channel Received Power (Frequency 1)",
+            "base.dow.dbmh1",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Frequency1,
+        ),
+        dow_received_power_descriptor(
+            "DBMH2",
+            "DOW H-Channel Received Power (Frequency 2)",
+            "base.dow.dbmh2",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Frequency2,
+        ),
+        dow_received_power_descriptor(
+            "DBMHM",
+            "DOW H-Channel Received Power (Merged)",
+            "base.dow.dbmhm",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Merged,
+        ),
+        dow_received_power_descriptor(
+            "DBMV1",
+            "DOW V-Channel Received Power (Frequency 1)",
+            "base.dow.dbmv1",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Frequency1,
+        ),
+        dow_received_power_descriptor(
+            "DBMV2",
+            "DOW V-Channel Received Power (Frequency 2)",
+            "base.dow.dbmv2",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Frequency2,
+        ),
+        dow_received_power_descriptor(
+            "DBMVM",
+            "DOW V-Channel Received Power (Merged)",
+            "base.dow.dbmvm",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Merged,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZH1",
+            "DOW H-Channel Reflectivity (Frequency 1)",
+            "base.dow.dbzh1",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Frequency1,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZH2",
+            "DOW H-Channel Reflectivity (Frequency 2)",
+            "base.dow.dbzh2",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Frequency2,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZHM",
+            "DOW H-Channel Reflectivity (Merged)",
+            "base.dow.dbzhm",
+            RadarReceiverChannel::Horizontal,
+            DowFrequencyProduct::Merged,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZV1",
+            "DOW V-Channel Reflectivity (Frequency 1)",
+            "base.dow.dbzv1",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Frequency1,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZV2",
+            "DOW V-Channel Reflectivity (Frequency 2)",
+            "base.dow.dbzv2",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Frequency2,
+        ),
+        dow_reflectivity_descriptor(
+            "DBZVM",
+            "DOW V-Channel Reflectivity (Merged)",
+            "base.dow.dbzvm",
+            RadarReceiverChannel::Vertical,
+            DowFrequencyProduct::Merged,
+        ),
         ProductDescriptor {
             id: ProductId("CREF".to_owned()),
             aliases: &[],
@@ -775,13 +1001,15 @@ mod tests {
 
     /// The ids a saved workspace already holds. Changing one of these silently
     /// retargets every workspace an analyst has saved, so the list is pinned.
-    const CANONICAL_IDS: [&str; 17] = [
-        "REF", "VEL", "DVEL", "SRV", "DSRV", "SW", "ZDR", "RHO", "PHI", "KDP", "CREF", "ET18",
-        "VIL", "VILD", "MESH", "POH", "POSH",
+    const CANONICAL_IDS: [&str; 30] = [
+        "REF", "PWR_REL", "VEL", "DVEL", "SRV", "DSRV", "SW", "ZDR", "RHO", "PHI", "KDP", "DBMH1",
+        "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM", "DBZH1", "DBZH2", "DBZHM", "DBZV1", "DBZV2",
+        "DBZVM", "CREF", "ET18", "VIL", "VILD", "MESH", "POH", "POSH",
     ];
 
     /// The ten a saved workspace may already hold, in their original order.
-    /// These must stay at the front: appending is safe, reordering is not.
+    /// New products may be inserted beside their group peers; the existing ids
+    /// must retain their relative order.
     const ORIGINAL_IDS: [&str; 10] = [
         "REF", "VEL", "DVEL", "SRV", "DSRV", "SW", "ZDR", "RHO", "PHI", "KDP",
     ];
@@ -795,9 +1023,13 @@ mod tests {
             .map(|descriptor| descriptor.id.0.as_str())
             .collect();
         assert_eq!(ids, CANONICAL_IDS);
+        let original_ids: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| ORIGINAL_IDS.contains(id))
+            .collect();
         assert_eq!(
-            &ids[..ORIGINAL_IDS.len()],
-            &ORIGINAL_IDS,
+            original_ids, ORIGINAL_IDS,
             "the products a saved workspace already names must keep their order"
         );
     }
@@ -956,6 +1188,66 @@ mod tests {
         assert_eq!(domain.engine_unit, PhysicalUnit::Dbz);
         assert_eq!(domain.display_unit, DisplayUnit::Dbz);
         assert_eq!(domain.format_display(52.5), "52.5 dBZ");
+    }
+
+    #[test]
+    fn relative_power_stays_explicitly_relative_from_storage_to_readout() {
+        let descriptor = ProductRegistry::builtin()
+            .get("PWR_REL")
+            .expect("PWR_REL must exist");
+        let domain = descriptor.domain;
+        assert_eq!(descriptor.group, ProductGroup::Base);
+        assert_eq!(descriptor.visibility, ProductVisibility::Normal);
+        assert_eq!(
+            descriptor.computation.source_moment(),
+            MomentType::RelativePower
+        );
+        assert_eq!(descriptor.default_palette, PaletteKey("generic"));
+        assert_eq!(domain.engine_unit, PhysicalUnit::RelativeIqPowerDb);
+        assert_eq!(domain.display_unit, DisplayUnit::RelativeIqPowerDb);
+        assert_eq!(domain.declared_engine_range, ValueRange::new(-5.0, 95.0));
+        assert!(domain.declared_engine_range.contains(-0.14));
+        assert!(domain.declared_engine_range.contains(92.09));
+        assert_eq!(domain.format_display(92.09), "92.1 dB re stored I/Q unit²");
+    }
+
+    #[test]
+    fn relative_power_does_not_become_a_source_for_reflectivity_products() {
+        let registry = ProductRegistry::builtin();
+        for id in ["CREF", "ET18", "VIL", "VILD", "MESH", "POH", "POSH"] {
+            let descriptor = registry.get(id).expect("derived product must exist");
+            assert_eq!(
+                descriptor.availability.required_moment(),
+                MomentType::Reflectivity,
+                "{id} must still require calibrated reflectivity"
+            );
+            assert_eq!(
+                descriptor.computation.source_moment(),
+                MomentType::Reflectivity,
+                "{id} must still read calibrated reflectivity"
+            );
+        }
+    }
+
+    #[test]
+    fn dow_frequency_products_keep_exact_names_units_and_sources() {
+        let registry = ProductRegistry::builtin();
+        for id in ["DBMH1", "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM"] {
+            let descriptor = registry.get(id).expect("DOW received-power product");
+            assert_eq!(descriptor.short_name, id);
+            assert_eq!(descriptor.domain.engine_unit, PhysicalUnit::Dbm);
+            assert_eq!(descriptor.domain.display_unit, DisplayUnit::Dbm);
+            assert_eq!(descriptor.default_palette, PaletteKey("dbm"));
+            assert_eq!(descriptor.domain.format_display(-92.5), "-92.5 dBm");
+            assert_eq!(descriptor.algorithm.citations.len(), 2);
+        }
+        for id in ["DBZH1", "DBZH2", "DBZHM", "DBZV1", "DBZV2", "DBZVM"] {
+            let descriptor = registry.get(id).expect("DOW reflectivity product");
+            assert_eq!(descriptor.short_name, id);
+            assert_eq!(descriptor.domain.engine_unit, PhysicalUnit::Dbz);
+            assert_eq!(descriptor.domain.display_unit, DisplayUnit::Dbz);
+            assert_eq!(descriptor.default_palette, PaletteKey("ref"));
+        }
     }
 
     #[test]

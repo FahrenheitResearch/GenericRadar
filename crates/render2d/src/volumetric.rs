@@ -218,6 +218,8 @@ fn moment_columns<'a>(volume: &'a RadarVolume, moment: &MomentType) -> Vec<CutCo
 fn f32_grid_like(base: &MomentGrid, moment: MomentType, values: Vec<f32>) -> MomentGrid {
     MomentGrid {
         moment,
+        producer_description: None,
+        producer_units: None,
         gate_range: base.gate_range.clone(),
         scale: 1.0,
         offset: 0.0,
@@ -861,6 +863,8 @@ pub fn vil_density_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     }
     Some(MomentGrid {
         moment: MomentType::Reflectivity,
+        producer_description: None,
+        producer_units: None,
         gate_range: vil.gate_range.clone(),
         scale: 1.0,
         offset: 0.0,
@@ -1443,6 +1447,8 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Reflectivity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -1506,6 +1512,8 @@ mod tests {
 
         let grid = MomentGrid {
             moment: MomentType::Reflectivity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,
@@ -1971,6 +1979,8 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Velocity,
+            producer_description: None,
+            producer_units: None,
             gate_range,
             scale: 1.0,
             offset: 0.0,

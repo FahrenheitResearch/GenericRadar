@@ -12,16 +12,16 @@
 //! ordinary apply path over it. It does not carry a list of the settings a
 //! profile contains.
 //!
-//! A hand-written list would be wrong the day after it was written. Every
-//! wave of work on this application adds knobs - a theme catalogue here, a
-//! gate filter there - and each one is added to the catalog and to the apply
+//! A hand-written list would be wrong the day after it was written. New
+//! releases add knobs - a theme catalogue here, a gate filter there - and
+//! each one is added to the catalog and to the apply
 //! path because that is what makes it work at all. A profile switch that
 //! enumerated keys would silently stop carrying each new setting, and the
 //! failure would be invisible: the profile would still switch, still say it
 //! had switched, and simply not move the three newest knobs. Because the
 //! switch replaces the document instead, a setting this build has never heard
-//! of - one a future build wrote, or one landing in another branch right now -
-//! is carried by the file, restored into the document, and applied by whatever
+//! of - for example, one written by a future build - is carried by the file,
+//! restored into the document, and applied by whatever
 //! wiring its own author gave it. **If you are here to add "and also copy
 //! X" - stop. X is already copied. What may be missing is X's apply path,
 //! which is the same thing that would be missing when a settings file is

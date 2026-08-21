@@ -724,8 +724,8 @@ fn fill_mesh(points: &[egui::Pos2], triangles: &[[u32; 3]], fill: egui::Color32)
 /// a COMPASS bearing, and this function turns it into screen sines and
 /// cosines. Without the camera's rotation added, a pane whose map has been
 /// straightened would draw every warning's motion vector pointing somewhere
-/// the storm is not going. That was already true of any non-zero rotation
-/// before this branch; nothing had ever set one.
+/// the storm is not going. Any non-zero rotation exposes the error, even
+/// though earlier sessions never set one.
 fn draw_hazard_motion(
     painter: &egui::Painter,
     points: &[egui::Pos2],
@@ -1200,7 +1200,7 @@ fn draw_range_rings(
                 //
                 // On a plate of the map's own label halo, because that column
                 // crosses whatever the basemap has written north of the radar:
-                // in the proof renders of KDVN, "62 mi" landed squarely on the
+                // in the reference renders of KDVN, "62 mi" landed squarely on the
                 // county name "Dubuque" and "100 km" on the same word. The
                 // collision is structural - a fixed azimuth over a labelled
                 // basemap will hit something at most sites - so the label is
@@ -1889,7 +1889,7 @@ mod tests {
         events: Vec<egui::Event>,
         body: impl FnOnce(&mut egui::Ui) -> R,
     ) -> R {
-        // A real integration updates the modifier state before it dispatches
+        // The window backend updates the modifier state before it dispatches
         // the key or wheel event that carries it, so the pass mirrors that:
         // `InputState::modifiers` is what the readers consult, and a test that
         // set only the event's own modifiers would be testing a state no

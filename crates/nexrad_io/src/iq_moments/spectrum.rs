@@ -37,7 +37,7 @@
 //! The returned axis is sorted ascending and spans one full Nyquist interval,
 //! `-v_a` (exclusive) to `+v_a` (inclusive) for an even dwell length.
 
-use super::estimator::{DwellGeometry, DwellWeights, MomentCalibration};
+use super::estimator::{DwellGeometry, DwellWeights, MomentCalibration, PowerReference};
 use super::fft::{Complex, forward};
 use super::taper::Taper;
 
@@ -48,15 +48,16 @@ pub struct DopplerSpectrum {
     pub nyquist_velocity_mps: f32,
     /// Bin centres, ascending, `-v_a` to just under `+v_a`.
     pub velocities_mps: Vec<f32>,
-    /// Bin powers, dBm, aligned with `velocities_mps`.
-    pub power_dbm: Vec<f32>,
-    /// The receiver noise floor for this channel, dBm - the level the spectrum
-    /// sits on where there is no signal. Carried so a plot can draw it.
-    pub noise_dbm: f32,
-    /// The noise floor spread across `n` bins, dBm: what one *bin* of pure noise
-    /// reads. This, not `noise_dbm`, is the line a spectrum plot should show,
-    /// and the two differ by `10 log10(n)` - about 18 dB for a 64-pulse dwell.
-    pub noise_per_bin_dbm: f32,
+    /// Bin powers aligned with `velocities_mps`.
+    pub power_db: Vec<f32>,
+    /// Whether `power_db` is absolute dBm or relative stored-unit power.
+    pub power_reference: PowerReference,
+    /// Receiver noise floor for this channel. Absent when the source carries no
+    /// measured noise reference.
+    pub noise_db: Option<f32>,
+    /// Noise spread across `n` bins. This is the line a calibrated spectrum
+    /// plot should show; relative spectra deliberately have no such line.
+    pub noise_per_bin_db: Option<f32>,
     /// The window the transform was actually taken through, read back off the
     /// weights rather than supplied alongside them.
     pub taper: Taper,
@@ -67,8 +68,9 @@ pub struct DopplerSpectrum {
 }
 
 impl DopplerSpectrum {
-    /// The first three spectral moments: total power in dBm, power-weighted
-    /// mean velocity, and power-weighted width.
+    /// The first three spectral moments: total power on this spectrum's
+    /// declared reference, power-weighted mean velocity, and power-weighted
+    /// width.
     ///
     /// Computed with the circular (vector) mean rather than an arithmetic one,
     /// because velocity is an angle here: a spectrum straddling the Nyquist edge
@@ -83,18 +85,19 @@ impl DopplerSpectrum {
         // this type needing to know the saturation level.
         let mut power_sum = 0.0f64;
         let mut vector = Complex::ZERO;
-        for (velocity, power_dbm) in self.velocities_mps.iter().zip(self.power_dbm.iter()) {
-            if !power_dbm.is_finite() {
+        for (velocity, power_db) in self.velocities_mps.iter().zip(self.power_db.iter()) {
+            if !power_db.is_finite() {
                 continue;
             }
-            let power = 10f64.powf(f64::from(*power_dbm) / 10.0);
+            let power = 10f64.powf(f64::from(*power_db) / 10.0);
             let angle = std::f64::consts::PI * f64::from(*velocity) / nyquist;
             power_sum += power;
             vector += Complex::from_polar(power, angle);
         }
         if power_sum <= 0.0 {
             return SpectralMoments {
-                power_dbm: f32::NEG_INFINITY,
+                power_db: f32::NEG_INFINITY,
+                power_reference: self.power_reference,
                 velocity_mps: f32::NAN,
                 width_mps: f32::NAN,
             };
@@ -105,11 +108,11 @@ impl DopplerSpectrum {
         // Second central moment about the circular mean, with each bin's offset
         // wrapped into +/- v_a first.
         let mut variance = 0.0f64;
-        for (velocity, power_dbm) in self.velocities_mps.iter().zip(self.power_dbm.iter()) {
-            if !power_dbm.is_finite() {
+        for (velocity, power_db) in self.velocities_mps.iter().zip(self.power_db.iter()) {
+            if !power_db.is_finite() {
                 continue;
             }
-            let power = 10f64.powf(f64::from(*power_dbm) / 10.0);
+            let power = 10f64.powf(f64::from(*power_db) / 10.0);
             let mut offset = f64::from(*velocity) - mean_velocity;
             while offset > nyquist {
                 offset -= 2.0 * nyquist;
@@ -120,7 +123,8 @@ impl DopplerSpectrum {
             variance += power * offset * offset;
         }
         SpectralMoments {
-            power_dbm: (10.0 * power_sum.log10()) as f32,
+            power_db: (10.0 * power_sum.log10()) as f32,
+            power_reference: self.power_reference,
             velocity_mps: mean_velocity as f32,
             width_mps: (variance / power_sum).sqrt() as f32,
         }
@@ -130,9 +134,14 @@ impl DopplerSpectrum {
 /// Moments read back off a spectrum. See [`DopplerSpectrum::moments`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpectralMoments {
-    /// Total power summed across every bin, dBm - the same quantity, and the
-    /// same scale, as `GateEstimate::power_h_dbm` from the same dwell.
-    pub power_dbm: f32,
+    /// Total power summed across every bin on [`Self::power_reference`] - the
+    /// same quantity and scale as `GateEstimate::power_h_db` from the same
+    /// dwell.
+    pub power_db: f32,
+    /// Whether [`Self::power_db`] is absolute receiver dBm or relative stored
+    /// I/Q-unit power. Kept beside the number so a caller cannot silently
+    /// relabel a calibration-free source as dBm.
+    pub power_reference: PowerReference,
     pub velocity_mps: f32,
     pub width_mps: f32,
 }
@@ -159,15 +168,17 @@ pub fn gate_spectrum(
     let n = samples.len();
     let taper = weights.taper();
     let nyquist = geometry.nyquist_velocity_mps();
-    let noise_dbm = calibration.noise_dbm[channel.min(1)];
+    let power_reference = calibration.power_reference();
+    let noise_db = calibration.noise_dbm(channel);
     if n == 0 || weights.pulses() != n {
         return DopplerSpectrum {
             range_m,
             nyquist_velocity_mps: nyquist as f32,
             velocities_mps: Vec::new(),
-            power_dbm: Vec::new(),
-            noise_dbm,
-            noise_per_bin_dbm: noise_dbm,
+            power_db: Vec::new(),
+            power_reference,
+            noise_db,
+            noise_per_bin_db: noise_db,
             taper,
             equivalent_noise_bandwidth_bins: taper.equivalent_noise_bandwidth_bins(n) as f32,
         };
@@ -189,7 +200,7 @@ pub fn gate_spectrum(
     } else {
         0.0
     };
-    let saturation = f64::from(calibration.saturation_dbm);
+    let power_offset = f64::from(calibration.power_db_offset());
 
     let half = n.div_ceil(2);
     let mut velocities = Vec::with_capacity(n);
@@ -200,23 +211,36 @@ pub fn gate_spectrum(
     for shifted in 0..n {
         let signed = (half as isize - 1) - shifted as isize;
         let k = signed.rem_euclid(n as isize) as usize;
-        let velocity = -2.0 * nyquist * signed as f64 / n as f64;
+        let velocity = geometry.doppler_phase_convention.velocity_multiplier()
+            * -2.0
+            * nyquist
+            * signed as f64
+            / n as f64;
         let power = transformed[k].norm_sqr() * scale;
         velocities.push(velocity as f32);
         powers.push(if power > 0.0 {
-            (10.0 * power.log10() + saturation) as f32
+            (10.0 * power.log10() + power_offset) as f32
         } else {
             f32::NEG_INFINITY
         });
+    }
+    if velocities
+        .first()
+        .zip(velocities.last())
+        .is_some_and(|(first, last)| first > last)
+    {
+        velocities.reverse();
+        powers.reverse();
     }
 
     DopplerSpectrum {
         range_m,
         nyquist_velocity_mps: nyquist as f32,
         velocities_mps: velocities,
-        power_dbm: powers,
-        noise_dbm,
-        noise_per_bin_dbm: noise_dbm - 10.0 * (n as f32).log10(),
+        power_db: powers,
+        power_reference,
+        noise_db,
+        noise_per_bin_db: noise_db.map(|noise| noise - 10.0 * (n as f32).log10()),
         taper,
         equivalent_noise_bandwidth_bins: taper.equivalent_noise_bandwidth_bins(n) as f32,
     }
@@ -231,18 +255,12 @@ mod tests {
         DwellGeometry {
             wavelength_m: 0.1108,
             prt_s: 833.375e-6,
+            doppler_phase_convention: Default::default(),
         }
     }
 
     fn calibration() -> MomentCalibration {
-        MomentCalibration {
-            dbz0_db: -35.5,
-            noise_dbm: [-80.0, -80.0],
-            saturation_dbm: 6.0,
-            zdr_offset_db: 0.0,
-            phidp_offset_deg: 0.0,
-            gaseous_attenuation_db_per_km: 0.0,
-        }
+        MomentCalibration::absolute(-35.5, [-80.0, -80.0], 6.0, 0.0, 0.0, 0.0)
     }
 
     /// A deterministic Gaussian-spectrum dwell: a sum of tones drawn from a
@@ -325,7 +343,7 @@ mod tests {
             .collect();
         let spectrum = gate_spectrum(&samples, &weights, &geometry, &calibration(), 0, 25_000.0);
         let peak = spectrum
-            .power_dbm
+            .power_db
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
@@ -359,7 +377,7 @@ mod tests {
                     25_000.0,
                 );
                 let difference =
-                    f64::from(spectrum.moments().power_dbm) - f64::from(estimate.power_h_dbm);
+                    f64::from(spectrum.moments().power_db) - f64::from(estimate.power_h_db);
                 assert!(
                     difference.abs() < 1e-4,
                     "{} at {pulses} pulses: spectrum total and R(0) differ by {difference} dB",
@@ -446,17 +464,17 @@ mod tests {
             let spectrum =
                 gate_spectrum(&samples, &weights, &geometry, &calibration(), 0, 25_000.0);
             let peak = spectrum
-                .power_dbm
+                .power_db
                 .iter()
                 .cloned()
                 .fold(f32::NEG_INFINITY, f32::max);
             let peak_index = spectrum
-                .power_dbm
+                .power_db
                 .iter()
                 .position(|value| *value == peak)
                 .expect("peak exists");
             // Ten bins away from the line, relative to the line.
-            let far = spectrum.power_dbm[(peak_index + 10) % pulses] - peak;
+            let far = spectrum.power_db[(peak_index + 10) % pulses] - peak;
             skirts.push((taper, far));
         }
         assert!(
@@ -505,5 +523,36 @@ mod tests {
         let spectrum = gate_spectrum(&[], &weights, &geometry, &calibration(), 0, 0.0);
         assert!(spectrum.velocities_mps.is_empty());
         assert!(spectrum.moments().velocity_mps.is_nan());
+    }
+
+    #[test]
+    fn a_relative_spectrum_has_a_relative_axis_and_no_invented_noise_line() {
+        let geometry = geometry();
+        let velocity = 5.0;
+        let step = -4.0 * std::f64::consts::PI * velocity * geometry.prt_s / geometry.wavelength_m;
+        let samples: Vec<Complex> = (0..32)
+            .map(|pulse| Complex::from_polar(10.0, step * pulse as f64))
+            .collect();
+        let weights = DwellWeights::new(Taper::Rectangular, samples.len());
+        let spectrum = gate_spectrum(
+            &samples,
+            &weights,
+            &geometry,
+            &MomentCalibration::RelativeStoredIq,
+            0,
+            1_000.0,
+        );
+        assert_eq!(
+            spectrum.power_reference,
+            PowerReference::RelativeStoredIqSquared
+        );
+        assert_eq!(spectrum.noise_db, None);
+        assert_eq!(spectrum.noise_per_bin_db, None);
+        assert!(spectrum.power_db.iter().any(|power| power.is_finite()));
+        assert_eq!(
+            spectrum.moments().power_reference,
+            PowerReference::RelativeStoredIqSquared,
+            "reading moments back off the spectrum must retain its relative reference"
+        );
     }
 }

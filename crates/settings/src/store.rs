@@ -264,9 +264,9 @@ impl SettingsStore {
     ///
     /// Deliberately the whole document and not a set of keys: a replacement
     /// carries values under categories and ids this build has never heard of,
-    /// which is the property that lets a profile written by a newer build - or
-    /// by a branch landing tomorrow - survive being switched to and away from
-    /// here. See the profiles module for the argument in full.
+    /// which is the property that lets a profile written by a newer build
+    /// survive being switched to and away from here. See the profiles module
+    /// for the argument in full.
     ///
     /// Unlike [`Self::replace_values`] this does carry the workspace, because
     /// a profile is a whole named bench and the analyst asked for it by name.

@@ -1,11 +1,11 @@
 //! Persisting colour table choices, and restoring them defensively.
 //!
 //! A palette is stored as its **base name** plus its **rendering** - the two
-//! halves `color_tables` split a table into when rendering became a property
-//! (commit 18af957): `base_name()` is stable across the smooth/stepped
-//! switch, and the rendering is one word. Restoring resolves the name
-//! through the shipped catalog for that family, then through the analyst's
-//! own colour table folder - the one `settings::user_colortables_dir` names,
+//! halves `color_tables` exposes for every table: `base_name()` is stable
+//! across the smooth/stepped switch, and the rendering is one word. Restoring
+//! resolves the name through the shipped catalog for that family, then
+//! through the analyst's own colour table folder - the one
+//! `settings::user_colortables_dir` names,
 //! which is both what the folder scanner (`color_tables::user`) reads and
 //! where the colour table editor writes, and which is what makes a table
 //! made in the editor survive a restart. A name neither of those holds - a
@@ -31,6 +31,7 @@ use settings::PaletteChoice;
 pub fn family_id(family: ColorTableFamily) -> &'static str {
     match family {
         ColorTableFamily::Reflectivity => "reflectivity",
+        ColorTableFamily::ReceivedPower => "received_power",
         ColorTableFamily::Velocity => "velocity",
         ColorTableFamily::SpectrumWidth => "spectrum_width",
         ColorTableFamily::DifferentialReflectivity => "differential_reflectivity",

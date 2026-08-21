@@ -24,6 +24,7 @@ pub mod iq;
 /// its moments already estimated; Level 1 arrives as pulses, so the estimator
 /// that the signal processor would have run lives here.
 pub mod iq_moments;
+pub mod matlab_iq;
 pub mod mobile_archive;
 pub mod netcdf3;
 pub mod netcdf4;
@@ -194,10 +195,14 @@ impl ArchiveCompression {
 ///   radar volume and [`decode_supported_volumes_bytes`] declines it in
 ///   those words rather than letting the Archive II decoder call it corrupt.
 ///   [`iq`] is the reader for it.
+/// * [`Self::MatlabIqCube`] — `MATLAB 5.0 MAT-file`, the Level 5 MAT header
+///   used by MATLAB v7 files with zlib-compressed data elements. It is not the
+///   HDF5 container used by MATLAB v7.3. [`matlab_iq`] reads OU-PRIME cubes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportedVolumeFormat {
     NexradLevel2,
     NexradLevel1TimeSeries,
+    MatlabIqCube,
     OdimH5,
     Dorade,
     CfRadial1,
@@ -210,6 +215,7 @@ impl SupportedVolumeFormat {
         match self {
             Self::NexradLevel2 => "NEXRAD Archive II",
             Self::NexradLevel1TimeSeries => "NEXRAD Level 1 time series (RVP8/RVP900)",
+            Self::MatlabIqCube => "MATLAB Level 5 I/Q cube",
             Self::OdimH5 => "ODIM_H5",
             Self::Dorade => "DORADE",
             Self::CfRadial1 => "CfRadial 1.x",
@@ -260,6 +266,9 @@ pub fn sniff_supported_volume_format(head: &[u8]) -> Option<SupportedVolumeForma
     }
     if head.starts_with(b"\x89HDF\r\n\x1a\n") {
         return Some(SupportedVolumeFormat::OdimH5);
+    }
+    if head.starts_with(b"MATLAB 5.0 MAT-file") {
+        return Some(SupportedVolumeFormat::MatlabIqCube);
     }
     // The netCDF reader owns which `CDF` versions it recognises, INCLUDING
     // the CDF-5 it can only refuse: routing a narrower set here left a
@@ -393,6 +402,14 @@ pub fn decode_supported_volumes_bytes(raw: &[u8]) -> Result<Vec<RadarVolume>> {
         // is the reader for it.
         SupportedVolumeFormat::NexradLevel1TimeSeries => {
             return Err(time_series_not_a_volume(format, body));
+        }
+        SupportedVolumeFormat::MatlabIqCube => {
+            return Err(NexradError::NotAVolume {
+                format: format.label(),
+                detail: "holds unestimated research-radar I/Q samples; decode it with the \
+                         `matlab_iq` reader and process its native ray dwells"
+                    .to_owned(),
+            });
         }
     };
     decoded
@@ -2577,7 +2594,7 @@ mod tests {
 
     #[test]
     fn sniffs_every_container_by_its_magic_number() {
-        let cases: [(&[u8], SupportedVolumeFormat); 8] = [
+        let cases: [(&[u8], SupportedVolumeFormat); 9] = [
             (b"AR2V0006.473", SupportedVolumeFormat::NexradLevel2),
             (b"ARCHIVE2.027", SupportedVolumeFormat::NexradLevel2),
             (
@@ -2588,6 +2605,7 @@ mod tests {
             (b"\x89HDF\r\n\x1a\n\x00\x00", SupportedVolumeFormat::OdimH5),
             (b"CDF\x01\x00\x00\x00\x00", SupportedVolumeFormat::CfRadial1),
             (b"CDF\x02\x00\x00\x00\x00", SupportedVolumeFormat::CfRadial1),
+            (b"MATLAB 5.0 MAT-file", SupportedVolumeFormat::MatlabIqCube),
             (
                 b"PK\x03\x04\x14\x00\x00\x00",
                 SupportedVolumeFormat::MobileDeploymentZip,
@@ -2601,6 +2619,18 @@ mod tests {
                 &bytes[..4.min(bytes.len())]
             );
         }
+    }
+
+    #[test]
+    fn matlab_iq_is_named_and_declined_by_the_volume_router() {
+        let error = decode_supported_volume_bytes(b"MATLAB 5.0 MAT-file").unwrap_err();
+        assert!(matches!(
+            error,
+            NexradError::NotAVolume {
+                format: "MATLAB Level 5 I/Q cube",
+                ..
+            }
+        ));
     }
 
     /// A CDF-5 file gets the netCDF decoder's own explanation, not the

@@ -8,14 +8,13 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-# Dev-only. The workstation's settings window (`workstation_app/src/settings_ui.rs`)
-# is compiled and unit-tested here through `tests/workstation_settings_ui.rs`
-# (a `#[path]` include) until the human-owned wiring lands in `workstation_app`,
-# because unreferenced source files are not compiled at all and an unverified
-# UI module is worth nothing. The same include drives `examples/settings_preview`,
-# which opens the real window and photographs it. None of these reach the
-# shipped `settings` library: the firewall in `workstation_app/tests/architecture.rs`
-# reads only `[dependencies]`, and this section is not it.
+# Dev-only. `tests/workstation_settings_ui.rs` includes the workstation's real
+# settings window (`workstation_app/src/settings_ui.rs`) so its focused tests
+# can run independently of the full application. The same include drives
+# `examples/settings_preview`, which opens and photographs the real window.
+# None of these reach the shipped `settings` library: the firewall in
+# `workstation_app/tests/architecture.rs` reads only `[dependencies]`, and this
+# section is not it.
 [dev-dependencies]
 analyst_runtime = { path = "../analyst_runtime" }
 color_tables = { path = "../color_tables" }

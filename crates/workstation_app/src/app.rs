@@ -33,6 +33,8 @@ use crate::sites_service::{LocatedSite, SitesService};
 use crate::sweep::{SweepAnimator, SweepState, catch_up_factor};
 use crate::warnings_service::WarningsService;
 
+mod online_data;
+
 /// How often placed hazards are rebuilt so expiries take effect.
 ///
 /// Placement filters by "now", so it goes stale on its own even when nothing
@@ -43,6 +45,86 @@ const HAZARD_REPLACEMENT_INTERVAL: Duration = Duration::from_secs(30);
 enum LiveAction {
     Start(String),
     Stop,
+}
+
+/// One ordered set of local files being decoded into separate timeline
+/// frames. It is deliberately not a volume-builder: each successful file
+/// remains independently identified and failure of one advances to the next.
+struct FileSequence {
+    paths: Vec<PathBuf>,
+    next: usize,
+    loaded: usize,
+    failures: Vec<(PathBuf, String)>,
+    /// The history/map architecture is one radar anchor at a time. The first
+    /// successful file fixes that anchor; another radar is reported and
+    /// skipped instead of being painted on the wrong ground.
+    site_id: Option<String>,
+    site_position: Option<(Option<f32>, Option<f32>)>,
+    level1_files: usize,
+}
+
+impl FileSequence {
+    fn total(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn current_path(&self) -> Option<&PathBuf> {
+        self.next
+            .checked_sub(1)
+            .and_then(|index| self.paths.get(index))
+    }
+}
+
+/// Stable order for a selection assembled by an OS drop or by the browser.
+/// Radar archive names normally sort chronologically; the history still uses
+/// the decoded volume time as its authoritative display order.
+fn ordered_unique_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .unwrap_or_else(|| left.as_os_str())
+            .to_string_lossy()
+            .to_lowercase();
+        let right_name = right
+            .file_name()
+            .unwrap_or_else(|| right.as_os_str())
+            .to_string_lossy()
+            .to_lowercase();
+        left_name
+            .cmp(&right_name)
+            .then_with(|| left.as_os_str().cmp(right.as_os_str()))
+    });
+    paths.dedup();
+    paths
+}
+
+fn short_path_label(path: &std::path::Path) -> String {
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    const MAX_CHARS: usize = 56;
+    if label.chars().count() <= MAX_CHARS {
+        label
+    } else {
+        let mut short = label.chars().take(MAX_CHARS - 1).collect::<String>();
+        short.push('…');
+        short
+    }
+}
+
+fn same_playlist_position(
+    left: (Option<f32>, Option<f32>),
+    right: (Option<f32>, Option<f32>),
+) -> bool {
+    fn same(left: Option<f32>, right: Option<f32>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => (left - right).abs() <= 0.001,
+            _ => false,
+        }
+    }
+    same(left.0, right.0) && same(left.1, right.1)
 }
 
 /// What the live poll last said about the FEED, as opposed to what is on
@@ -126,6 +208,7 @@ const PLACEHOLDER_KM_PER_POINT: f32 = 4.0;
 /// magic bytes: an extensionless archive object works, and a `.gz` is opened
 /// by what is inside it.
 const OPEN_PATH_HINT: &str = "NEXRAD Level II (.ar2v/.gz/.bz2/_V06, or no extension at all), \
+                             MATLAB Level 5 I/Q (.mat), \
      GR2Analyst .msg31, ODIM_H5 (.h5/.hdf/.hd5), CfRadial (.nc), or a mobile deployment .zip. \
      Files can also be dropped on the window.";
 
@@ -422,6 +505,11 @@ pub struct WorkstationApp {
     /// transforms. `None` whenever the current frame came from a file that
     /// arrived with its moments already made, which is every other format.
     iq: Option<Box<crate::iq_session::IqSession>>,
+    /// Panes temporarily moved from REF to PWR_REL for a calibration-free I/Q
+    /// source. The bit is cleared by an explicit product choice and consumed
+    /// when the next calibrated/non-IQ source arrives, so the convenience can
+    /// never permanently rewrite the analyst's workspace.
+    relative_power_fallback_from_ref: [bool; analyst_runtime::MAX_PANES],
     /// The 3D volume explorer. Its own window, so opening it does not disturb
     /// the pane layout an analyst has set up.
     vol3d: crate::vol3d::Vol3d,
@@ -472,6 +560,15 @@ pub struct WorkstationApp {
     /// owns the folder it is looking at, the identifications it has already
     /// paid for, and the channel its scan thread answers on.
     file_browser: crate::file_browser::FileBrowser,
+    /// A multi-file open is a sequential playlist of independent frames.
+    file_sequence: Option<FileSequence>,
+    sequence_status: Option<String>,
+    sequence_detail: Option<String>,
+    current_view_export: crate::current_view_export::CurrentViewExport,
+    /// Public research-radar catalog navigation and its background download
+    /// worker. Kept beside the local browser because both return a path into
+    /// the same load seam; neither performs decoding itself.
+    online_data: online_data::OnlineDataBrowser,
     status: String,
     load_ms: Option<f32>,
     last_playback_step: Instant,
@@ -552,6 +649,7 @@ impl WorkstationApp {
             history: VolumeHistory::default(),
             hail_environment: product_engine::HailEnvironment::climatological_fallback(),
             iq: None,
+            relative_power_fallback_from_ref: [false; analyst_runtime::MAX_PANES],
             vol3d: crate::vol3d::Vol3d::default(),
             xsection: crate::xsection::XSection::default(),
             vrot_active: false,
@@ -587,6 +685,11 @@ impl WorkstationApp {
             palette_offers: crate::settings_ui::PaletteOfferCache::default(),
             source_path_text,
             file_browser: crate::file_browser::FileBrowser::new(context.clone()),
+            file_sequence: None,
+            sequence_status: None,
+            sequence_detail: None,
+            current_view_export: crate::current_view_export::CurrentViewExport::default(),
+            online_data: online_data::OnlineDataBrowser::new(context.clone()),
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
             last_playback_step: Instant::now(),
@@ -1648,7 +1751,8 @@ impl WorkstationApp {
         self.vol3d.open = open;
     }
 
-    fn begin_load(&mut self, path: PathBuf) {
+    /// Retire the previous session before a local file or file playlist.
+    fn begin_local_session(&mut self) -> analyst_runtime::Generation {
         if self.live_site.is_some() {
             self.live_service.stop();
             self.live_site = None;
@@ -1665,10 +1769,18 @@ impl WorkstationApp {
         let generation = self.session_clock.bump();
         self.frame_clock.bump();
         self.history.clear();
-        self.source_path_text = path.display().to_string();
-        self.status = format!("Loading {}", path.display());
         self.load_ms = None;
         self.clear_all_panes();
+        generation
+    }
+
+    fn begin_load(&mut self, path: PathBuf) {
+        self.file_sequence = None;
+        self.sequence_status = None;
+        self.sequence_detail = None;
+        let generation = self.begin_local_session();
+        self.source_path_text = path.display().to_string();
+        self.status = format!("Loading {}", path.display());
         let source_label = path.display().to_string();
         if let Err(request) = self.load_service.request(LoadRequest {
             generation,
@@ -1682,9 +1794,203 @@ impl WorkstationApp {
         }
     }
 
+    /// Decode local files one at a time into independent history frames.
+    ///
+    /// Input order is made deterministic before the first request; history
+    /// then applies its existing volume-time ordering. A failed file advances
+    /// to the next. Files from another radar are refused because this
+    /// workspace has one map anchor and cannot honestly paint two sites on it.
+    fn begin_load_sequence(&mut self, paths: Vec<PathBuf>) {
+        let paths = ordered_unique_paths(paths);
+        match paths.len() {
+            0 => return,
+            1 => {
+                self.begin_load(paths.into_iter().next().expect("one path"));
+                return;
+            }
+            _ => {}
+        }
+
+        let first = paths[0].display().to_string();
+        self.begin_local_session();
+        self.source_path_text = first;
+        self.file_sequence = Some(FileSequence {
+            paths,
+            next: 0,
+            loaded: 0,
+            failures: Vec::new(),
+            site_id: None,
+            site_position: None,
+            level1_files: 0,
+        });
+        self.update_sequence_status("starting");
+        self.request_next_sequence_file();
+    }
+
+    fn request_next_sequence_file(&mut self) {
+        let next = self.file_sequence.as_mut().and_then(|sequence| {
+            let path = sequence.paths.get(sequence.next)?.clone();
+            sequence.next += 1;
+            Some(path)
+        });
+        let Some(path) = next else {
+            self.finish_file_sequence();
+            return;
+        };
+
+        let source_label = path.display().to_string();
+        self.update_sequence_status("loading");
+        self.status = format!("Loading {source_label}");
+        let request = LoadRequest {
+            generation: self.session_clock.current(),
+            path,
+            origin: FrameOrigin::Local,
+            final_stage: FrameStage::Complete,
+            source_label,
+            iq_controls: self.settings_cache.iq_controls,
+        };
+        if let Err(request) = self.load_service.request(request) {
+            let message = "load worker is closed".to_owned();
+            if let Some(sequence) = self.file_sequence.as_mut() {
+                sequence.failures.push((request.path, message.clone()));
+                // A closed worker cannot serve any remaining request. Record
+                // them explicitly rather than pretending they were attempted.
+                for path in sequence.paths.drain(sequence.next..) {
+                    sequence.failures.push((path, message.clone()));
+                }
+            }
+            self.finish_file_sequence();
+        }
+    }
+
+    fn finish_sequence_failure(&mut self, message: String) {
+        if let Some(sequence) = self.file_sequence.as_mut() {
+            let path = sequence
+                .current_path()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("unknown file"));
+            sequence.failures.push((path, message));
+        }
+        self.request_next_sequence_file();
+    }
+
+    fn finish_sequence_volume(&mut self, mut loaded: LoadedVolume) {
+        // Preserve the same sourced site lookup a single Level 1 open gets,
+        // before discarding the raw pulses that cannot safely live in history.
+        self.locate_loaded_time_series(&mut loaded);
+        let site = loaded.volume.site.id.trim().to_owned();
+        let position = (
+            loaded.volume.site.latitude_deg,
+            loaded.volume.site.longitude_deg,
+        );
+        let expected = self
+            .file_sequence
+            .as_ref()
+            .and_then(|sequence| sequence.site_id.as_deref());
+        if let Some(expected) = expected
+            && !site.eq_ignore_ascii_case(expected)
+        {
+            self.finish_sequence_failure(format!(
+                "radar {site} does not match playlist radar {expected}; file skipped"
+            ));
+            return;
+        }
+        let expected_position = self
+            .file_sequence
+            .as_ref()
+            .and_then(|sequence| sequence.site_position);
+        if let Some(expected_position) = expected_position
+            && !same_playlist_position(position, expected_position)
+        {
+            self.finish_sequence_failure(
+                "radar position differs from the first playlist frame; file skipped".to_owned(),
+            );
+            return;
+        }
+
+        if let Some(sequence) = self.file_sequence.as_mut() {
+            if sequence.site_id.is_none() {
+                sequence.site_id = Some(site);
+                sequence.site_position = Some(position);
+            }
+            if loaded.iq.is_some() {
+                sequence.level1_files += 1;
+            }
+            sequence.loaded += 1;
+        }
+        // Let the ordinary install path inspect this session long enough to
+        // select PWR_REL for an uncalibrated cube. The session is discarded
+        // immediately afterwards: raw Level 1 pulses are session state, not
+        // history state, and retaining one would let a scrubbed frame operate
+        // on another file's I/Q. Playlists keep the honestly estimated moments
+        // while disabling raw reprocessing/spectra.
+        self.install_loaded_volume(loaded);
+        self.iq = None;
+        self.request_next_sequence_file();
+    }
+
+    fn update_sequence_status(&mut self, action: &str) {
+        let Some(sequence) = self.file_sequence.as_ref() else {
+            return;
+        };
+        let current = sequence.next.max(1).min(sequence.total());
+        self.sequence_status = Some(format!(
+            "Playlist {current}/{} · filename order · {action}",
+            sequence.total()
+        ));
+        let current = sequence
+            .current_path()
+            .map(|path| format!(" Current file: {}.", path.display()))
+            .unwrap_or_default();
+        self.sequence_detail = Some(format!(
+            "Each file is a separate frame.{current} {} decoded, {} failed so far. Successful frames are ordered by radar volume time; a different radar or radar position is skipped because this workspace has one map anchor.",
+            sequence.loaded,
+            sequence.failures.len()
+        ));
+    }
+
+    fn finish_file_sequence(&mut self) {
+        let Some(sequence) = self.file_sequence.take() else {
+            return;
+        };
+        let failed = sequence.failures.len();
+        self.sequence_status = Some(format!(
+            "Playlist complete · {}/{} decoded · {} frame(s) · {failed} failed",
+            sequence.loaded,
+            sequence.total(),
+            self.history.len()
+        ));
+        let mut detail = "Loaded in filename order; the timeline orders the retained frames by radar volume time. Files are never merged into one volume.".to_owned();
+        if sequence.level1_files > 0 {
+            detail.push_str(
+                " Level 1 frames keep their estimated moments, but raw spectrum and reprocessing controls are disabled for a playlist so pulses from one file cannot be applied to another.",
+            );
+        }
+        if failed > 0 {
+            detail.push_str(" Failed: ");
+            for (index, (path, message)) in sequence.failures.iter().take(5).enumerate() {
+                if index > 0 {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!("{} ({message})", short_path_label(path)));
+            }
+            if failed > 5 {
+                detail.push_str(&format!("; and {} more", failed - 5));
+            }
+        }
+        self.sequence_detail = Some(detail);
+        self.iq = None;
+        if self.history.is_empty() {
+            self.clear_all_panes();
+        }
+    }
+
     /// Start a live session for `site`. The generation bump invalidates every
     /// in-flight local or previous-site result before the new session installs.
     fn start_live(&mut self, site: String) {
+        self.file_sequence = None;
+        self.sequence_status = None;
+        self.sequence_detail = None;
         // Unconditional, like the history clear below: a half-finished pair
         // must not keep its first endpoint - old-anchor coordinates - alive
         // into the new radar's data, and a finished measurement of the old
@@ -2034,17 +2340,39 @@ impl WorkstationApp {
                     source_label,
                 } => {
                     if generation == self.session_clock.current() {
+                        if self.file_sequence.is_some() {
+                            self.update_sequence_status("decoding");
+                        }
                         self.status = format!("Decoding {source_label}");
                     }
                 }
-                LoadUpdate::Volume(loaded) => self.install_loaded_volume(loaded),
+                LoadUpdate::Volume(loaded) => {
+                    if loaded.generation != self.session_clock.current() {
+                        continue;
+                    }
+                    if self.file_sequence.is_some() {
+                        // A playlist waits for each file's terminal answer.
+                        // Installing a progressive preview would leave a
+                        // failed file as a half-frame and could fix the map
+                        // anchor from a file that never decoded completely.
+                        if loaded.stage == FrameStage::Complete {
+                            self.finish_sequence_volume(loaded);
+                        }
+                    } else {
+                        self.install_loaded_volume(loaded);
+                    }
+                }
                 LoadUpdate::Failed {
                     generation,
                     source_label,
                     message,
                 } => {
                     if generation == self.session_clock.current() {
-                        self.handle_load_failure(&source_label, &message);
+                        if self.file_sequence.is_some() {
+                            self.finish_sequence_failure(message);
+                        } else {
+                            self.handle_load_failure(&source_label, &message);
+                        }
                     }
                 }
             }
@@ -2069,13 +2397,29 @@ impl WorkstationApp {
         }
     }
 
+    /// Give a Level 1-derived volume the sourced site position its pulse file
+    /// does not contain. Shared by ordinary installs and playlist installs;
+    /// the latter discards the raw pulse session after this lookup.
+    fn locate_loaded_time_series(&self, loaded: &mut LoadedVolume) {
+        let Some(session) = loaded.iq.as_ref() else {
+            return;
+        };
+        let Some(located) = self.time_series_site(session.site_id()) else {
+            return;
+        };
+        let mut volume = (*loaded.volume).clone();
+        volume.site.name.clone_from(&located.name);
+        volume.site.latitude_deg = Some(located.latitude_deg as f32);
+        volume.site.longitude_deg = Some(located.longitude_deg as f32);
+        loaded.volume = Arc::new(volume);
+    }
+
     fn install_loaded_volume(&mut self, mut loaded: LoadedVolume) {
         if loaded.generation != self.session_clock.current() {
             return;
         }
-        // A NEXRAD Level 1 record brings its pulses with it. Take them before
-        // the volume is moved into the history, and give the volume the site
-        // position the record could not: the RVP8 header states a processor
+        // A NEXRAD Level 1 record brings its pulses with it. Give the volume
+        // the site position the record could not: the RVP8 header states a processor
         // name and no coordinates, so without this the sweep is drawn in
         // radar-local kilometres over whatever the map was anchored on before.
         //
@@ -2090,15 +2434,37 @@ impl WorkstationApp {
         // Any frame that is not a time series clears the session, so the knobs
         // and the spectrum readout can never act on pulses that belong to a
         // file the analyst has moved on from.
+        let relative_iq = loaded
+            .iq
+            .as_ref()
+            .is_some_and(|session| !session.snr_available());
+        self.locate_loaded_time_series(&mut loaded);
         self.iq = loaded.iq.take();
-        if let Some(session) = self.iq.as_ref()
-            && let Some(located) = self.time_series_site(session.site_id())
-        {
-            let mut volume = (*loaded.volume).clone();
-            volume.site.name.clone_from(&located.name);
-            volume.site.latitude_deg = Some(located.latitude_deg as f32);
-            volume.site.longitude_deg = Some(located.longitude_deg as f32);
-            loaded.volume = Arc::new(volume);
+        // An uncalibrated I/Q cube intentionally carries no reflectivity grid.
+        // A fresh workspace opens on REF, so leaving that selection untouched
+        // would present a blank pane even though the source decoded correctly.
+        // Replace only REF with the honest relative-power product and remember
+        // that it was OUR fallback. On the next ordinary/calibrated source,
+        // restore only panes that still show that fallback. A product picked
+        // by the analyst clears the marker in `apply_product_selection`.
+        for index in 0..analyst_runtime::MAX_PANES {
+            let pane = PaneId::new(index as u8).expect("MAX_PANES yields valid pane ids");
+            let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+            if relative_iq {
+                if product == DisplayProduct::Reflectivity {
+                    self.relative_power_fallback_from_ref[index] = true;
+                    self.workspace.pane_mut(pane).product =
+                        DisplayProduct::RelativePower.product_id();
+                    self.pane_clocks[index].bump();
+                }
+            } else {
+                let restore_ref = std::mem::take(&mut self.relative_power_fallback_from_ref[index]);
+                if restore_ref && product == DisplayProduct::RelativePower {
+                    self.workspace.pane_mut(pane).product =
+                        DisplayProduct::Reflectivity.product_id();
+                    self.pane_clocks[index].bump();
+                }
+            }
         }
         // Anchor the map at the radar this volume came from. Re-anchoring is a
         // no-op when the site is unchanged; a genuine site change moves the
@@ -2355,15 +2721,14 @@ impl WorkstationApp {
         // so playback gating is unchanged by the stale pixels.
     }
 
-    /// A drop is either colour tables or a radar volume, decided per path by
+    /// A drop is either colour tables or radar volumes, decided per path by
     /// its extension.
     ///
     /// One drop can carry several files, and a folder of palettes is exactly
     /// the kind of thing an analyst drags in one go, so every colour table in
-    /// the drop is imported rather than only the first. A volume is still one
-    /// at a time - a pane draws one - so the first non-palette path that
-    /// looks like radar data wins, which keeps a screenshot dragged alongside
-    /// the volume from clearing the session.
+    /// the drop is imported rather than only the first. Every plausible radar
+    /// path becomes a sequential playlist of independent timeline frames;
+    /// obvious decoys such as a screenshot dragged beside them are ignored.
     fn handle_dropped_files(&mut self, context: &egui::Context) {
         let dropped = context.input(|input| input.raw.dropped_files.clone());
         if dropped.is_empty() {
@@ -2374,8 +2739,9 @@ impl WorkstationApp {
         if !tables.is_empty() && self.user_tables.import_all(&tables) {
             self.reresolve_palettes_from_user_tables();
         }
-        if let Some(path) = crate::app_support::choose_dropped_radar_file(candidates) {
-            self.begin_load(path);
+        let paths = crate::app_support::choose_dropped_radar_files(candidates);
+        if !paths.is_empty() {
+            self.begin_load_sequence(paths);
         }
     }
 
@@ -2471,6 +2837,8 @@ impl WorkstationApp {
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
         let mut open_browser = false;
+        let mut export_current_view = false;
+        let mut open_online_data = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
@@ -2537,6 +2905,23 @@ impl WorkstationApp {
                             ui.close();
                         }
                     });
+                    if ui
+                        .add_enabled(
+                            !self.current_view_export.in_flight(),
+                            egui::Button::new("Export current view"),
+                        )
+                        .on_hover_text(
+                            "Write the rendered application window — panes, legends, chrome and timeline — directly to Downloads as a non-overwriting PNG.",
+                        )
+                        .clicked()
+                    {
+                        export_current_view = true;
+                        ui.close();
+                    }
+                    if ui.button("Download Level I data…").clicked() {
+                        open_online_data = true;
+                        ui.close();
+                    }
                     bevel::etched_separator(ui);
                     // The one place a running application names the active
                     // profile: unobtrusive - a menu nobody has to open - and
@@ -2933,6 +3318,12 @@ impl WorkstationApp {
         if open_browser {
             self.show_file_browser();
         }
+        if export_current_view {
+            self.request_current_view_export(ui.ctx());
+        }
+        if open_online_data {
+            self.online_data.open();
+        }
         if let Some(path) = requested_load {
             self.begin_load(path);
         }
@@ -2977,6 +3368,8 @@ impl WorkstationApp {
         let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
         let mut requested_load = None;
         let mut open_browser = false;
+        let mut export_current_view = false;
+        let mut open_online_data = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
@@ -3010,6 +3403,25 @@ impl WorkstationApp {
                 .clicked()
             {
                 open_browser = true;
+            }
+            if ui
+                .add_enabled(
+                    !self.current_view_export.in_flight(),
+                    egui::Button::new("Export current view"),
+                )
+                .on_hover_text(
+                    "Write the rendered application window directly to Downloads as a non-overwriting PNG.",
+                )
+                .clicked()
+            {
+                export_current_view = true;
+            }
+            if ui
+                .button("Online Level I…")
+                .on_hover_text("Browse and download public NOAA/NSSL KOUN time-series records")
+                .clicked()
+            {
+                open_online_data = true;
             }
 
             ui.separator();
@@ -3199,9 +3611,20 @@ impl WorkstationApp {
             crate::app_support::basemap_picker(ui, &mut self.map_scene, &mut self.settings_store);
 
             let mut selected_quality = self.quality;
+            // `ComboBox::show_ui` builds a non-wrapping horizontal child
+            // before the wrapping parent sees the control's minimum width.
+            // If the row has less than that width left, the button is laid
+            // out in the sliver and its selected text is clipped away instead
+            // of the whole control moving to the next row. Reserve the seam
+            // explicitly so adding an earlier toolbar action cannot make the
+            // active quality (for example, "Smooth") disappear.
+            const QUALITY_COMBO_WIDTH: f32 = 92.0;
+            if ui.available_size_before_wrap().x < QUALITY_COMBO_WIDTH {
+                ui.end_row();
+            }
             egui::ComboBox::from_id_salt("workstation-quality")
                 .selected_text(selected_quality.preset_label().unwrap_or("Custom"))
-                .width(92.0)
+                .width(QUALITY_COMBO_WIDTH)
                 .show_ui(ui, |ui| {
                     for (label, preset) in render2d::DisplayQuality::PRESETS {
                         ui.selectable_value(&mut selected_quality, preset, label);
@@ -3349,6 +3772,12 @@ impl WorkstationApp {
         if open_browser {
             self.show_file_browser();
         }
+        if export_current_view {
+            self.request_current_view_export(ui.ctx());
+        }
+        if open_online_data {
+            self.online_data.open();
+        }
         if let Some(path) = requested_load {
             self.begin_load(path);
         }
@@ -3397,6 +3826,9 @@ impl WorkstationApp {
         if self.vrot_pane.is_some_and(|pane| changed.contains(&pane)) {
             self.vrot_state
                 .mark_stale(crate::vrot::StaleReason::DifferentProduct);
+        }
+        for pane in &changed {
+            self.relative_power_fallback_from_ref[pane.index()] = false;
         }
         self.invalidate_semantic_panes(&changed);
     }
@@ -3457,11 +3889,26 @@ impl WorkstationApp {
         );
     }
 
+    fn request_current_view_export(&mut self, context: &egui::Context) {
+        let frame = self.history.current();
+        let site = frame.map(|frame| frame.identity.site_id.as_str());
+        let volume_time = frame.map(|frame| frame.identity.volume_time);
+        let product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let pane_count = self.workspace.visible_panes().len();
+        let view = if pane_count == 1 {
+            product.id().to_owned()
+        } else {
+            format!("{pane_count}panes-{}-active", product.id())
+        };
+        let file_base =
+            crate::current_view_export::capture_file_base(site, volume_time, &view, Utc::now());
+        self.current_view_export.request(context, file_base);
+    }
+
     /// Draw the `Open…` window and load whatever it was pointed at.
     ///
-    /// A file chosen here goes through `begin_load` - the same door a typed
-    /// path and a dropped file use - so there is exactly one loading path in
-    /// the application and browsing cannot acquire behaviour of its own.
+    /// One file is an ordinary load; a multi-selection takes the same ordered
+    /// playlist door as a multi-file drop.
     fn file_browser_window(&mut self, context: &egui::Context) {
         let units = self.settings_cache.units;
         let outcome = crate::file_browser::draw_file_browser(
@@ -3472,9 +3919,8 @@ impl WorkstationApp {
                 store: &mut self.settings_store,
             },
         );
-        if let Some(path) = outcome.open {
-            self.source_path_text = path.display().to_string();
-            self.begin_load(path);
+        if !outcome.open.is_empty() {
+            self.begin_load_sequence(outcome.open);
         }
     }
 
@@ -3856,6 +4302,20 @@ impl WorkstationApp {
 
             ui.separator();
             ui.label(self.timeline_status(Utc::now()));
+            if let Some(status) = self.sequence_status.as_deref() {
+                ui.label(status).on_hover_text(
+                    self.sequence_detail
+                        .as_deref()
+                        .unwrap_or("File playlist status"),
+                );
+            }
+            if let Some(status) = self.current_view_export.status() {
+                ui.label(status).on_hover_text(
+                    self.current_view_export
+                        .detail()
+                        .unwrap_or("Current-view PNG export"),
+                );
+            }
             if let Some(load_ms) = self.load_ms {
                 ui.label(format!("decode {load_ms:.1} ms"));
             }
@@ -5261,6 +5721,8 @@ impl eframe::App for WorkstationApp {
         // exposes before layout catches up.
         crate::theme::paint_root_ground(ui);
         let context = ui.ctx().clone();
+        self.current_view_export.poll();
+        self.current_view_export.handle_capture_events(&context);
         self.handle_dropped_files(&context);
         // A save made in the colour table editor, one frame ago.
         //
@@ -5302,6 +5764,10 @@ impl eframe::App for WorkstationApp {
         self.xsection_window(&context);
         self.palette_editor_window(&context);
         self.file_browser_window(&context);
+        if let Some(path) = self.online_data.draw(&context) {
+            self.source_path_text = path.display().to_string();
+            self.begin_load(path);
+        }
         self.toolbar(ui);
         // No separator under the bar: the band paints its own raised bevel,
         // and a stock hairline immediately below it reads as a second, weaker
@@ -6009,16 +6475,11 @@ mod tests {
     /// color" (eframe 0.34.3, `epi.rs`) and clears the window to its own
     /// `rgba(12, 12, 12, 180)`, so the app has to paint its own face and
     /// return its own clear colour. `tests/theme_contract.rs` pins the two
-    /// helpers that do it — but that file `#[path]`-includes `src/theme.rs`
-    /// and nothing else, so it cannot see whether anyone still CALLS them,
-    /// and neither can `examples/theme_gallery.rs`'s toolbar proof, which
-    /// paints the ground itself before photographing `toolbar`. Deleting
-    /// `paint_root_ground(ui)` from `ui` and the `clear_color` override from
-    /// this `impl` left all sixteen contract tests green and all sixteen
-    /// proof PNGs byte-identical — and that deletion IS the field failure:
-    /// the per-frame `panel_fill` override that used to hide it was removed
-    /// exactly this way when the theme landed. So this test drives the real
-    /// `<WorkstationApp as eframe::App>` and nothing else.
+    /// helpers that do it, but includes only `src/theme.rs`, so it cannot prove
+    /// the application still calls them. The toolbar proof in
+    /// `examples/theme_gallery.rs` paints its own ground as well. This test
+    /// therefore drives the real `<WorkstationApp as eframe::App>` and
+    /// verifies both application-level calls.
     ///
     /// Both halves are asserted the way eframe asks for them: the ground as
     /// a filled face rect that covers the viewport and is painted before any
@@ -6120,6 +6581,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the profile directory");
         dir
+    }
+
+    #[test]
+    fn file_playlist_input_is_filename_ordered_and_exact_duplicates_are_removed() {
+        let ordered = ordered_unique_paths(vec![
+            PathBuf::from("C:/case/KTLX_003"),
+            PathBuf::from("C:/case/KTLX_001"),
+            PathBuf::from("C:/case/KTLX_002"),
+            PathBuf::from("C:/case/KTLX_001"),
+        ]);
+        assert_eq!(
+            ordered,
+            ["KTLX_001", "KTLX_002", "KTLX_003"]
+                .into_iter()
+                .map(|name| PathBuf::from("C:/case").join(name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn file_playlist_position_tolerates_rounding_but_not_a_moved_radar() {
+        assert!(same_playlist_position(
+            (Some(35.3330), Some(-97.2770)),
+            (Some(35.3334), Some(-97.2774))
+        ));
+        assert!(!same_playlist_position(
+            (Some(35.3330), Some(-97.2770)),
+            (Some(35.3500), Some(-97.2500))
+        ));
+        assert!(!same_playlist_position(
+            (None, None),
+            (Some(35.3330), Some(-97.2770))
+        ));
+    }
+
+    #[test]
+    fn file_playlist_continues_after_failure_and_refuses_a_second_radar() {
+        let dir = scratch_profile_dir("file-playlist");
+        let cfrad = crate::load_service::io_fixture("cfrad.xsapr_sgp_ppi_20110520.classic.nc");
+        let dorade =
+            crate::load_service::io_fixture("swp.1090509143923.NOXPRVP.0.0.5_PPI_v1.head3");
+        let first = dir.join("001-cfrad.nc");
+        let missing = dir.join("002-missing.nc");
+        let duplicate = dir.join("003-cfrad-copy.nc");
+        let other_radar = dir.join("004-other-radar");
+        std::fs::copy(&cfrad, &first).expect("copy first CfRadial");
+        std::fs::copy(&cfrad, &duplicate).expect("copy duplicate CfRadial");
+        std::fs::copy(&dorade, &other_radar).expect("copy another radar");
+
+        let mut app = test_app();
+        // Deliberately reversed: the session owns and reports its order.
+        app.begin_load_sequence(vec![other_radar, duplicate, missing, first]);
+        for _ in 0..4_000 {
+            app.poll_load_results();
+            if app.file_sequence.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.file_sequence.is_none(),
+            "the playlist worker never finished"
+        );
+        assert_eq!(
+            app.history.len(),
+            1,
+            "two copies of one volume are one timeline identity, never a merged volume"
+        );
+        assert_eq!(app.history.current().unwrap().identity.site_id, "XSAPR-SGP");
+        let status = app.sequence_status.as_deref().expect("playlist status");
+        assert!(status.contains("2/4 decoded"), "{status}");
+        assert!(status.contains("2 failed"), "{status}");
+        let detail = app.sequence_detail.as_deref().expect("playlist detail");
+        assert!(detail.contains("002-missing.nc"), "{detail}");
+        assert!(detail.contains("does not match playlist radar"), "{detail}");
+        assert!(
+            app.iq.is_none(),
+            "a playlist never retains one file's raw I/Q"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Every string one `draw_pane` pass emitted, with the settings cache the
@@ -6246,15 +6787,13 @@ mod tests {
     /// The cheap version of this test reads the stored value back and calls
     /// it proved. It would pass over a pane still painting the old unit:
     /// between `settings.json` and a glyph there are two more steps -
-    /// `recompute_settings_cache` and the paint pass - and this wave built
-    /// the unit setting, the window that resets it and the profile that
-    /// restores it on three separate branches that never compiled together.
-    /// So this asserts on the strings `draw_pane` emitted.
+    /// `recompute_settings_cache` and the paint pass. So this asserts on the
+    /// strings `draw_pane` emitted.
     ///
     /// It stands for the whole Units & time page rather than for one row.
     /// [`WorkstationApp::apply_switched_profile`] enumerates the registry
     /// instead of a list of keys, so a page that is registered is a page a
-    /// profile carries - and the audit's four pages are registered.
+    /// profile carries, including all four operational settings pages.
     #[test]
     fn switching_back_to_a_profile_restores_the_drawn_unit_not_only_the_stored_one() {
         use crate::settings_ui::catalog::keys;
@@ -6462,13 +7001,13 @@ mod tests {
     /// then hands the registry to `catalog::register_into`, which returns
     /// nothing and registers by side effect. That shape is the seam where a
     /// page goes missing without anyone noticing: `register_into` is a wall
-    /// of `registry.register(...)` lines, one page each, and a line lost to a
-    /// bad merge takes its whole page - its rows, its search hits, its reset
-    /// and its share of every profile - out of the application while
+    /// of `registry.register(...)` lines, one page each. Omitting a line takes
+    /// its whole page - its rows, its search hits, its reset and its share of
+    /// every profile - out of the application while
     /// `catalog::registry()` and every test written against THAT keep
     /// passing, because they go through the same lost line.
     ///
-    /// So this pins the merged list, by name and in order, against the only
+    /// So this pins the complete list, by name and in order, against the only
     /// registry the application actually runs on.
     #[test]
     fn the_application_registry_is_the_appearance_page_and_the_whole_catalog() {
@@ -6483,7 +7022,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                // The theme's page and the catalog's merge into this one.
+                // Theme settings and catalog settings share this page.
                 crate::theme::settings::keys::CATEGORY,
                 keys::map::CATEGORY,
                 keys::radar::CATEGORY,
@@ -6491,7 +7030,7 @@ mod tests {
                 keys::vol3d::CATEGORY,
                 keys::analysis::CATEGORY,
                 keys::data::CATEGORY,
-                // The four pages the settings audit added...
+                // The four operational settings pages...
                 keys::units::CATEGORY,
                 keys::network::CATEGORY,
                 keys::annotation::CATEGORY,
@@ -6631,6 +7170,8 @@ mod tests {
             // only Level II, and says so.
             "Radar volume file path".to_owned(),
             "Load".to_owned(),
+            "Export current view".to_owned(),
+            "Online Level I…".to_owned(),
             "KRTX".to_owned(),
             "Start live".to_owned(),
             layout_label(app.workspace.layout).to_owned(),
@@ -8360,7 +8901,14 @@ mod tests {
         fn walk(shape: &egui::Shape, wanted: &str) -> Option<egui::Pos2> {
             match shape {
                 egui::Shape::Text(text) if text.galley.text().trim() == wanted => {
-                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    // In a horizontal wrapping layout egui represents a label
+                    // with one galley whose rect includes the blank lead-in
+                    // occupied by controls earlier on its first row. The
+                    // galley rect's center can therefore be nowhere near the
+                    // painted glyphs (and outside the label's hover response).
+                    // Target the tight painted bounds, which remain true when
+                    // earlier controls move the label across a row seam.
+                    Some(text.visual_bounding_rect().center())
                 }
                 egui::Shape::Vec(nested) => nested.iter().find_map(|shape| walk(shape, wanted)),
                 _ => None,
@@ -8731,12 +9279,11 @@ mod tests {
 
     /// The filter is a citizen of the settings window, not a stowaway.
     ///
-    /// The five criteria arrived on their own branch, reachable from their own
-    /// toolbar panel, while the window beside them grew search, per-setting
-    /// and per-page reset, and named profiles. Landing both is only half the
-    /// job: a criterion the window cannot find, cannot reset, or quietly drops
-    /// out of a profile is a criterion that hides weather and then refuses to
-    /// account for it.
+    /// The five criteria are reachable from both their toolbar panel and the
+    /// settings window, including search, per-setting and per-page reset, and
+    /// named profiles. A criterion the window cannot find, cannot reset, or
+    /// quietly drops out of a profile is a criterion that hides weather and
+    /// then refuses to account for it.
     ///
     /// Every assertion is made against `settings_cache.gate_filter` - the
     /// value `ensure_render_requested` puts on the `RenderRequest` and the
@@ -8888,26 +9435,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- the integration seams ----------------------------------------------
+    // --- the engine/UI contract ---------------------------------------------
     //
-    // Two branches built this feature against a written contract: `render2d`
-    // owns the censoring, `workstation_app` owns the analyst's choice and the
-    // admission that it is on. These pin the joints between them - the places
-    // where a merge that compiles can still be wrong.
+    // `render2d` owns the censoring; `workstation_app` owns the analyst's
+    // choice and the indication that it is active. These tests pin the
+    // contract between them.
 
     /// The words on the pane and the gates the engine removed come from the
     /// same sentence.
     ///
     /// `GateFilter::hidden_summary` is the only implementation of that
-    /// sentence after the merge - the UI branch's copy was a declared
-    /// placeholder and is gone - and both indicators quote it: the pane header
+    /// sentence, and both indicators quote it: the pane header
     /// through `gate_filter_ui::pane_status_line`, and the engine's own line
     /// through `GateFilterReport::badge`. Pinning that they quote it, rather
     /// than pinning two literal strings, is what makes them unable to drift
     /// apart.
     ///
-    /// The second half is the case the merge created. A volume-derived product
-    /// is integrated out of the whole volume rather than rastered from one
+    /// A volume-derived product is integrated out of the whole volume rather
+    /// than rastered from one
     /// sweep, so `render_service::render_derived` answers it with
     /// `GateFilterReport::not_applicable` - and an indicator built from the
     /// settings alone would then have that pane reading FILTERED while the
@@ -8915,9 +9460,8 @@ mod tests {
     /// disagreeing about whether weather is being hidden is worse than either
     /// alone, which is why `pane_status_line` takes the reason per pane.
     ///
-    /// Re-pointed from the removed band, whose sentence carried its own "click
-    /// here to show everything" clause; that clause is now a key on the
-    /// toolbar and is pinned by
+    /// The toolbar's clear key supplies the corresponding "show everything"
+    /// action and is pinned by
     /// `clicking_the_toolbars_clear_key_shows_everything_again`.
     #[test]
     fn the_pane_statement_and_the_engine_never_describe_the_same_pane_differently() {
@@ -9235,9 +9779,8 @@ mod tests {
         assert_eq!(app.settings_cache.gate_filter, storm_mode().to_filter());
         let filtered = render_one_frame(&mut app, pane);
 
-        // The request carried the analyst's criteria, not the engine's
-        // placeholder. This is the seam the merge had to close: both branches
-        // wrote this field, and only one of them read the settings.
+        // The request carries the analyst's criteria, rather than an engine
+        // default, so the UI and renderer apply the same filter.
         assert_eq!(
             filtered.gate_filter.filter, app.settings_cache.gate_filter,
             "the engine filtered by something other than what the settings say"
@@ -9348,7 +9891,7 @@ mod tests {
     /// pane opens on, and (c) at an SNR the censor slider can straddle: above
     /// the shipped 2 dB threshold, below the 20 dB the slider reaches.
     fn stare_sweep(site: &str) -> nexrad_io::iq::IqSweep {
-        use nexrad_io::iq::{IqPulse, IqSweep};
+        use nexrad_io::iq::{IqCalibration, IqPulse, IqSweep};
         const PRT_S: f32 = 833.375e-6;
         const NOISE_DBM: f32 = -80.5;
         const SATURATION_DBM: f32 = 6.0;
@@ -9381,20 +9924,21 @@ mod tests {
             site: site.to_owned(),
             time_utc: 1_369_079_161,
             wavelength_m: 0.1108,
-            pulse_width_s: 1.5e-6,
+            pulse_width_s: Some(1.5e-6),
             gate_spacing_m: Some(500.0),
             first_gate_m: 1_000.0,
             range_bins: (0..GATES).map(|bin| 1_000.0 + 500.0 * bin as f32).collect(),
-            noise_dbm: [NOISE_DBM, NOISE_DBM],
-            dbz_calibration: -35.5,
-            saturation_dbm: SATURATION_DBM,
+            calibration: IqCalibration::Absolute {
+                noise_dbm: [NOISE_DBM, NOISE_DBM],
+                dbz_calibration: -35.5,
+                saturation_dbm: SATURATION_DBM,
+            },
             pulses,
             ..IqSweep::default()
         }
     }
 
-    /// Open that sweep in the application, through the shipped install path.
-    fn install_time_series(app: &mut WorkstationApp, sweep: nexrad_io::iq::IqSweep) {
+    fn loaded_time_series(app: &WorkstationApp, sweep: nexrad_io::iq::IqSweep) -> LoadedVolume {
         let session = crate::iq_session::IqSession::from_sweep(
             sweep,
             "stare.iqd",
@@ -9403,16 +9947,141 @@ mod tests {
         .expect("the fixture processes");
         let site = radar_core::RadarSite::new(session.site_id());
         let volume = Arc::new(session.volume(site));
-        let generation = app.session_clock.current();
-        app.install_loaded_volume(LoadedVolume {
+        LoadedVolume {
             iq: Some(Box::new(session)),
-            generation,
+            generation: app.session_clock.current(),
             origin: FrameOrigin::Local,
             source_label: "stare.iqd".to_owned(),
             stage: FrameStage::Complete,
             volume,
             elapsed_ms: 1.0,
+        }
+    }
+
+    /// Open that sweep in the application, through the shipped install path.
+    fn install_time_series(app: &mut WorkstationApp, sweep: nexrad_io::iq::IqSweep) {
+        let loaded = loaded_time_series(app, sweep);
+        app.install_loaded_volume(loaded);
+    }
+
+    #[test]
+    fn an_uncalibrated_iq_cube_opens_on_relative_power_instead_of_a_blank_ref_pane() {
+        use nexrad_io::iq::{IqCalibration, PulseLayout, PulseSpan};
+
+        let mut app = test_app();
+        let active = app.workspace.active_pane;
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::Reflectivity,
+            "fixture starts on the ordinary workspace default"
+        );
+
+        let mut sweep = stare_sweep("OUPRIME");
+        sweep.calibration = IqCalibration::RelativeStoredIq;
+        sweep.pulse_width_s = None;
+        sweep.pulse_layout = PulseLayout::Rays(
+            (0..16)
+                .map(|ray| PulseSpan {
+                    start: ray * 32,
+                    len: 32,
+                })
+                .collect(),
+        );
+        install_time_series(&mut app, sweep);
+
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::RelativePower
+        );
+        assert!(app.relative_power_fallback_from_ref[active.index()]);
+        let session = app.iq.as_ref().expect("I/Q session stays installed");
+        assert_eq!(session.native_dwell_pulses(), Some(32));
+        let provenance = session.provenance();
+        assert!(provenance.contains("power is relative"), "{provenance}");
+        assert!(provenance.contains("SNR unavailable"), "{provenance}");
+        assert!(!provenance.contains("dBm"), "{provenance}");
+        assert!(!provenance.contains("dBZ"), "{provenance}");
+    }
+
+    #[test]
+    fn relative_power_fallback_restores_ref_for_the_next_calibrated_source() {
+        use nexrad_io::iq::IqCalibration;
+
+        let mut app = test_app();
+        let active = app.workspace.active_pane;
+        let mut relative = stare_sweep("OUPRIME");
+        relative.calibration = IqCalibration::RelativeStoredIq;
+        relative.pulse_width_s = None;
+        install_time_series(&mut app, relative);
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::RelativePower
+        );
+
+        install_time_series(&mut app, stare_sweep("KOUN"));
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::Reflectivity,
+            "the app-owned fallback must not leak into the next source"
+        );
+        assert!(!app.relative_power_fallback_from_ref[active.index()]);
+    }
+
+    #[test]
+    fn explicit_product_choice_cancels_relative_power_fallback_restoration() {
+        use nexrad_io::iq::IqCalibration;
+
+        let mut app = test_app();
+        let active = app.workspace.active_pane;
+        let mut relative = stare_sweep("OUPRIME");
+        relative.calibration = IqCalibration::RelativeStoredIq;
+        relative.pulse_width_s = None;
+        install_time_series(&mut app, relative);
+
+        app.apply_product_selection(active, DisplayProduct::Velocity);
+        assert!(!app.relative_power_fallback_from_ref[active.index()]);
+        install_time_series(&mut app, stare_sweep("KOUN"));
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::Velocity,
+            "a real analyst choice must not be mistaken for the app-owned fallback"
+        );
+    }
+
+    #[test]
+    fn relative_iq_playlist_keeps_relative_power_but_discards_raw_session() {
+        use nexrad_io::iq::IqCalibration;
+
+        let mut app = test_app();
+        let active = app.workspace.active_pane;
+        let mut relative = stare_sweep("OUPRIME");
+        relative.calibration = IqCalibration::RelativeStoredIq;
+        relative.pulse_width_s = None;
+        let loaded = loaded_time_series(&app, relative);
+        app.file_sequence = Some(FileSequence {
+            paths: vec![PathBuf::from("ouprime-relative.mat")],
+            next: 1,
+            loaded: 0,
+            failures: Vec::new(),
+            site_id: None,
+            site_position: None,
+            level1_files: 0,
         });
+
+        app.finish_sequence_volume(loaded);
+
+        assert!(app.file_sequence.is_none(), "the one-frame playlist ended");
+        assert!(
+            app.iq.is_none(),
+            "playlist raw pulses must not escape install"
+        );
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(
+            DisplayProduct::from_product_id(&app.workspace.pane(active).product),
+            DisplayProduct::RelativePower,
+            "discarding raw pulses must not also discard the honest display fallback"
+        );
+        assert!(app.relative_power_fallback_from_ref[active.index()]);
     }
 
     /// Put the pointer on the gate at `east_km`, `north_km` and return the

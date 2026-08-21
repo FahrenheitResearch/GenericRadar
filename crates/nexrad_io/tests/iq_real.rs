@@ -126,8 +126,8 @@ struct GateMoments {
 /// a processor samples, and what this proves is that the samples it hands over
 /// are the ones the antenna measured, placed where the antenna measured them.
 fn pulse_pair(sweep: &IqSweep) -> Vec<GateMoments> {
-    let noise_h = f64::from(sweep.noise_power(0));
-    let noise_v = f64::from(sweep.noise_power(1));
+    let noise_h = f64::from(sweep.noise_power(0).expect("calibrated H noise"));
+    let noise_v = f64::from(sweep.noise_power(1).expect("calibrated V noise"));
     let prt = f64::from(sweep.pulses[0].prt_seconds);
     let wavelength = f64::from(sweep.wavelength_m);
     let pulses = sweep.pulses.len() as f64;
@@ -203,7 +203,11 @@ fn far_range_mean_dbm(sweep: &IqSweep, vertical: bool, gates: usize) -> f32 {
         }
     }
     let mean = total / count as f64;
-    (10.0 * mean.log10()) as f32 + sweep.saturation_dbm
+    (10.0 * mean.log10()) as f32
+        + sweep
+            .calibration
+            .saturation_dbm()
+            .expect("RVP fixture is absolutely calibrated")
 }
 
 #[test]
@@ -213,8 +217,8 @@ fn the_alternate_mask_record_decodes_with_its_documented_header() {
     assert_eq!(sweep.site, "KOUN_RVP");
     assert_eq!(sweep.task_name, "Ascope_DEFAULT");
     assert_eq!(sweep.processor_version, "8.12.8");
-    assert_eq!(sweep.major_mode, 0);
-    assert_eq!(sweep.polarization_code, 3);
+    assert_eq!(sweep.major_mode, Some(0));
+    assert_eq!(sweep.polarization_code, Some(3));
     assert_eq!(sweep.channels_recorded, 2);
     assert!(sweep.is_dual_channel());
     assert_eq!(sweep.nominal_sample_size, 32);
@@ -222,11 +226,11 @@ fn the_alternate_mask_record_decodes_with_its_documented_header() {
     // fWavelengthCM=11.08, fPWidthUSec=1.5, fDBzCalib=-35.5,
     // fSaturationDBM=6, fRangeMaskRes=250, fNoiseDBm=-80.5555 -80.5955.
     assert_eq!(sweep.wavelength_m, 0.1108);
-    assert_eq!(sweep.pulse_width_s, 1.5e-6);
-    assert_eq!(sweep.dbz_calibration, -35.5);
-    assert_eq!(sweep.saturation_dbm, 6.0);
+    assert_eq!(sweep.pulse_width_s, Some(1.5e-6));
+    assert_eq!(sweep.calibration.dbz_calibration(), Some(-35.5));
+    assert_eq!(sweep.calibration.saturation_dbm(), Some(6.0));
     assert_eq!(sweep.range_mask_res_m, 250.0);
-    assert_eq!(sweep.noise_dbm, [-80.5555, -80.5955]);
+    assert_eq!(sweep.calibration.noise_dbm(), Some([-80.5555, -80.5955]));
 
     assert_eq!(sweep.pulses.len(), 24);
     assert_eq!(sweep.time_utc, 1_369_079_161);
@@ -438,7 +442,7 @@ fn the_contiguous_mask_record_is_a_different_acquisition_and_decodes_too() {
     let sweep = decode_iq_time_series(CONTIGUOUS_MASK).unwrap();
 
     assert_eq!(sweep.site, "KOUN_RVP");
-    assert_eq!(sweep.major_mode, 13);
+    assert_eq!(sweep.major_mode, Some(13));
     assert_eq!(sweep.nominal_sample_size, 128);
     assert_eq!(sweep.pulses.len(), 8);
     assert_eq!(sweep.burst_samples, 2);
@@ -518,7 +522,10 @@ fn decoded_power_reproduces_the_noise_floor_the_processor_measured() {
         let sweep = decode_iq_time_series(bytes).unwrap();
         for (channel, vertical) in [("H", false), ("V", true)] {
             let measured = far_range_mean_dbm(&sweep, vertical, 20);
-            let stated = sweep.noise_dbm[usize::from(vertical)];
+            let stated = sweep
+                .calibration
+                .noise_dbm()
+                .expect("RVP fixture is absolutely calibrated")[usize::from(vertical)];
             assert!(
                 (measured - stated).abs() < 1.5,
                 "{name} {channel}: far-range mean {measured} dBm against a stated \
@@ -548,7 +555,7 @@ fn no_decoded_sample_exceeds_the_formats_headroom_above_saturation() {
         // — which is what the transposed rule produces — cannot do that,
         // because every value it can represent lies within about 8 dB of
         // every other.
-        let noise_amplitude = sweep.noise_power(0).sqrt();
+        let noise_amplitude = sweep.noise_power(0).expect("calibrated H noise").sqrt();
         let dynamic_range_db = 20.0 * (peak / noise_amplitude).log10();
         assert!(
             dynamic_range_db > 60.0,
@@ -608,7 +615,7 @@ fn a_pulse_limit_reads_a_dwell_without_reading_the_record() {
     assert_eq!(clipped.pulses.len(), 8);
     assert_eq!(whole.pulses.len(), 24);
     assert_eq!(clipped.range_bins, whole.range_bins);
-    assert_eq!(clipped.noise_dbm, whole.noise_dbm);
+    assert_eq!(clipped.calibration, whole.calibration);
     for (left, right) in clipped.pulses.iter().zip(&whole.pulses) {
         assert_eq!(left.h, right.h);
     }

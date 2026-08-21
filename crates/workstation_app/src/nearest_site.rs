@@ -5,7 +5,7 @@
 //! sitting fifteen to thirty kilometres from downtown — closer to the city
 //! than the WSR-88D almost every time. A plain nearest-site search therefore
 //! answers "Dallas" with TDAL, "Chicago" with TORD and "Atlanta" with TATL,
-//! which is the opposite of what was asked for. A TDWR has roughly ninety
+//! which violates the feature's S-band contract. A TDWR has roughly ninety
 //! kilometres of Doppler range and attenuates badly in the heavy rain that a
 //! severe-weather workflow is looking at, so it is a supplement, never the
 //! radar the map falls back to (Vasiloff, S. V., 2001: Improving tornado
@@ -989,7 +989,7 @@ mod tests {
                 );
             }
         }
-        // The converse for the ids the proof cases turn on: still S-band.
+        // The converse for the ids exercised below: they remain S-band.
         for id in ["KFWS", "KLOT", "KFFC", "TJUA", "KTLX", "KHDC"] {
             assert!(
                 classify_site(id).is_s_band_nexrad(),
@@ -1000,10 +1000,9 @@ mod tests {
         }
     }
 
-    /// Confirm the terminal radars the proof cases lean on really are in this
-    /// catalog before any assertion relies on them — and record that "TCHI",
-    /// the id the request named for Chicago, does not exist. Chicago has two
-    /// TDWRs, TORD and TMDW.
+    /// Confirm the terminal radars these tests rely on really are in this
+    /// catalog before any assertion uses them, and record that "TCHI" does not
+    /// exist. Chicago has two TDWRs, TORD and TMDW.
     #[test]
     fn the_terminal_radars_these_tests_rely_on_exist() {
         let sites = real_sites();

@@ -778,15 +778,14 @@ mod tests {
         )))
     }
 
-    /// The half of the shared contract the written contract forgot to state.
+    /// Trait guarantees required by the filter's application-facing state.
     ///
     /// `SettingsCache` is `Copy` and holds a `GateFilter` by value; `app.rs`
     /// compares one to `GateFilter::OFF` with `assert_eq!`; several tests
-    /// print one in a failure message. So the engine branch's `GateFilter`
-    /// owes this branch `Copy + Clone + Debug + PartialEq + Default`, and the
-    /// contract text named none of them. This is a compile-time assertion on
-    /// purpose: a merge that drops a derive fails here, with a message that
-    /// says which one, instead of somewhere in `app.rs`.
+    /// print one in a failure message. `GateFilter` therefore requires
+    /// `Copy + Clone + Debug + PartialEq + Default`. This compile-time
+    /// assertion makes a missing derive fail here with a precise message
+    /// instead of surfacing elsewhere in `app.rs`.
     #[test]
     fn the_engine_contract_carries_the_derives_this_branch_depends_on() {
         fn requires_the_contracts_derives<T>(_: &T)
@@ -1021,7 +1020,7 @@ mod tests {
     /// The expected strings below are written the way an analyst would say
     /// them out loud - "it's hiding REF below 20 dBZ" - so re-inverting one
     /// cannot be done quietly: the diff would have to replace plain English
-    /// with its opposite in this file, in words, where a reviewer reads it.
+    /// with its opposite in this file, in words, where a maintainer reads it.
     ///
     /// The subject was the full-width band until that band was removed; the
     /// sentence moved to the pane header and the pin moved with it, minus the
@@ -1255,7 +1254,7 @@ mod tests {
     /// clicked - a control that says one thing at the top and another at the
     /// bottom about what is being hidden. It corrected itself on the next
     /// frame, which is exactly why nothing that settles first can catch it:
-    /// the proof example's photographs settle three passes and look right
+    /// the settled reference photographs use three passes and look right
     /// either way.
     #[test]
     fn the_frame_a_preset_is_clicked_on_already_shows_that_presets_numbers() {

@@ -19,6 +19,10 @@
 pub enum PhysicalUnit {
     /// Logarithmic reflectivity factor.
     Dbz,
+    /// Uncalibrated power relative to one squared stored I/Q unit.
+    RelativeIqPowerDb,
+    /// Received power referenced to one milliwatt.
+    Dbm,
     /// Velocity, spectrum width, and every wind-like quantity.
     MetersPerSecond,
     /// Differential reflectivity.
@@ -49,6 +53,8 @@ impl PhysicalUnit {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dbz => "dBZ",
+            Self::RelativeIqPowerDb => "dB re stored I/Q unit²",
+            Self::Dbm => "dBm",
             Self::MetersPerSecond => "m/s",
             Self::Decibels => "dB",
             Self::Dimensionless => "",
@@ -73,6 +79,9 @@ impl PhysicalUnit {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DisplayUnit {
     Dbz,
+    /// Uncalibrated power relative to one squared stored I/Q unit.
+    RelativeIqPowerDb,
+    Dbm,
     MetersPerSecond,
     /// Velocity as an analyst reads it off a warning.
     Knots,
@@ -99,6 +108,8 @@ impl DisplayUnit {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dbz => "dBZ",
+            Self::RelativeIqPowerDb => "dB re stored I/Q unit²",
+            Self::Dbm => "dBm",
             Self::MetersPerSecond => "m/s",
             Self::Knots => "kt",
             Self::Decibels => "dB",
@@ -293,9 +304,30 @@ mod tests {
     }
 
     #[test]
+    fn received_power_is_not_labelled_as_an_unreferenced_decibel_ratio() {
+        assert_eq!(PhysicalUnit::Dbm.label(), "dBm");
+        assert_eq!(DisplayUnit::Dbm.label(), "dBm");
+        assert_ne!(PhysicalUnit::Dbm.label(), PhysicalUnit::Decibels.label());
+    }
+
+    #[test]
     fn a_zero_scale_transform_is_not_invertible() {
         assert!(!AffineTransform::scaled(0.0).is_invertible());
         assert!(AffineTransform::scaled(METERS_TO_KILOFEET).is_invertible());
+    }
+
+    #[test]
+    fn relative_iq_power_is_not_labelled_as_an_absolute_decibel_quantity() {
+        assert_eq!(PhysicalUnit::Decibels.label(), "dB");
+        assert_eq!(DisplayUnit::Decibels.label(), "dB");
+        assert_eq!(
+            PhysicalUnit::RelativeIqPowerDb.label(),
+            "dB re stored I/Q unit²"
+        );
+        assert_eq!(
+            DisplayUnit::RelativeIqPowerDb.label(),
+            "dB re stored I/Q unit²"
+        );
     }
 
     /// KTLX's antenna sits near 370 m. A thermal level quoted from a sounding
