@@ -56,7 +56,9 @@ same history identity.
 - immediate pan and zoom by transforming the retained texture while a
   newest-wins exact raster is generated off-thread;
 - typed generation guards for source, frame, pane, view and palette state, and
-  byte- and count-bounded immutable volume history.
+  policy-controlled immutable volume history: unlimited by default for
+  operator-selected local playlists, with bounded fallback history for
+  unattended live feeds.
 
 ## Data sources
 
@@ -76,6 +78,8 @@ software reads or redistributes is credited in
 - source/site changes invalidate the old session before any late result can
   install.
 - map geometry identity never includes exact camera-center or scale bits.
-- every queue, history, cache, and texture owner is explicitly bounded.
+- every queue, cache and texture owner is explicitly bounded; volume history
+  follows an explicit retention policy, with unlimited local playlists and
+  bounded unattended-live fallback by default.
 - the direct-dependency allowlist in `tests/architecture.rs` is the one hard
   boundary; adding to it is deliberate. See `docs/extending.md`.

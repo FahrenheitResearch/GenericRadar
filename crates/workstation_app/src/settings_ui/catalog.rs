@@ -917,22 +917,30 @@ fn data_category() -> SettingsCategory {
             .group("Live polling"),
             SettingSpec::new(
                 k::HISTORY_MAX_FRAMES,
-                "History frames",
-                integer(5, 200, 30, ""),
+                "History frame limit (0 = Unlimited)",
+                integer(0, 100_000, 0, "frames"),
             )
             .help(
-                "How many volumes the timeline keeps in memory. A real VCP-212 \
-                     volume measures ~74 MiB, so the memory ceiling below usually \
-                     binds first.",
+                "For operator-selected local files, 0 is Unlimited and is the default: \
+                 every selected or assembled logical volume remains on the timeline. A \
+                 live feed can run unattended, so a 0 frame limit uses the live-safe \
+                 fallback of 30 frames. A positive limit applies to both local and live \
+                 sessions. Every resulting eviction is reported.",
             )
-            .group("History held in memory"),
+            .group("Timeline retention (Unlimited by default)"),
             SettingSpec::new(
                 k::HISTORY_MAX_MB,
-                "History memory",
-                integer(128, 8192, 1024, "MiB"),
+                "History RAM limit (0 = Unlimited)",
+                integer(0, 1_048_576, 0, "MiB"),
             )
-            .help("Memory ceiling for the volume timeline.")
-            .group("History held in memory"),
+            .help(
+                "For operator-selected local files, 0 is Unlimited and is the default. \
+                 A live feed can run unattended, so 0 uses the live-safe 1 GiB fallback. \
+                 A positive value applies to both local and live sessions and caps the \
+                 timeline's conservative estimate of decoded volume allocations; it is \
+                 not an input-file-size limit. Every resulting eviction is reported.",
+            )
+            .group("Timeline retention (Unlimited by default)"),
             // The loop's speed sits beside the loop's depth: the two rows
             // above decide how much there is to play, this decides how fast it
             // plays. The toolbar is the surface this application deliberately
@@ -1811,6 +1819,52 @@ mod tests {
         assert_eq!(
             store.effective_text(&registry, keys::radar::CATEGORY, keys::radar::QUALITY),
             "smooth"
+        );
+    }
+
+    #[test]
+    fn timeline_retention_is_unlimited_by_default_and_preserves_explicit_old_limits() {
+        let registry = registry();
+        let mut store = settings::SettingsStore::open(
+            std::env::temp_dir().join("settings-catalog-history-never-written.json"),
+        );
+        assert_eq!(
+            store.effective_int(
+                &registry,
+                keys::data::CATEGORY,
+                keys::data::HISTORY_MAX_FRAMES
+            ),
+            0
+        );
+        assert_eq!(
+            store.effective_int(&registry, keys::data::CATEGORY, keys::data::HISTORY_MAX_MB),
+            0
+        );
+
+        // The ids did not change. A constrained-system profile from an older
+        // build therefore keeps the positive limits its operator chose while
+        // an absent value adopts the new Unlimited default.
+        store.set(
+            keys::data::CATEGORY,
+            keys::data::HISTORY_MAX_FRAMES,
+            SettingValue::Int(45),
+        );
+        store.set(
+            keys::data::CATEGORY,
+            keys::data::HISTORY_MAX_MB,
+            SettingValue::Int(1_536),
+        );
+        assert_eq!(
+            store.effective_int(
+                &registry,
+                keys::data::CATEGORY,
+                keys::data::HISTORY_MAX_FRAMES
+            ),
+            45
+        );
+        assert_eq!(
+            store.effective_int(&registry, keys::data::CATEGORY, keys::data::HISTORY_MAX_MB),
+            1_536
         );
     }
 

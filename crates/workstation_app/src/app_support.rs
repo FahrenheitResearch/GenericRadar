@@ -285,6 +285,51 @@ pub(crate) fn pane_title(
     format!("{} · {}{}{}", pane.get() + 1, product.id(), unit, elevation)
 }
 
+pub(crate) fn source_field_pane_title(
+    volume: Option<&RadarVolume>,
+    pane: PaneId,
+    source: &crate::source_fields::SourceFieldDisplay,
+    cut_index: Option<usize>,
+) -> String {
+    let elevation = volume
+        .zip(cut_index)
+        .and_then(|(volume, index)| volume.cuts.get(index))
+        .map(|cut| format!(" · {:.1}°", cut.elevation_deg))
+        .unwrap_or_default();
+    let description = source
+        .producer_description
+        .as_deref()
+        .filter(|description| *description != source.producer_name)
+        .map(|description| format!(" · metadata: {description}"))
+        .unwrap_or_default();
+    let units = source.producer_units.as_deref().unwrap_or("not provided");
+    format!(
+        "{} · {} · SOURCE FIELD{description} · producer unit token: {units}{elevation}",
+        pane.get() + 1,
+        source.producer_name,
+    )
+}
+
+/// Keep a dynamic field's exact identity on glass when the selected cut has
+/// no finite samples, or when a restored source-field selection is absent
+/// from the current file. Falling through `DisplayProduct` would call it REF.
+pub(crate) fn unavailable_source_field_pane_title(
+    volume: Option<&RadarVolume>,
+    pane: PaneId,
+    producer_name: &str,
+    cut_index: Option<usize>,
+) -> String {
+    let elevation = volume
+        .zip(cut_index)
+        .and_then(|(volume, index)| volume.cuts.get(index))
+        .map(|cut| format!(" · {:.1}°", cut.elevation_deg))
+        .unwrap_or_default();
+    format!(
+        "{} · {producer_name} · SOURCE FIELD · unavailable{elevation}",
+        pane.get() + 1
+    )
+}
+
 pub(crate) fn viewport_changed(previous: ViewportMetrics, current: ViewportMetrics) -> bool {
     (previous.width_points - current.width_points).abs() >= 0.5
         || (previous.height_points - current.height_points).abs() >= 0.5
@@ -443,6 +488,15 @@ mod tests {
     #[test]
     fn an_empty_drop_loads_nothing() {
         assert_eq!(choose_dropped_radar_file(Vec::new()), None);
+    }
+
+    #[test]
+    fn an_unavailable_source_title_never_falls_through_to_ref() {
+        let pane = PaneId::new(0).expect("first pane");
+        assert_eq!(
+            unavailable_source_field_pane_title(None, pane, "VL1_CRR", None),
+            "1 · VL1_CRR · SOURCE FIELD · unavailable"
+        );
     }
 
     #[test]

@@ -946,7 +946,7 @@ fn draw_actions(ui: &mut egui::Ui, browser: &mut FileBrowser, outcome: &mut File
     let selected_count = browser.selected_count();
     let line = match (&selected, selected_count) {
         (_, count) if count > 1 => format!(
-            "{count} files selected. They load in file-name order as separate timeline frames."
+            "{count} files selected. They load in file-name order; proven per-sweep members assemble into logical timeline volumes."
         ),
         (Some(entry), _) if entry.directory => format!("{} - a folder.", entry.name),
         (Some(entry), _) => format!("{} - {}", entry.name, entry.identity.sentence()),

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use analyst_runtime::{
-    Camera2D, FrameOrigin, FrameStage, GenerationClock, PaneId, PaneLayout, PlaybackState,
-    RenderStamp, TiltSelection, ViewportMetrics, VolumeFrame, VolumeHistory, WorkspaceState,
+    Camera2D, FrameOrigin, FrameStage, GenerationClock, InstallReport, PaneId, PaneLayout,
+    PlaybackState, RenderStamp, TiltSelection, ViewportMetrics, VolumeFrame, VolumeHistory,
+    WorkspaceState,
 };
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use color_tables::ColorTableSet;
@@ -23,7 +24,10 @@ use crate::north_up::NorthUpFrame;
 use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
 use crate::product::DisplayProduct;
 
-use crate::app_support::{color_image_from_rgba, layout_label, pane_title, viewport_changed};
+use crate::app_support::{
+    color_image_from_rgba, layout_label, pane_title, source_field_pane_title,
+    unavailable_source_field_pane_title, viewport_changed,
+};
 use crate::product_availability::ProductAvailabilityIndex;
 use crate::product_picker::{ProductPickerInput, ProductPickerState, draw_product_picker};
 use crate::render_service::{
@@ -47,11 +51,114 @@ enum LiveAction {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourcePaletteAction {
+    Edit,
+    Reset,
+}
+
+/// What a tool backed only by modeled [`DisplayProduct`] variants says when
+/// the active pane instead carries an exact producer-native field.
+///
+/// This sentence is part of the scientific boundary: the tool remains
+/// unavailable rather than letting `DisplayProduct::from_product_id` turn an
+/// unfamiliar id into reflectivity behind the analyst's back.
+fn source_field_2d_only_message(tool: &str, producer_name: &str) -> String {
+    format!(
+        "{tool} is unavailable for exact source field {producer_name}. Exact source fields are \
+         currently 2D only; {producer_name} remains selected and no modeled product was \
+         substituted."
+    )
+}
+
+/// Resolve only product ids whose semantics the static product model owns.
+///
+/// `DisplayProduct::from_product_id` intentionally has a total, migration-safe
+/// default for old workspace ids. Producer-native ids are not old workspace
+/// ids, though, and crossing that default would silently turn them into REF.
+/// Every modeled-moment-only consumer goes through this boundary first.
+fn modeled_product_or_source_field(id: &radar_core::ProductId) -> Result<DisplayProduct, &str> {
+    match crate::source_fields::producer_name_from_product_id(id) {
+        Some(producer_name) => Err(producer_name),
+        None => Ok(DisplayProduct::from_product_id(id)),
+    }
+}
+
+/// The palette control for an exact producer-native field.
+///
+/// It deliberately does not use `ColorTableFamily::Generic`: that family is
+/// shared by every unmodeled field. The action is returned to the caller so
+/// the UI closure borrows no application state while the exact-id map moves.
+fn source_palette_control(
+    ui: &mut egui::Ui,
+    producer_name: &str,
+    resolved: &crate::source_field_palettes::ResolvedSourceFieldPalette,
+) -> Option<SourcePaletteAction> {
+    let (minimum, maximum) = resolved.value_range();
+    let mode = if resolved.automatic {
+        "AUTO"
+    } else if resolved.current_is_durable {
+        "CUSTOM · SAVED"
+    } else {
+        "CUSTOM · SESSION"
+    };
+    let label = format!("{mode} {minimum:.3}…{maximum:.3}");
+    let mut action = None;
+    egui::ComboBox::from_id_salt("workstation-source-field-palette")
+        .selected_text(label)
+        .width(210.0)
+        .show_ui(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Exact field: {producer_name}"))
+                    .monospace()
+                    .weak(),
+            );
+            ui.label(
+                egui::RichText::new(format!("Palette: {}", resolved.table.base_name())).weak(),
+            );
+            if !resolved.automatic {
+                ui.label(
+                    egui::RichText::new(if resolved.current_is_durable {
+                        "Saved binding · returns after restart"
+                    } else {
+                        "Session-only preview · Save in the editor to keep it"
+                    })
+                    .weak(),
+                );
+            }
+            if ui
+                .selectable_label(false, "Edit palette and fixed range…")
+                .clicked()
+            {
+                action = Some(SourcePaletteAction::Edit);
+                ui.close();
+            }
+            if !resolved.automatic
+                && ui
+                    .selectable_label(false, "Reset to observed range")
+                    .clicked()
+            {
+                action = Some(SourcePaletteAction::Reset);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text(if resolved.automatic {
+            "Automatic visibility: this exact source field is stretched across its observed finite values. Edit to set reproducible fixed stops and colours."
+        } else if resolved.current_is_durable {
+            "Saved field-specific palette and fixed raw-value range. It does not affect any other source field; Reset returns this exact id to automatic observed-range display."
+        } else {
+            "Session-only field-specific preview; it will not return after restart. Save the matching edit to keep it, or choose CUSTOM → Reset to observed range to undo it."
+        });
+    action
+}
+
 /// One ordered set of local files being decoded into separate timeline
 /// frames. It is deliberately not a volume-builder: each successful file
 /// remains independently identified and failure of one advances to the next.
 struct FileSequence {
     paths: Vec<PathBuf>,
+    preflight: crate::playlist_preflight::PlaylistRamEstimate,
     next: usize,
     loaded: usize,
     failures: Vec<(PathBuf, String)>,
@@ -61,6 +168,36 @@ struct FileSequence {
     site_id: Option<String>,
     site_position: Option<(Option<f32>, Option<f32>)>,
     level1_files: usize,
+    /// A proven one-cut Archive II member waits here until the next decoded
+    /// file either extends its internal volume identity or proves a boundary.
+    pending_assembly: Option<PendingSweepAssembly>,
+    assembled_files: usize,
+    assembled_groups: usize,
+    assembly_refusals: Vec<(PathBuf, nexrad_io::sweep_assembly::SweepAssemblyRefusal)>,
+    /// Explicit limits may remove an installed logical volume. Count every
+    /// such removal so completion status never calls an eviction "retained".
+    evicted_frames: usize,
+}
+
+/// A large selection waiting for an operator decision. This is an egui window,
+/// not a blocking native dialog: the rest of the application remains alive and
+/// the current session is not cleared until Continue is pressed.
+struct PendingPlaylistConfirmation {
+    paths: Vec<PathBuf>,
+    estimate: crate::playlist_preflight::PlaylistRamEstimate,
+}
+
+/// A local selection whose metadata/signature planning is running off the UI
+/// thread. Only the matching generation may advance to confirmation or load.
+struct PendingPlaylistPreflight {
+    generation: analyst_runtime::Generation,
+    selected: usize,
+}
+
+struct PendingSweepAssembly {
+    loaded: LoadedVolume,
+    evidence: nexrad_io::sweep_assembly::ProvenSweepMembership,
+    first_source_label: String,
 }
 
 impl FileSequence {
@@ -72,6 +209,21 @@ impl FileSequence {
         self.next
             .checked_sub(1)
             .and_then(|index| self.paths.get(index))
+    }
+
+    /// Successfully decoded files reduced by any one-cut members still
+    /// waiting for a boundary, then folded by the proven assembly groups that
+    /// have already reached the timeline.
+    fn logical_volumes(&self) -> usize {
+        let pending_members = self
+            .pending_assembly
+            .as_ref()
+            .map_or(0, |pending| pending.evidence.member_count);
+        self.loaded
+            .saturating_sub(pending_members)
+            .saturating_sub(self.assembled_files)
+            .saturating_add(self.assembled_groups)
+            .saturating_add(usize::from(pending_members > 0))
     }
 }
 
@@ -111,6 +263,28 @@ fn short_path_label(path: &std::path::Path) -> String {
         short.push('…');
         short
     }
+}
+
+fn history_policy_status(policy: analyst_runtime::HistoryPolicy) -> String {
+    if policy.max_frames == 0 && policy.max_estimated_bytes == 0 {
+        return "retention Unlimited".to_owned();
+    }
+    let frames = if policy.max_frames == 0 {
+        "Unlimited frames".to_owned()
+    } else {
+        format!("{} frames", policy.max_frames)
+    };
+    let bytes = if policy.max_estimated_bytes == 0 {
+        "Unlimited RAM".to_owned()
+    } else {
+        format!(
+            "{} RAM",
+            crate::playlist_preflight::format_binary_bytes(
+                policy.max_estimated_bytes.try_into().unwrap_or(u64::MAX)
+            )
+        )
+    };
+    format!("retention limit {frames} / {bytes}")
 }
 
 fn same_playlist_position(
@@ -347,7 +521,7 @@ impl PaneRuntime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SweepKey {
     identity: analyst_runtime::FrameIdentity,
-    product: &'static str,
+    product: String,
     cut_index: usize,
 }
 
@@ -366,6 +540,7 @@ struct InstalledTexture {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CapabilitiesKey {
     identity: analyst_runtime::FrameIdentity,
+    source_label: String,
     stage: FrameStage,
     cuts: usize,
     radials: usize,
@@ -528,6 +703,14 @@ pub struct WorkstationApp {
     /// Which products the current volume can actually show, rebuilt with the
     /// capabilities.
     product_availability: ProductAvailabilityIndex,
+    /// Producer-native fields the research-data decoders preserved. Rebuilt
+    /// beside capabilities so opening the picker never walks every cut just
+    /// to discover what the file already supplied.
+    source_fields: crate::source_fields::SourceFieldCatalog,
+    /// Analyst colour/range decisions for exact producer-native fields.
+    /// Absence means automatic observed-range visibility; entries never flow
+    /// through the shared Generic family.
+    source_field_palettes: crate::source_field_palettes::SourceFieldPaletteOverrides,
     product_picker: ProductPickerState,
     product_picker_open: bool,
     palette_editor: crate::palette_editor::PaletteEditorState,
@@ -562,6 +745,10 @@ pub struct WorkstationApp {
     file_browser: crate::file_browser::FileBrowser,
     /// A multi-file open is a sequential playlist of independent frames.
     file_sequence: Option<FileSequence>,
+    playlist_preflight_service: crate::playlist_preflight::PlaylistPreflightService,
+    playlist_preflight_clock: GenerationClock,
+    pending_playlist_preflight: Option<PendingPlaylistPreflight>,
+    pending_playlist_confirmation: Option<PendingPlaylistConfirmation>,
     sequence_status: Option<String>,
     sequence_detail: Option<String>,
     current_view_export: crate::current_view_export::CurrentViewExport,
@@ -659,6 +846,9 @@ impl WorkstationApp {
             capabilities_for: None,
             quality: render2d::DisplayQuality::default(),
             product_availability: ProductAvailabilityIndex::unrestricted(),
+            source_fields: crate::source_fields::SourceFieldCatalog::default(),
+            source_field_palettes:
+                crate::source_field_palettes::SourceFieldPaletteOverrides::default(),
             product_picker: ProductPickerState::default(),
             product_picker_open: false,
             palette_editor: crate::palette_editor::PaletteEditorState::default(),
@@ -686,6 +876,12 @@ impl WorkstationApp {
             source_path_text,
             file_browser: crate::file_browser::FileBrowser::new(context.clone()),
             file_sequence: None,
+            playlist_preflight_service: crate::playlist_preflight::PlaylistPreflightService::new(
+                context.clone(),
+            ),
+            playlist_preflight_clock: GenerationClock::default(),
+            pending_playlist_preflight: None,
+            pending_playlist_confirmation: None,
             sequence_status: None,
             sequence_detail: None,
             current_view_export: crate::current_view_export::CurrentViewExport::default(),
@@ -747,14 +943,58 @@ impl WorkstationApp {
         app
     }
 
+    /// The retention policy the operator configured. Zero is literal and
+    /// means Unlimited for that dimension in an explicitly selected local
+    /// file session.
+    fn configured_history_policy(&self) -> analyst_runtime::HistoryPolicy {
+        use crate::settings_ui::catalog::keys;
+
+        let frames = self
+            .settings_store
+            .effective_int(
+                &self.settings_registry,
+                keys::data::CATEGORY,
+                keys::data::HISTORY_MAX_FRAMES,
+            )
+            .max(0) as usize;
+        let megabytes = self
+            .settings_store
+            .effective_int(
+                &self.settings_registry,
+                keys::data::CATEGORY,
+                keys::data::HISTORY_MAX_MB,
+            )
+            .max(0) as usize;
+        analyst_runtime::HistoryPolicy::new(frames, megabytes.saturating_mul(1024 * 1024))
+    }
+
+    /// A live feed can run unattended and has no finite playlist whose cost
+    /// the operator accepted in preflight. Preserve every positive configured
+    /// ceiling, but replace a zero dimension with the runtime's conservative
+    /// live default (30 frames / 1 GiB).
+    fn live_history_policy(&self) -> analyst_runtime::HistoryPolicy {
+        let configured = self.configured_history_policy();
+        let fallback = analyst_runtime::HistoryPolicy::default();
+        analyst_runtime::HistoryPolicy::new(
+            if configured.max_frames == 0 {
+                fallback.max_frames
+            } else {
+                configured.max_frames
+            },
+            if configured.max_estimated_bytes == 0 {
+                fallback.max_estimated_bytes
+            } else {
+                configured.max_estimated_bytes
+            },
+        )
+    }
+
     /// Apply everything the settings file says to a freshly built application.
     ///
     /// Called once from `with_context`, before any load or live start, so the
     /// history policy exists before the first install and a restored pane
     /// never renders once in its default shape first.
     fn apply_settings_on_start(&mut self) {
-        use crate::settings_ui::catalog::keys;
-
         self.apply_settings_document();
 
         // Only on start: `VolumeHistory::new` builds an empty history, so
@@ -762,20 +1002,7 @@ impl WorkstationApp {
         // profile switch changes the same two settings through
         // `apply_changed_setting`, which calls `set_policy` and evicts down to
         // it rather than throwing away every volume the analyst has.
-        let frames = self.settings_store.effective_int(
-            &self.settings_registry,
-            keys::data::CATEGORY,
-            keys::data::HISTORY_MAX_FRAMES,
-        ) as usize;
-        let megabytes = self.settings_store.effective_int(
-            &self.settings_registry,
-            keys::data::CATEGORY,
-            keys::data::HISTORY_MAX_MB,
-        ) as usize;
-        self.history = VolumeHistory::new(analyst_runtime::HistoryPolicy::new(
-            frames,
-            megabytes * 1024 * 1024,
-        ));
+        self.history = VolumeHistory::new(self.configured_history_policy());
 
         // The shipped profile is "how this build behaves with nothing
         // stored", and only the application can say what that includes: the
@@ -825,6 +1052,11 @@ impl WorkstationApp {
             &self.settings_store.workspace().palettes,
             self.user_tables.library(),
         ));
+        self.source_field_palettes =
+            crate::source_field_palettes::SourceFieldPaletteOverrides::from_snapshot(
+                &self.settings_store.workspace().source_field_palettes,
+                self.user_tables.library(),
+            );
 
         // The workspace: layout, active pane, per-pane product, tilt, camera
         // and camera link. Cameras are sanitized on the way in.
@@ -838,7 +1070,9 @@ impl WorkstationApp {
                 continue;
             };
             let id = self.workspace.pane(pane).product.clone();
-            if DisplayProduct::try_from_product_id(&id).is_none() {
+            if DisplayProduct::try_from_product_id(&id).is_none()
+                && crate::source_fields::producer_name_from_product_id(&id).is_none()
+            {
                 self.workspace.pane_mut(pane).product = DisplayProduct::default().product_id();
                 self.status = format!("Unknown saved product '{}' - reset to default", id.0);
             }
@@ -1351,22 +1585,29 @@ impl WorkstationApp {
                 self.invalidate_view_panes(self.workspace.visible_panes());
             }
             (keys::data::CATEGORY, keys::data::HISTORY_MAX_FRAMES | keys::data::HISTORY_MAX_MB) => {
-                let frames = self.settings_store.effective_int(
-                    &self.settings_registry,
-                    keys::data::CATEGORY,
-                    keys::data::HISTORY_MAX_FRAMES,
-                ) as usize;
-                let megabytes = self.settings_store.effective_int(
-                    &self.settings_registry,
-                    keys::data::CATEGORY,
-                    keys::data::HISTORY_MAX_MB,
-                ) as usize;
-                // `set_policy`, not a rebuild: shrinking evicts, and the
-                // frames that survive stay on the timeline.
-                let _evicted = self.history.set_policy(analyst_runtime::HistoryPolicy::new(
-                    frames,
-                    megabytes * 1024 * 1024,
-                ));
+                let policy = if self.live_site.is_some() {
+                    self.live_history_policy()
+                } else {
+                    self.configured_history_policy()
+                };
+                // `set_policy`, not a rebuild: a positive limit can shrink
+                // local history, while zero means Unlimited there. A live
+                // session substitutes its bounded fallback for a zero
+                // dimension. Every resulting eviction is surfaced instead of
+                // disappearing behind a settings change.
+                let evicted = self.history.set_policy(policy);
+                if !evicted.is_empty() {
+                    if let Some(sequence) = self.file_sequence.as_mut() {
+                        sequence.evicted_frames = sequence
+                            .evicted_frames
+                            .saturating_add(evicted.len());
+                    }
+                    self.status = format!(
+                        "History limit applied · {} frame(s) evicted · {} retained",
+                        evicted.len(),
+                        self.history.len()
+                    );
+                }
             }
             (
                 keys::radar::CATEGORY,
@@ -1601,6 +1842,7 @@ impl WorkstationApp {
             &self.settings_store.workspace().palettes,
             self.user_tables.library(),
         );
+        workspace.source_field_palettes = self.source_field_palettes.capture();
         workspace.last_site = self.live_site.clone();
         workspace.show_warnings = Some(self.show_warnings);
         workspace.window = context.input(|input| {
@@ -1751,8 +1993,47 @@ impl WorkstationApp {
         self.vol3d.open = open;
     }
 
+    /// Invalidate any metadata planning result that has not yet been acted
+    /// upon. The worker may still finish an operating-system read, but its
+    /// generation can no longer clear the current session or start a load.
+    fn cancel_playlist_preflight(&mut self) {
+        self.playlist_preflight_clock.bump();
+        self.pending_playlist_preflight = None;
+        self.pending_playlist_confirmation = None;
+    }
+
+    fn poll_playlist_preflight(&mut self) {
+        while let Some(update) = self.playlist_preflight_service.try_recv() {
+            let is_current = self
+                .pending_playlist_preflight
+                .as_ref()
+                .is_some_and(|pending| pending.generation == update.generation);
+            if !is_current {
+                continue;
+            }
+            self.pending_playlist_preflight = None;
+            if update.estimate.requires_confirmation() {
+                self.status = format!(
+                    "Large playlist awaiting confirmation · {} selected · estimated {} decoded RAM",
+                    update.paths.len(),
+                    crate::playlist_preflight::format_binary_bytes(
+                        update.estimate.estimated_decoded_bytes
+                    )
+                );
+                self.pending_playlist_confirmation = Some(PendingPlaylistConfirmation {
+                    paths: update.paths,
+                    estimate: update.estimate,
+                });
+            } else {
+                self.start_load_sequence(update.paths, update.estimate);
+            }
+        }
+    }
+
     /// Retire the previous session before a local file or file playlist.
     fn begin_local_session(&mut self) -> analyst_runtime::Generation {
+        let history_policy = self.configured_history_policy();
+        self.cancel_playlist_preflight();
         if self.live_site.is_some() {
             self.live_service.stop();
             self.live_site = None;
@@ -1769,6 +2050,8 @@ impl WorkstationApp {
         let generation = self.session_clock.bump();
         self.frame_clock.bump();
         self.history.clear();
+        let evicted = self.history.set_policy(history_policy);
+        debug_assert!(evicted.is_empty(), "an empty history cannot evict");
         self.load_ms = None;
         self.clear_all_panes();
         generation
@@ -1802,26 +2085,52 @@ impl WorkstationApp {
     /// workspace has one map anchor and cannot honestly paint two sites on it.
     fn begin_load_sequence(&mut self, paths: Vec<PathBuf>) {
         let paths = ordered_unique_paths(paths);
-        match paths.len() {
-            0 => return,
-            1 => {
-                self.begin_load(paths.into_iter().next().expect("one path"));
-                return;
-            }
-            _ => {}
+        if paths.is_empty() {
+            return;
         }
+
+        self.cancel_playlist_preflight();
+        let selected = paths.len();
+        let generation = self.playlist_preflight_clock.bump();
+        self.pending_playlist_preflight = Some(PendingPlaylistPreflight {
+            generation,
+            selected,
+        });
+        self.status = format!("Estimating playlist memory · {selected} selected");
+        if let Err(error) = self.playlist_preflight_service.request(generation, paths) {
+            self.pending_playlist_preflight = None;
+            self.status = format!(
+                "Playlist preflight could not start ({error}) · {selected} selected · 0 decoded · 0 logical volumes · 0 failed"
+            );
+        }
+    }
+
+    /// Begin a selection whose planning estimate has either stayed below the
+    /// warning threshold or been explicitly accepted by the operator.
+    fn start_load_sequence(
+        &mut self,
+        paths: Vec<PathBuf>,
+        preflight: crate::playlist_preflight::PlaylistRamEstimate,
+    ) {
+        self.pending_playlist_confirmation = None;
 
         let first = paths[0].display().to_string();
         self.begin_local_session();
         self.source_path_text = first;
         self.file_sequence = Some(FileSequence {
             paths,
+            preflight,
             next: 0,
             loaded: 0,
             failures: Vec::new(),
             site_id: None,
             site_position: None,
             level1_files: 0,
+            pending_assembly: None,
+            assembled_files: 0,
+            assembled_groups: 0,
+            assembly_refusals: Vec::new(),
+            evicted_frames: 0,
         });
         self.update_sequence_status("starting");
         self.request_next_sequence_file();
@@ -1834,6 +2143,7 @@ impl WorkstationApp {
             Some(path)
         });
         let Some(path) = next else {
+            self.flush_pending_sweep_assembly();
             self.finish_file_sequence();
             return;
         };
@@ -1864,6 +2174,10 @@ impl WorkstationApp {
     }
 
     fn finish_sequence_failure(&mut self, message: String) {
+        // A missing or corrupt member is a hard boundary. Even if the next
+        // readable file repeats the same three-digit sequence, joining across
+        // bytes we could not inspect would claim continuity we did not prove.
+        self.flush_pending_sweep_assembly();
         if let Some(sequence) = self.file_sequence.as_mut() {
             let path = sequence
                 .current_path()
@@ -1918,15 +2232,123 @@ impl WorkstationApp {
             }
             sequence.loaded += 1;
         }
-        // Let the ordinary install path inspect this session long enough to
-        // select PWR_REL for an uncalibrated cube. The session is discarded
-        // immediately afterwards: raw Level 1 pulses are session state, not
-        // history state, and retaining one would let a scrubbed frame operate
-        // on another file's I/Q. Playlists keep the honestly estimated moments
-        // while disabling raw reprocessing/spectra.
-        self.install_loaded_volume(loaded);
-        self.iq = None;
+        if let Some(reason) = loaded.assembly_refusal.take()
+            && reason.should_report_for_playlist()
+            && let Some(sequence) = self.file_sequence.as_mut()
+        {
+            let path = sequence
+                .current_path()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("unknown file"));
+            sequence.assembly_refusals.push((path, reason));
+        }
+        if let Some(evidence) = loaded.assembly.take() {
+            self.accept_proven_sweep_member(loaded, evidence);
+        } else {
+            self.flush_pending_sweep_assembly();
+            self.install_sequence_frame(loaded);
+        }
         self.request_next_sequence_file();
+    }
+
+    /// Buffer or append one member whose identity came from the file itself.
+    fn accept_proven_sweep_member(
+        &mut self,
+        loaded: LoadedVolume,
+        evidence: nexrad_io::sweep_assembly::ProvenSweepMembership,
+    ) {
+        let pending = self
+            .file_sequence
+            .as_mut()
+            .and_then(|sequence| sequence.pending_assembly.take());
+        let Some(mut pending) = pending else {
+            let first_source_label = loaded.source_label.clone();
+            if let Some(sequence) = self.file_sequence.as_mut() {
+                sequence.pending_assembly = Some(PendingSweepAssembly {
+                    loaded,
+                    evidence,
+                    first_source_label,
+                });
+            }
+            return;
+        };
+
+        let decision =
+            nexrad_io::sweep_assembly::decide_adjacent_sweeps(&pending.evidence, &evidence);
+        if decision == nexrad_io::sweep_assembly::SweepAssemblyDecision::ProvenSameVolume {
+            let incoming =
+                Arc::try_unwrap(loaded.volume).unwrap_or_else(|shared| shared.as_ref().clone());
+            // The same decision is checked again inside the append function;
+            // reaching an error here would mean the evidence changed between
+            // two adjacent statements, which cannot happen.
+            nexrad_io::sweep_assembly::append_proven_sweep(
+                Arc::make_mut(&mut pending.loaded.volume),
+                &mut pending.evidence,
+                incoming,
+                evidence,
+            )
+            .expect("a proven adjacent sweep remains proven while appending");
+            pending.loaded.elapsed_ms += loaded.elapsed_ms;
+            let count = pending.evidence.member_count;
+            pending.loaded.source_label = format!(
+                "{} (+{} sweep files, internal volume {:03})",
+                pending.first_source_label,
+                count - 1,
+                pending.evidence.key.volume_sequence
+            );
+            Arc::make_mut(&mut pending.loaded.volume)
+                .metadata
+                .source_path = Some(pending.loaded.source_label.clone());
+            if let Some(sequence) = self.file_sequence.as_mut() {
+                sequence.pending_assembly = Some(pending);
+            }
+            return;
+        }
+
+        // A typed refusal is a frame boundary, not a load error. Install the
+        // completed pending group and let this admitted sweep start its own.
+        if let Some(sequence) = self.file_sequence.as_mut() {
+            sequence.pending_assembly = Some(pending);
+        }
+        self.flush_pending_sweep_assembly();
+        let first_source_label = loaded.source_label.clone();
+        if let Some(sequence) = self.file_sequence.as_mut() {
+            sequence.pending_assembly = Some(PendingSweepAssembly {
+                loaded,
+                evidence,
+                first_source_label,
+            });
+        }
+    }
+
+    fn flush_pending_sweep_assembly(&mut self) {
+        let pending = self
+            .file_sequence
+            .as_mut()
+            .and_then(|sequence| sequence.pending_assembly.take());
+        let Some(pending) = pending else {
+            return;
+        };
+        if pending.evidence.member_count > 1
+            && let Some(sequence) = self.file_sequence.as_mut()
+        {
+            sequence.assembled_files += pending.evidence.member_count;
+            sequence.assembled_groups += 1;
+        }
+        self.install_sequence_frame(pending.loaded);
+    }
+
+    /// Install one playlist frame, then retire any raw pulse session it had.
+    fn install_sequence_frame(&mut self, loaded: LoadedVolume) {
+        // Let the ordinary install path inspect a Level 1 session long enough
+        // to select PWR_REL for an uncalibrated cube. Raw pulses are session
+        // state, not history state, and must not follow a scrub to another
+        // file's estimated moments.
+        let report = self.install_distinct_loaded_volume(loaded);
+        if let (Some(sequence), Some(report)) = (self.file_sequence.as_mut(), report) {
+            sequence.evicted_frames = sequence.evicted_frames.saturating_add(report.evicted.len());
+        }
+        self.iq = None;
     }
 
     fn update_sequence_status(&mut self, action: &str) {
@@ -1935,17 +2357,21 @@ impl WorkstationApp {
         };
         let current = sequence.next.max(1).min(sequence.total());
         self.sequence_status = Some(format!(
-            "Playlist {current}/{} · filename order · {action}",
-            sequence.total()
+            "Playlist {current}/{} · {action} · {} decoded · {} logical · {} retained · {} failed",
+            sequence.total(),
+            sequence.loaded,
+            sequence.logical_volumes(),
+            self.history.len(),
+            sequence.failures.len()
         ));
         let current = sequence
             .current_path()
             .map(|path| format!(" Current file: {}.", path.display()))
             .unwrap_or_default();
         self.sequence_detail = Some(format!(
-            "Each file is a separate frame.{current} {} decoded, {} failed so far. Successful frames are ordered by radar volume time; a different radar or radar position is skipped because this workspace has one map anchor.",
-            sequence.loaded,
-            sequence.failures.len()
+            "{} files selected in filename order. Files are independent frames unless matching internal Archive II volume identity proves they are one-cut members of one logical volume.{current} {} safe assembly boundary/boundaries so far. Successful frames are ordered by radar volume time; a different radar or radar position is skipped because this workspace has one map anchor.",
+            sequence.total(),
+            sequence.assembly_refusals.len()
         ));
     }
 
@@ -1954,17 +2380,47 @@ impl WorkstationApp {
             return;
         };
         let failed = sequence.failures.len();
+        let logical = sequence.logical_volumes();
+        let retained = self.history.len();
         self.sequence_status = Some(format!(
-            "Playlist complete · {}/{} decoded · {} frame(s) · {failed} failed",
-            sequence.loaded,
+            "Playlist complete · {} selected · {} decoded · {logical} logical volume(s) · {retained} retained · {failed} failed",
             sequence.total(),
-            self.history.len()
+            sequence.loaded,
         ));
-        let mut detail = "Loaded in filename order; the timeline orders the retained frames by radar volume time. Files are never merged into one volume.".to_owned();
+        let mut detail = format!(
+            "Loaded in filename order; the timeline orders retained frames by radar volume time. Preflight saw {} input and estimated {} decoded RAM. Internal Archive II evidence assembled {} file(s) into {} logical volume(s); all weaker or ambiguous cases stayed independent.",
+            sequence.preflight.input_size_text(),
+            crate::playlist_preflight::format_binary_bytes(
+                sequence.preflight.estimated_decoded_bytes
+            ),
+            sequence.assembled_files,
+            sequence.assembled_groups
+        );
+        if sequence.evicted_frames > 0 {
+            detail.push_str(&format!(
+                " Configured history limits explicitly evicted {} frame(s) during this playlist.",
+                sequence.evicted_frames
+            ));
+        }
         if sequence.level1_files > 0 {
             detail.push_str(
                 " Level 1 frames keep their estimated moments, but raw spectrum and reprocessing controls are disabled for a playlist so pulses from one file cannot be applied to another.",
             );
+        }
+        if !sequence.assembly_refusals.is_empty() {
+            detail.push_str(" Kept separate: ");
+            for (index, (path, reason)) in sequence.assembly_refusals.iter().take(5).enumerate() {
+                if index > 0 {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!("{} ({})", short_path_label(path), reason.label()));
+            }
+            if sequence.assembly_refusals.len() > 5 {
+                detail.push_str(&format!(
+                    "; and {} more",
+                    sequence.assembly_refusals.len() - 5
+                ));
+            }
         }
         if failed > 0 {
             detail.push_str(" Failed: ");
@@ -1988,7 +2444,9 @@ impl WorkstationApp {
     /// Start a live session for `site`. The generation bump invalidates every
     /// in-flight local or previous-site result before the new session installs.
     fn start_live(&mut self, site: String) {
+        let history_policy = self.live_history_policy();
         self.file_sequence = None;
+        self.cancel_playlist_preflight();
         self.sequence_status = None;
         self.sequence_detail = None;
         // Unconditional, like the history clear below: a half-finished pair
@@ -2000,6 +2458,8 @@ impl WorkstationApp {
         let generation = self.session_clock.bump();
         self.frame_clock.bump();
         self.history.clear();
+        let evicted = self.history.set_policy(history_policy);
+        debug_assert!(evicted.is_empty(), "an empty history cannot evict");
         self.load_ms = None;
         self.clear_all_panes();
         // The old site's feed report says nothing about the new one, and
@@ -2359,7 +2819,7 @@ impl WorkstationApp {
                             self.finish_sequence_volume(loaded);
                         }
                     } else {
-                        self.install_loaded_volume(loaded);
+                        let _ = self.install_loaded_volume(loaded);
                     }
                 }
                 LoadUpdate::Failed {
@@ -2414,9 +2874,26 @@ impl WorkstationApp {
         loaded.volume = Arc::new(volume);
     }
 
-    fn install_loaded_volume(&mut self, mut loaded: LoadedVolume) {
+    fn install_loaded_volume(&mut self, loaded: LoadedVolume) -> Option<InstallReport> {
+        self.install_loaded_volume_with_mode(loaded, false)
+    }
+
+    /// A different selected source path is an independently admitted frame.
+    /// Equal site/time metadata alone is not permission to discard it; only
+    /// the proven sweep-assembly path combines local files. Live updates keep
+    /// using `install_loaded_volume` so preview/partial/complete replacement
+    /// semantics remain unchanged.
+    fn install_distinct_loaded_volume(&mut self, loaded: LoadedVolume) -> Option<InstallReport> {
+        self.install_loaded_volume_with_mode(loaded, true)
+    }
+
+    fn install_loaded_volume_with_mode(
+        &mut self,
+        mut loaded: LoadedVolume,
+        retain_equal_identity: bool,
+    ) -> Option<InstallReport> {
         if loaded.generation != self.session_clock.current() {
-            return;
+            return None;
         }
         // A NEXRAD Level 1 record brings its pulses with it. Give the volume
         // the site position the record could not: the RVP8 header states a processor
@@ -2542,12 +3019,12 @@ impl WorkstationApp {
         let before = self.current_frame_signature();
         let before_extent = self.current_frame_extent();
         let stage = loaded.stage;
-        let report = self.history.install(VolumeFrame::new(
-            loaded.volume,
-            loaded.origin,
-            stage,
-            loaded.source_label,
-        ));
+        let frame = VolumeFrame::new(loaded.volume, loaded.origin, stage, loaded.source_label);
+        let report = if retain_equal_identity {
+            self.history.install_distinct(frame)
+        } else {
+            self.history.install(frame)
+        };
         self.load_ms = Some(loaded.elapsed_ms);
         let after = self.current_frame_signature();
         let after_extent = self.current_frame_extent();
@@ -2579,24 +3056,33 @@ impl WorkstationApp {
             // chunk. The texture is replaced when the new render lands.
             self.frame_clock.bump();
         }
+        let eviction = if report.evicted.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · {} frame(s) evicted by configured history limit",
+                report.evicted.len()
+            )
+        };
         self.status = match stage {
             FrameStage::Preview => format!(
-                "Preview ready in {:.1} ms · {} frame(s)",
+                "Preview ready in {:.1} ms · {} frame(s){eviction}",
                 loaded.elapsed_ms,
                 self.history.len()
             ),
             FrameStage::Partial => format!(
-                "Partial volume ready in {:.1} ms · {} frame(s)",
+                "Partial volume ready in {:.1} ms · {} frame(s){eviction}",
                 loaded.elapsed_ms,
                 self.history.len()
             ),
             FrameStage::Complete => format!(
-                "Complete volume ready in {:.1} ms · {} frame(s) · {:?}",
+                "Complete volume ready in {:.1} ms · {} frame(s) · {:?}{eviction}",
                 loaded.elapsed_ms,
                 self.history.len(),
                 report.disposition
             ),
         };
+        Some(report)
     }
 
     fn poll_render_results(&mut self, context: &egui::Context) {
@@ -2771,7 +3257,14 @@ impl WorkstationApp {
             &self.settings_store.workspace().palettes,
             self.user_tables.library(),
         );
+        self.source_field_palettes
+            .reresolve(self.user_tables.library());
         if *self.color_tables == resolved {
+            // A saved exact-field table may have appeared even when no shared
+            // family moved. Its resolver has changed, so source panes still
+            // need a fresh render.
+            self.palette_clock.bump();
+            self.invalidate_view_panes(self.workspace.visible_panes());
             return;
         }
         self.color_tables = Arc::new(resolved);
@@ -2834,7 +3327,15 @@ impl WorkstationApp {
         // and computing it here keeps the closure borrowing one field.
         let profile_line = self.active_profile_line();
         let active = self.workspace.active_pane;
-        let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let current_product_id = self.workspace.active().product.clone();
+        let current_source_field =
+            crate::source_fields::producer_name_from_product_id(&current_product_id)
+                .map(str::to_owned);
+        let current_product = DisplayProduct::from_product_id(&current_product_id);
+        let current_source_palette = current_source_field.as_deref().and_then(|producer_name| {
+            self.source_palette_for_pane(active, &current_product_id, producer_name)
+        });
+        let mut source_palette_action = None;
         let mut requested_load = None;
         let mut open_browser = false;
         let mut export_current_view = false;
@@ -2842,6 +3343,7 @@ impl WorkstationApp {
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
+        let mut selected_source_field = None;
         let mut quality_changed = false;
         let mut palette_changed = false;
         let mut filter_changed = false;
@@ -3054,7 +3556,12 @@ impl WorkstationApp {
                 let picker_button = bevel::toolbar_toggle(
                     ui,
                     self.product_picker_open,
-                    format!("{} ⏷", current_product.label()),
+                    format!(
+                        "{} ⏷",
+                        current_source_field
+                            .as_deref()
+                            .unwrap_or_else(|| current_product.label())
+                    ),
                 )
                 .on_hover_text("Choose a product and its colour table");
                 let mut opened_this_frame = false;
@@ -3083,7 +3590,9 @@ impl WorkstationApp {
                                     ProductPickerInput {
                                         state: &mut self.product_picker,
                                         current: current_product,
+                                        current_source_field: current_source_field.as_deref(),
                                         availability: &self.product_availability,
+                                        source_fields: &self.source_fields,
                                         tables: &self.color_tables,
                                         user_tables: Some(self.user_tables.library()),
                                         show_experimental: false,
@@ -3095,6 +3604,10 @@ impl WorkstationApp {
                     let outcome = outcome.inner.inner;
                     if let Some(product) = outcome.product {
                         selected_product = product;
+                        self.product_picker_open = false;
+                    }
+                    if let Some(producer_name) = outcome.source_field {
+                        selected_source_field = Some(producer_name);
                         self.product_picker_open = false;
                     }
                     if let Some(selection) = outcome.palette {
@@ -3140,7 +3653,13 @@ impl WorkstationApp {
                 // an analyst whether a strange-looking field is the data or the
                 // palette, so burying it one level down inside a menu was wrong.
                 let palette_family = crate::product_picker::palette_family(current_product);
-                if let Some(family) = palette_family {
+                if let (Some(producer_name), Some(resolved)) =
+                    (current_source_field.as_deref(), current_source_palette.as_ref())
+                {
+                    source_palette_action = source_palette_control(ui, producer_name, resolved);
+                } else if current_source_field.is_none()
+                    && let Some(family) = palette_family
+                {
                     let installed = self.color_tables.for_family(family).clone();
                     // Taken out of the popup rather than installed inside it:
                     // the rows are borrowed from the offer cache for the
@@ -3300,6 +3819,31 @@ impl WorkstationApp {
             });
         });
 
+        if let Some(action) = source_palette_action {
+            match action {
+                SourcePaletteAction::Edit => {
+                    if let Some(resolved) = current_source_palette.as_ref() {
+                        self.palette_editor.edit_source_field(
+                            current_product_id.clone(),
+                            &resolved.table,
+                            resolved.automatic,
+                            resolved.current_is_durable,
+                        );
+                    }
+                }
+                SourcePaletteAction::Reset => {
+                    if self.source_field_palettes.reset(&current_product_id) {
+                        self.palette_clock.bump();
+                        palette_changed = true;
+                        self.status = format!(
+                            "{} palette reset to automatic observed range",
+                            current_source_field.as_deref().unwrap_or("source field")
+                        );
+                    }
+                }
+            }
+        }
+
         if filter_changed {
             // The chip wrote straight to the store, so the cache the paint
             // path reads is one frame stale until this runs. Before the
@@ -3335,7 +3879,9 @@ impl WorkstationApp {
         if selected_layout != self.workspace.layout {
             self.workspace.set_layout(selected_layout);
         }
-        if selected_product != current_product {
+        if let Some(producer_name) = selected_source_field {
+            self.apply_source_field_selection(active, &producer_name);
+        } else if selected_product != current_product {
             self.apply_product_selection(active, selected_product);
         }
         if tilt_delta != 0 {
@@ -3365,7 +3911,15 @@ impl WorkstationApp {
     /// by Settings > Appearance > Toolbar style = Everything visible.
     fn toolbar_everything(&mut self, ui: &mut egui::Ui) {
         let active = self.workspace.active_pane;
-        let current_product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let current_product_id = self.workspace.active().product.clone();
+        let current_source_field =
+            crate::source_fields::producer_name_from_product_id(&current_product_id)
+                .map(str::to_owned);
+        let current_product = DisplayProduct::from_product_id(&current_product_id);
+        let current_source_palette = current_source_field.as_deref().and_then(|producer_name| {
+            self.source_palette_for_pane(active, &current_product_id, producer_name)
+        });
+        let mut source_palette_action = None;
         let mut requested_load = None;
         let mut open_browser = false;
         let mut export_current_view = false;
@@ -3373,6 +3927,7 @@ impl WorkstationApp {
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
         let mut selected_product = current_product;
+        let mut selected_source_field = None;
         let mut quality_changed = false;
         let mut palette_changed = false;
         let mut filter_changed = false;
@@ -3499,7 +4054,12 @@ impl WorkstationApp {
                 });
 
             let picker_button = ui
-                .selectable_label(self.product_picker_open, current_product.label())
+                .selectable_label(
+                    self.product_picker_open,
+                    current_source_field
+                        .as_deref()
+                        .unwrap_or_else(|| current_product.label()),
+                )
                 .on_hover_text("Choose a product and its colour table");
             let mut opened_this_frame = false;
             if picker_button.clicked() {
@@ -3523,7 +4083,9 @@ impl WorkstationApp {
                                 ProductPickerInput {
                                     state: &mut self.product_picker,
                                     current: current_product,
+                                    current_source_field: current_source_field.as_deref(),
                                     availability: &self.product_availability,
+                                    source_fields: &self.source_fields,
                                     tables: &self.color_tables,
                                     user_tables: Some(self.user_tables.library()),
                                     show_experimental: false,
@@ -3535,6 +4097,10 @@ impl WorkstationApp {
                 let outcome = outcome.inner.inner;
                 if let Some(product) = outcome.product {
                     selected_product = product;
+                    self.product_picker_open = false;
+                }
+                if let Some(producer_name) = outcome.source_field {
+                    selected_source_field = Some(producer_name);
                     self.product_picker_open = false;
                 }
                 if let Some(selection) = outcome.palette {
@@ -3576,7 +4142,13 @@ impl WorkstationApp {
             // the data or the palette, so burying it one level down inside
             // another menu was wrong.
             let palette_family = crate::product_picker::palette_family(current_product);
-            if let Some(family) = palette_family {
+            if let (Some(producer_name), Some(resolved)) =
+                (current_source_field.as_deref(), current_source_palette.as_ref())
+            {
+                source_palette_action = source_palette_control(ui, producer_name, resolved);
+            } else if current_source_field.is_none()
+                && let Some(family) = palette_family
+            {
                 let installed = self.color_tables.for_family(family).clone();
                 // Taken out of the popup rather than installed inside it, for
                 // the reason the wide bar above gives.
@@ -3754,6 +4326,31 @@ impl WorkstationApp {
             ui.label(format!("Pane {}", active.get() + 1));
         });
 
+        if let Some(action) = source_palette_action {
+            match action {
+                SourcePaletteAction::Edit => {
+                    if let Some(resolved) = current_source_palette.as_ref() {
+                        self.palette_editor.edit_source_field(
+                            current_product_id.clone(),
+                            &resolved.table,
+                            resolved.automatic,
+                            resolved.current_is_durable,
+                        );
+                    }
+                }
+                SourcePaletteAction::Reset => {
+                    if self.source_field_palettes.reset(&current_product_id) {
+                        self.palette_clock.bump();
+                        palette_changed = true;
+                        self.status = format!(
+                            "{} palette reset to automatic observed range",
+                            current_source_field.as_deref().unwrap_or("source field")
+                        );
+                    }
+                }
+            }
+        }
+
         if filter_changed {
             // The chip wrote straight to the store, so the cache the paint
             // path reads is one frame stale until this runs. Before the
@@ -3789,7 +4386,9 @@ impl WorkstationApp {
         if selected_layout != self.workspace.layout {
             self.workspace.set_layout(selected_layout);
         }
-        if selected_product != current_product {
+        if let Some(producer_name) = selected_source_field {
+            self.apply_source_field_selection(active, &producer_name);
+        } else if selected_product != current_product {
             self.apply_product_selection(active, selected_product);
         }
         if tilt_delta != 0 {
@@ -3814,6 +4413,23 @@ impl WorkstationApp {
         }
     }
 
+    fn source_palette_for_pane(
+        &self,
+        pane: PaneId,
+        product_id: &radar_core::ProductId,
+        producer_name: &str,
+    ) -> Option<crate::source_field_palettes::ResolvedSourceFieldPalette> {
+        let volume = &self.history.current()?.volume;
+        let cut_index = self.resolve_cut_index(pane, volume)?;
+        let source = self
+            .source_fields
+            .display_on_cut(producer_name, cut_index)?;
+        Some(
+            self.source_field_palettes
+                .resolve(product_id, &source, &self.color_tables),
+        )
+    }
+
     /// Change a pane's product, with everything that has to move with it.
     ///
     /// A product change on the Vrot pane retires the measurement: a DVEL gate
@@ -3833,6 +4449,20 @@ impl WorkstationApp {
         self.invalidate_semantic_panes(&changed);
     }
 
+    fn apply_source_field_selection(&mut self, active: PaneId, producer_name: &str) {
+        let changed = self
+            .workspace
+            .apply_product_from(active, crate::source_fields::product_id(producer_name));
+        if self.vrot_pane.is_some_and(|pane| changed.contains(&pane)) {
+            self.vrot_state
+                .mark_stale(crate::vrot::StaleReason::DifferentProduct);
+        }
+        for pane in &changed {
+            self.relative_power_fallback_from_ref[pane.index()] = false;
+        }
+        self.invalidate_semantic_panes(&changed);
+    }
+
     /// The 3D volume explorer, in its own window.
     ///
     /// Follows the active pane's product, so switching that pane to velocity
@@ -3842,7 +4472,22 @@ impl WorkstationApp {
         if !self.vol3d.open {
             return;
         }
-        let product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let product = match modeled_product_or_source_field(&self.workspace.active().product) {
+            Ok(product) => product,
+            Err(producer_name) => {
+                let message = source_field_2d_only_message("3D Volume", producer_name);
+                let mut open = self.vol3d.open;
+                egui::Window::new("3D Volume")
+                    .open(&mut open)
+                    .default_size([460.0, 150.0])
+                    .show(context, |ui| {
+                        ui.label(egui::RichText::new(producer_name).monospace().strong());
+                        ui.label(message);
+                    });
+                self.vol3d.open = open;
+                return;
+            }
+        };
         let descriptor = product.descriptor();
         // Volume products are already a vertical reduction; there is nothing
         // left to ray march. Fall back to the moment they are built from.
@@ -3893,12 +4538,15 @@ impl WorkstationApp {
         let frame = self.history.current();
         let site = frame.map(|frame| frame.identity.site_id.as_str());
         let volume_time = frame.map(|frame| frame.identity.volume_time);
-        let product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let product_id = self.workspace.active().product.clone();
+        let product = DisplayProduct::from_product_id(&product_id);
+        let product_name = crate::source_fields::producer_name_from_product_id(&product_id)
+            .unwrap_or_else(|| product.id());
         let pane_count = self.workspace.visible_panes().len();
         let view = if pane_count == 1 {
-            product.id().to_owned()
+            product_name.to_owned()
         } else {
-            format!("{pane_count}panes-{}-active", product.id())
+            format!("{pane_count}panes-{product_name}-active")
         };
         let file_base =
             crate::current_view_export::capture_file_base(site, volume_time, &view, Utc::now());
@@ -3924,6 +4572,137 @@ impl WorkstationApp {
         }
     }
 
+    /// Ask before a very large local selection starts consuming RAM.
+    ///
+    /// This floating egui window does not block the event loop and, until
+    /// Continue is pressed, does not clear or replace the session already on
+    /// screen. It is strictly a warning: no estimate can disable Continue.
+    fn playlist_preflight_window(&mut self, context: &egui::Context) {
+        if let Some(pending) = self.pending_playlist_preflight.as_ref() {
+            let selected = pending.selected;
+            let mut open = true;
+            let mut cancel = false;
+            egui::Window::new("Estimating playlist memory…")
+                .id(egui::Id::new("playlist-memory-estimating"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .default_width(520.0)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Inspecting {selected} selected files…"));
+                    });
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            "File metadata and the first 8 KiB signature are read on a worker. \
+                             The current session remains usable while slow or network paths respond.",
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            if cancel || !open {
+                self.cancel_playlist_preflight();
+                let retained = self.history.len();
+                self.status = format!(
+                    "Playlist cancelled · {selected} selected · 0 decoded · 0 logical volumes · 0 new retained · existing session unchanged ({retained} frame(s)) · 0 failed"
+                );
+            }
+            return;
+        }
+
+        let Some(pending) = self.pending_playlist_confirmation.as_ref() else {
+            return;
+        };
+        let selected = pending.paths.len();
+        let input = pending.estimate.input_size_text();
+        let estimated = crate::playlist_preflight::format_binary_bytes(
+            pending.estimate.estimated_decoded_bytes,
+        );
+        let method = pending.estimate.method_text();
+        let caveat = pending.estimate.caveat_text();
+        let mut open = true;
+        let mut continue_loading = false;
+        let mut cancel = false;
+
+        egui::Window::new("Large playlist memory warning")
+            .id(egui::Id::new("playlist-memory-preflight"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(580.0)
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "This selection may require substantial decoded memory.",
+                        )
+                        .strong(),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("playlist-memory-preflight-facts")
+                    .num_columns(2)
+                    .spacing([16.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("Selected files");
+                        ui.label(selected.to_string());
+                        ui.end_row();
+                        ui.label("Input size");
+                        ui.label(input);
+                        ui.end_row();
+                        ui.label("Estimated decoded RAM");
+                        ui.label(egui::RichText::new(estimated).strong());
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Method").strong());
+                ui.add(egui::Label::new(method).wrap());
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Caveat").strong());
+                ui.add(egui::Label::new(caveat).wrap());
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        "This is a warning, not a limit. Continue loads the entire selection. \
+                         Operator-selected local playlists are Unlimited by default; positive limits \
+                         are optional under Settings → Data → Timeline retention. Unattended live \
+                         feeds use a bounded fallback for each setting left at 0.",
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue loading").clicked() {
+                        continue_loading = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if continue_loading {
+            if let Some(pending) = self.pending_playlist_confirmation.take() {
+                self.start_load_sequence(pending.paths, pending.estimate);
+            }
+        } else if cancel || !open {
+            self.cancel_playlist_preflight();
+            let retained = self.history.len();
+            self.status = format!(
+                "Playlist cancelled · {selected} selected · 0 decoded · 0 logical volumes · 0 new retained · existing session unchanged ({retained} frame(s)) · 0 failed"
+            );
+        }
+    }
+
     fn palette_editor_window(&mut self, context: &egui::Context) {
         if !self.palette_editor.open {
             return;
@@ -3943,8 +4722,50 @@ impl WorkstationApp {
             self.palette_clock.bump();
             self.invalidate_view_panes(self.workspace.visible_panes());
         }
+        if let Some(install) = outcome.source_install {
+            let label = crate::source_fields::producer_name_from_product_id(&install.id)
+                .unwrap_or(install.id.0.as_str())
+                .to_owned();
+            let changed = if install.durable {
+                self.source_field_palettes
+                    .apply_saved(install.id, install.table)
+            } else {
+                self.source_field_palettes
+                    .apply_session(install.id, install.table)
+            };
+            if changed {
+                self.palette_clock.bump();
+                self.invalidate_view_panes(self.workspace.visible_panes());
+            }
+            self.status = if install.durable {
+                format!(
+                    "Saved palette binding applied only to {label}; it will return after restart"
+                )
+            } else {
+                format!(
+                    "Session-only preview applied to {label} · undo: CUSTOM → Reset to observed range"
+                )
+            };
+        }
+        let promoted_source = outcome.source_saved.and_then(|(id, table)| {
+            self.source_field_palettes
+                .promote_matching_saved(&id, &table)
+                .then(|| {
+                    crate::source_fields::producer_name_from_product_id(&id)
+                        .unwrap_or(id.0.as_str())
+                        .to_owned()
+                })
+        });
         if let Some(path) = outcome.saved {
-            self.status = format!("Colour table saved to {}", path.display());
+            self.status = promoted_source.map_or_else(
+                || format!("Colour table saved to {}", path.display()),
+                |label| {
+                    format!(
+                        "Colour table saved to {} · {label} binding saved for restart",
+                        path.display()
+                    )
+                },
+            );
             // The folder has a file in it that nothing has read yet, and the
             // focus rescan will never notice: focus was never lost - the save
             // happened inside this window. So the picker, the settings page
@@ -3964,7 +4785,15 @@ impl WorkstationApp {
         if !self.xsection.open {
             return;
         }
-        let product = DisplayProduct::from_product_id(&self.workspace.active().product);
+        let product = match modeled_product_or_source_field(&self.workspace.active().product) {
+            Ok(product) => product,
+            Err(producer_name) => {
+                let message = source_field_2d_only_message("Cross-section", producer_name);
+                self.xsection
+                    .source_field_2d_only_window(context, producer_name, &message);
+                return;
+            }
+        };
         let descriptor = product.descriptor();
         let moment = descriptor.computation.source_moment();
         let table = crate::palettes::table_for(descriptor, &self.color_tables);
@@ -4113,14 +4942,55 @@ impl WorkstationApp {
             // can never come apart. See `crate::north_up`.
             let north_up = self.north_up_frame(pane, Self::pane_viewport(ui, pane_rect));
             let camera = north_up.display_camera(self.workspace.pane(pane).camera);
-            let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+            let product_id = self.workspace.pane(pane).product.clone();
+            let source_name =
+                crate::source_fields::producer_name_from_product_id(&product_id).map(str::to_owned);
+            let product = DisplayProduct::from_product_id(&product_id);
             let cut_index = volume
                 .as_deref()
                 .and_then(|volume| self.resolve_cut_index(pane, volume));
-            let title = pane_title(volume.as_deref(), pane, product, cut_index);
-            let status = self.pane_header_status(pane, product, now);
+            let source_display = source_name.as_deref().and_then(|producer_name| {
+                self.source_fields.display_on_cut(producer_name, cut_index?)
+            });
+            let source_palette = source_display.as_ref().map(|source| {
+                self.source_field_palettes
+                    .resolve(&product_id, source, &self.color_tables)
+            });
+            let title = match (source_name.as_deref(), source_display.as_ref()) {
+                (_, Some(source)) => {
+                    source_field_pane_title(volume.as_deref(), pane, source, cut_index)
+                }
+                (Some(producer_name), None) => unavailable_source_field_pane_title(
+                    volume.as_deref(),
+                    pane,
+                    producer_name,
+                    cut_index,
+                ),
+                (None, None) => pane_title(volume.as_deref(), pane, product, cut_index),
+            };
+            let mut status = self.pane_header_status(pane, product, now);
+            if source_name.is_some() {
+                let palette_status =
+                    source_palette
+                        .as_ref()
+                        .map_or("palette unavailable on this cut", |resolved| {
+                            if resolved.automatic {
+                                "automatic observed-range palette"
+                            } else {
+                                "custom exact-field palette and fixed range"
+                            }
+                        });
+                status = if status.is_empty() {
+                    format!("SOURCE FIELD · native-grid · {palette_status}")
+                } else {
+                    format!("SOURCE FIELD · native-grid · {palette_status} · {status}")
+                };
+            }
             let pane_map = self.pane_map(pane, camera, pane_rect);
-            let badges = self.pane_badges(product, now);
+            let mut badges = self.pane_badges(product, now);
+            if source_name.is_some() {
+                badges.insert(0, "SOURCE FIELD".to_owned());
+            }
             let interaction = {
                 let texture =
                     self.panes[pane.index()]
@@ -4138,18 +5008,48 @@ impl WorkstationApp {
                 // a base-moment dBZ ramp does not even intersect the domain, so
                 // the legend vanished instead of being wrong visibly: VIL
                 // Density had no legend at all.
-                let table = crate::palettes::table_for(product.descriptor(), &self.color_tables);
+                let (table, domain, product_name) = match (
+                    source_name.as_deref(),
+                    source_display.as_ref(),
+                    source_palette.as_ref(),
+                ) {
+                    (_, Some(source), Some(resolved)) => {
+                        let (minimum, maximum) = resolved.value_range();
+                        let domain = crate::source_fields::numeric_domain(minimum, maximum);
+                        (
+                            Some(resolved.table.clone()),
+                            Some(domain),
+                            source.producer_name.as_str(),
+                        )
+                    }
+                    (Some(producer_name), None, _) => (None, None, producer_name),
+                    (None, None, _) => (
+                        Some(crate::palettes::table_for(
+                            product.descriptor(),
+                            &self.color_tables,
+                        )),
+                        Some(product.domain()),
+                        product.descriptor().short_name,
+                    ),
+                    // `source_palette` is resolved directly from a present
+                    // source display, so this arm is only a defensive blank:
+                    // never explain source pixels with REF colours.
+                    (_, Some(source), None) => (None, None, source.producer_name.as_str()),
+                };
                 // The legend can be turned off in Settings; `None` draws no
                 // bar, the same as a product whose domain has no ladder.
                 let layout = if self.settings_cache.legend {
-                    crate::legend::legend_layout(&product.domain(), &table)
+                    domain
+                        .as_ref()
+                        .zip(table.as_ref())
+                        .and_then(|(domain, table)| crate::legend::legend_layout(domain, table))
                 } else {
                     None
                 };
                 let overlay = crate::pane_canvas::PaneOverlay {
                     legend: layout.as_ref(),
-                    table: Some(&table),
-                    product_name: product.descriptor().short_name,
+                    table: table.as_ref(),
+                    product_name,
                     badges: &badges,
                     probe: self.panes[pane.index()].probe_text.as_deref(),
                     spectrum: self.panes[pane.index()].spectrum.as_ref(),
@@ -4183,7 +5083,7 @@ impl WorkstationApp {
                 self.settings_cache.units,
             );
 
-            if self.vrot_active && interaction.clicked {
+            if self.vrot_active && interaction.clicked && source_name.is_none() {
                 self.take_vrot_sample(pane, volume.as_deref(), cut_index, product);
             } else if self.xsection.wants_pane_clicks()
                 && interaction.clicked
@@ -4221,7 +5121,16 @@ impl WorkstationApp {
                 self.workspace.set_active(pane);
             }
             self.panes[pane.index()].hovered_world_km = interaction.hovered_world_km;
-            self.refresh_probe(pane, volume.as_deref(), cut_index, product);
+            match (source_name.is_some(), source_display.as_ref()) {
+                (_, Some(source)) => {
+                    self.refresh_source_probe(pane, volume.as_deref(), cut_index, source)
+                }
+                (true, None) => {
+                    self.panes[pane.index()].probe_text = None;
+                    self.panes[pane.index()].spectrum = None;
+                }
+                (false, None) => self.refresh_probe(pane, volume.as_deref(), cut_index, product),
+            }
             self.update_viewport(pane, interaction.viewport);
             if interaction.camera_changed {
                 // Strip the derived rotation on the way back in. The centre
@@ -4323,6 +5232,10 @@ impl WorkstationApp {
                 "history {:.1} MiB",
                 self.history.estimated_bytes() as f64 / (1024.0 * 1024.0)
             ));
+            ui.label(history_policy_status(self.history.policy()))
+                .on_hover_text(
+                    "For selected local files, 0 means Unlimited. Live feeds substitute the 30-frame / 1 GiB safe fallback for zero dimensions. Positive limits apply to both, and every eviction is reported.",
+                );
             let queued = self.render_service.queued_panes();
             if queued > 0 {
                 ui.label(format!("{queued} pane(s) queued"));
@@ -4358,7 +5271,10 @@ impl WorkstationApp {
         volume: Arc<RadarVolume>,
         viewport: ViewportMetrics,
     ) {
-        let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+        let product_id = self.workspace.pane(pane).product.clone();
+        let source_name =
+            crate::source_fields::producer_name_from_product_id(&product_id).map(str::to_owned);
+        let product = DisplayProduct::from_product_id(&product_id);
         let stamp = self.current_stamp(pane);
         let Some(cut_index) = self.resolve_cut_index(pane, &volume) else {
             // Terminal for this stamp, so playback does not wait for ever on
@@ -4366,7 +5282,16 @@ impl WorkstationApp {
             let runtime = &mut self.panes[pane.index()];
             runtime.pending_stamp = None;
             runtime.terminal = Some(RenderTerminal::Unavailable(stamp));
-            runtime.status = format!("{} unavailable", product.id());
+            if source_name.is_some() {
+                // There will be no replacement raster for this source stamp;
+                // keeping the previous product indefinitely would relabel old
+                // pixels as this unavailable native field.
+                runtime.texture = None;
+            }
+            runtime.status = format!(
+                "{} unavailable",
+                source_name.as_deref().unwrap_or_else(|| product.id())
+            );
             return;
         };
         let runtime = &self.panes[pane.index()];
@@ -4392,27 +5317,55 @@ impl WorkstationApp {
         let Some(capabilities) = self.capabilities.as_ref().map(Arc::clone) else {
             return;
         };
+        let source_field = source_name.as_deref().and_then(|producer_name| {
+            let source = self
+                .source_fields
+                .display_on_cut(producer_name, cut_index)?;
+            let resolved =
+                self.source_field_palettes
+                    .resolve(&product_id, &source, &self.color_tables);
+            Some(crate::render_service::SourceFieldRender {
+                moment: source.moment,
+                table: resolved.table,
+            })
+        });
+        if source_name.is_some() && source_field.is_none() {
+            let runtime = &mut self.panes[pane.index()];
+            runtime.pending_stamp = None;
+            runtime.terminal = Some(RenderTerminal::Unavailable(stamp));
+            runtime.texture = None;
+            runtime.status = format!(
+                "{} has no finite values",
+                source_name.as_deref().unwrap_or("source field")
+            );
+            return;
+        }
         // A sweep still filling is drawn over the last complete picture of the
         // same tilt. A complete sweep is not blended at all, so an archive file
         // renders down exactly the path it always did.
-        let sweep = self.panes[pane.index()]
-            .sweep_state
-            .filter(|state| !state.complete)
-            .and_then(|state| {
-                let moment = product.source_moment();
-                let (previous_volume, previous_cut_index) = crate::app_support::previous_sweep_for(
-                    &self.history,
-                    &volume,
-                    cut_index,
-                    &moment,
-                )?;
-                Some(SweepBlendRequest {
-                    previous_volume,
-                    previous_cut_index,
-                    start_deg: state.start_deg,
-                    revealed_deg: state.revealed_deg,
+        let sweep = if source_field.is_some() {
+            None
+        } else {
+            self.panes[pane.index()]
+                .sweep_state
+                .filter(|state| !state.complete)
+                .and_then(|state| {
+                    let moment = product.source_moment();
+                    let (previous_volume, previous_cut_index) =
+                        crate::app_support::previous_sweep_for(
+                            &self.history,
+                            &volume,
+                            cut_index,
+                            &moment,
+                        )?;
+                    Some(SweepBlendRequest {
+                        previous_volume,
+                        previous_cut_index,
+                        start_deg: state.start_deg,
+                        revealed_deg: state.revealed_deg,
+                    })
                 })
-            });
+        };
 
         let request = RenderRequest {
             pane,
@@ -4422,6 +5375,7 @@ impl WorkstationApp {
             environment: self.hail_environment.clone(),
             cut_index,
             product,
+            source_field,
             // The DISPLAY camera, so the echo is rastered under the same
             // rotation the basemap is drawn under. `radar_raster_view` carries
             // it into `ViewportRasterOptions::rotation_rad`, and the raster's
@@ -4506,10 +5460,15 @@ impl WorkstationApp {
             };
             // Resolved before the mutable borrow below: both read `self`.
             let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
+            let product_key = crate::source_fields::producer_name_from_product_id(
+                &self.workspace.pane(pane).product,
+            )
+            .unwrap_or_else(|| product.id())
+            .to_owned();
             let cut_index = self.resolve_cut_index(pane, &volume);
             let key = cut_index.map(|cut_index| SweepKey {
                 identity: identity.clone(),
-                product: product.id(),
+                product: product_key,
                 cut_index,
             });
             let runtime = &mut self.panes[index];
@@ -4697,15 +5656,16 @@ impl WorkstationApp {
 
     /// Re-measure the current volume when anything about it changes.
     ///
-    /// The key includes the cut and radial counts, not just the frame identity
-    /// and stage. A live volume grows in place: chunks arrive, radials are
-    /// appended and whole cuts are added, all under one site and volume time at
-    /// stage `Partial`. Keying on identity alone would measure the first
-    /// fragment that arrived and then answer every later question from it, so
-    /// the pane would keep drawing the tilt that existed a minute ago.
+    /// The key includes source label, cut count and radial count, not just the
+    /// radar/time identity and stage. Different local research files can
+    /// legitimately share site/time metadata, while a live volume grows in
+    /// place as chunks append radials and cuts under one stable source label.
+    /// Omitting either discriminator can answer questions from a different
+    /// retained frame or from the first fragment that arrived.
     fn refresh_capabilities(&mut self) {
         let key = self.history.current().map(|frame| CapabilitiesKey {
             identity: frame.identity.clone(),
+            source_label: frame.source_label.clone(),
             stage: frame.stage,
             cuts: frame.volume.cuts.len(),
             radials: frame.volume.cuts.iter().map(|cut| cut.radials.len()).sum(),
@@ -4722,12 +5682,23 @@ impl WorkstationApp {
         // data, so it is remeasured wherever the measurement is.
         self.product_availability =
             ProductAvailabilityIndex::from_optional_capabilities(self.capabilities.as_deref());
+        self.source_fields = self
+            .history
+            .current()
+            .map(|frame| crate::source_fields::SourceFieldCatalog::from_volume(&frame.volume))
+            .unwrap_or_default();
     }
 
-    fn current_frame_signature(&self) -> Option<(analyst_runtime::FrameIdentity, FrameStage)> {
-        self.history
-            .current()
-            .map(|frame| (frame.identity.clone(), frame.stage))
+    fn current_frame_signature(
+        &self,
+    ) -> Option<(analyst_runtime::FrameIdentity, FrameStage, String)> {
+        self.history.current().map(|frame| {
+            (
+                frame.identity.clone(),
+                frame.stage,
+                frame.source_label.clone(),
+            )
+        })
     }
 
     /// How much data the current frame holds, as (cuts, radials).
@@ -4747,7 +5718,7 @@ impl WorkstationApp {
 
     fn commit_history_selection(
         &mut self,
-        before: Option<(analyst_runtime::FrameIdentity, FrameStage)>,
+        before: Option<(analyst_runtime::FrameIdentity, FrameStage, String)>,
     ) {
         if self.current_frame_signature() != before {
             self.frame_clock.bump();
@@ -4988,6 +5959,67 @@ impl WorkstationApp {
         self.panes[pane.index()].spectrum = self.gate_spectrum_for(&reading);
     }
 
+    fn refresh_source_probe(
+        &mut self,
+        pane: PaneId,
+        volume: Option<&RadarVolume>,
+        cut_index: Option<usize>,
+        source: &crate::source_fields::SourceFieldDisplay,
+    ) {
+        let Some((east_km, north_km)) = self.panes[pane.index()].hovered_world_km else {
+            self.panes[pane.index()].probe_text = None;
+            self.panes[pane.index()].spectrum = None;
+            return;
+        };
+        let (Some(volume), Some(cut_index)) = (volume, cut_index) else {
+            self.panes[pane.index()].probe_text = None;
+            self.panes[pane.index()].spectrum = None;
+            return;
+        };
+        let elevation_deg = self
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.cut(cut_index))
+            .map(|cut| cut.nominal_elevation_deg)
+            .or_else(|| volume.cuts.get(cut_index).map(|cut| cut.elevation_deg))
+            .unwrap_or_default();
+        let censor = self.probe_censor(
+            volume,
+            cut_index,
+            &source.moment,
+            DisplayProduct::Reflectivity,
+        );
+        let reading = crate::probe::probe_polar(
+            volume,
+            cut_index,
+            &source.moment,
+            elevation_deg,
+            volume.site.elevation_m,
+            east_km,
+            north_km,
+            censor,
+        );
+        let product_id = &self.workspace.pane(pane).product;
+        let resolved = self
+            .source_field_palettes
+            .resolve(product_id, source, &self.color_tables);
+        let (minimum, maximum) = resolved.value_range();
+        let domain = crate::source_fields::numeric_domain(minimum, maximum);
+        let mut text = crate::probe::format_reading(
+            &reading,
+            &domain,
+            &source.producer_name,
+            self.settings_cache.units,
+            self.settings_cache.annotation.range_decimals,
+        );
+        text.push_str(" | producer unit token: ");
+        text.push_str(source.producer_units.as_deref().unwrap_or("not provided"));
+        self.panes[pane.index()].probe_text = Some(text);
+        // A processed source field has no Level 1 pulse channel attached to
+        // it merely because an I/Q record happens to be open in the session.
+        self.panes[pane.index()].spectrum = None;
+    }
+
     /// The spectrum panel for a probe reading, when a Level 1 record is open.
     ///
     /// The probe's `row` is the moment grid's row, which for a processed sweep
@@ -5117,6 +6149,38 @@ impl WorkstationApp {
 
     fn resolve_cut_index(&self, pane: PaneId, volume: &RadarVolume) -> Option<usize> {
         let intent = self.workspace.pane(pane);
+        if let Some(producer_name) =
+            crate::source_fields::producer_name_from_product_id(&intent.product)
+        {
+            let available = |index: usize| {
+                crate::source_fields::grid_in_cut(volume, index, producer_name).is_some()
+            };
+            return match intent.tilt {
+                TiltSelection::LowestAvailable => {
+                    (0..volume.cuts.len()).find(|index| available(*index))
+                }
+                TiltSelection::CutIndex(index) => {
+                    let index = usize::from(index);
+                    available(index)
+                        .then_some(index)
+                        .or_else(|| (0..volume.cuts.len()).find(|index| available(*index)))
+                }
+                TiltSelection::NearestElevationTenths(target) => {
+                    let target = f32::from(target) / 10.0;
+                    volume
+                        .cuts
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| available(*index))
+                        .min_by(|(_, left), (_, right)| {
+                            (left.elevation_deg - target)
+                                .abs()
+                                .total_cmp(&(right.elevation_deg - target).abs())
+                        })
+                        .map(|(index, _)| index)
+                }
+            };
+        }
         let product = DisplayProduct::from_product_id(&intent.product);
         let descriptor = product.descriptor();
         let moment = descriptor.computation.source_moment();
@@ -5168,10 +6232,38 @@ impl WorkstationApp {
             return;
         };
         let active = self.workspace.active_pane;
-        let product = DisplayProduct::from_product_id(&self.workspace.pane(active).product);
         let Some(current) = self.resolve_cut_index(active, &volume) else {
             return;
         };
+        if let Some(producer_name) = crate::source_fields::producer_name_from_product_id(
+            &self.workspace.pane(active).product,
+        ) {
+            let next = if delta == 0 {
+                Some(current)
+            } else {
+                let mut index = current as isize;
+                loop {
+                    index += delta;
+                    if index < 0 || index >= volume.cuts.len() as isize {
+                        break None;
+                    }
+                    if crate::source_fields::grid_in_cut(&volume, index as usize, producer_name)
+                        .is_some()
+                    {
+                        break Some(index as usize);
+                    }
+                }
+            };
+            let Some(next) = next else {
+                return;
+            };
+            let changed = self
+                .workspace
+                .apply_tilt_from(active, TiltSelection::CutIndex(next as u16));
+            self.invalidate_semantic_panes(&changed);
+            return;
+        }
+        let product = DisplayProduct::from_product_id(&self.workspace.pane(active).product);
         // Step one commanded tilt, not one cut. On a split-cut volume the next
         // entry in the cut list is the other leg of the same elevation, so
         // stepping by index makes "+ Tilt" stand still.
@@ -5206,11 +6298,14 @@ impl WorkstationApp {
     /// because "the pane jumped from 0.48 to 0.44 degrees" is otherwise an
     /// unexplained change rather than a four-minute-fresher picture.
     fn active_tilt_hover(&self) -> String {
+        let pane = self.workspace.active_pane;
+        let product = match modeled_product_or_source_field(&self.workspace.pane(pane).product) {
+            Ok(product) => product,
+            Err(producer_name) => return self.source_field_tilt_hover(pane, producer_name),
+        };
         let Some(capabilities) = self.capabilities.as_ref() else {
             return "No volume measured yet".to_owned();
         };
-        let pane = self.workspace.active_pane;
-        let product = DisplayProduct::from_product_id(&self.workspace.pane(pane).product);
         let descriptor = product.descriptor();
         let moment = descriptor.computation.source_moment();
         let Some(choice) = product_engine::cut_selection::select_lowest_tilt(
@@ -5258,6 +6353,67 @@ impl WorkstationApp {
             "
 ",
         )
+    }
+
+    /// Describe the exact producer field selected by the pane without asking
+    /// the static product registry to interpret it.
+    fn source_field_tilt_hover(&self, pane: PaneId, producer_name: &str) -> String {
+        let limit =
+            "Exact source fields are currently 2D only; no modeled product was substituted.";
+        let Some(frame) = self.history.current() else {
+            return format!("Exact source field {producer_name} is selected.\n{limit}");
+        };
+        let Some(cut_index) = self.resolve_cut_index(pane, &frame.volume) else {
+            return format!(
+                "No sweep in this volume carries exact source field {producer_name}.\n{limit}"
+            );
+        };
+        let Some((_, grid)) =
+            crate::source_fields::grid_in_cut(&frame.volume, cut_index, producer_name)
+        else {
+            return format!(
+                "No sweep in this volume carries exact source field {producer_name}.\n{limit}"
+            );
+        };
+        let Some(stored_cut) = frame.volume.cuts.get(cut_index) else {
+            return format!("Exact source field {producer_name} is selected.\n{limit}");
+        };
+        let measured_cut = self
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.cut(cut_index));
+        let nominal_elevation_deg = measured_cut
+            .map(|cut| cut.nominal_elevation_deg)
+            .unwrap_or(stored_cut.elevation_deg);
+        let mut lines = vec![
+            format!("Exact source field {producer_name} · 2D only"),
+            format!(
+                "cut {cut_index} of {} at {nominal_elevation_deg:.2}° (stored {:.2}°)",
+                frame.volume.cuts.len(),
+                stored_cut.elevation_deg
+            ),
+            format!(
+                "{} source rows on {} sweep radials",
+                grid.radial_count(),
+                stored_cut.radials.len()
+            ),
+        ];
+        if let Some(cut) = measured_cut {
+            lines.push(format!(
+                "{:.0}° of azimuth{}",
+                cut.azimuth_coverage_deg,
+                if cut.complete { "" } else { ", still arriving" }
+            ));
+        }
+        if let Some(description) = grid.producer_description.as_deref() {
+            lines.push(format!("Producer description: {description}"));
+        }
+        lines.push(format!(
+            "Producer unit token: {}",
+            grid.producer_units.as_deref().unwrap_or("not provided")
+        ));
+        lines.push(limit.to_owned());
+        lines.join("\n")
     }
 
     fn active_tilt_label(&self) -> String {
@@ -5314,9 +6470,21 @@ impl WorkstationApp {
             return (None, None);
         };
         let pane = self.workspace.active_pane;
-        let moment =
-            DisplayProduct::from_product_id(&self.workspace.pane(pane).product).source_moment();
         let Some(index) = self.resolve_cut_index(pane, &frame.volume) else {
+            return (None, None);
+        };
+        let moment = match crate::source_fields::producer_name_from_product_id(
+            &self.workspace.pane(pane).product,
+        ) {
+            Some(producer_name) => {
+                crate::source_fields::grid_in_cut(&frame.volume, index, producer_name)
+                    .map(|(moment, _)| moment.clone())
+            }
+            None => Some(
+                DisplayProduct::from_product_id(&self.workspace.pane(pane).product).source_moment(),
+            ),
+        };
+        let Some(moment) = moment else {
             return (None, None);
         };
         let Some(grid) = frame
@@ -5743,6 +6911,7 @@ impl eframe::App for WorkstationApp {
         if self.user_tables.poll_focus(&context) {
             self.reresolve_palettes_from_user_tables();
         }
+        self.poll_playlist_preflight();
         self.poll_live_results();
         self.poll_load_results();
         self.poll_site_directory();
@@ -5764,6 +6933,7 @@ impl eframe::App for WorkstationApp {
         self.xsection_window(&context);
         self.palette_editor_window(&context);
         self.file_browser_window(&context);
+        self.playlist_preflight_window(&context);
         if let Some(path) = self.online_data.draw(&context) {
             self.source_path_text = path.display().to_string();
             self.begin_load(path);
@@ -6601,6 +7771,135 @@ mod tests {
     }
 
     #[test]
+    fn a_1075_path_selection_is_preserved_and_large_estimate_waits_for_confirmation() {
+        let paths = (0..1_075)
+            .rev()
+            .map(|index| PathBuf::from(format!("C:/not-present/volume-{index:04}.msg31")))
+            .collect::<Vec<_>>();
+        let ordered = ordered_unique_paths(paths.clone());
+        assert_eq!(ordered.len(), 1_075);
+        assert_eq!(
+            ordered.first().unwrap(),
+            &PathBuf::from("C:/not-present/volume-0000.msg31")
+        );
+        assert_eq!(
+            ordered.last().unwrap(),
+            &PathBuf::from("C:/not-present/volume-1074.msg31")
+        );
+
+        let mut app = test_app();
+        let generation = app.session_clock.current();
+        app.begin_load_sequence(paths);
+        assert!(
+            app.file_sequence.is_none(),
+            "a warned selection must not start before Continue"
+        );
+        assert_eq!(
+            app.pending_playlist_preflight
+                .as_ref()
+                .expect("metadata planning starts on its worker")
+                .selected,
+            1_075
+        );
+        for _ in 0..5_000 {
+            app.poll_playlist_preflight();
+            if app.pending_playlist_preflight.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let pending = app
+            .pending_playlist_confirmation
+            .as_ref()
+            .expect("the >16 GiB estimate opens the warning");
+        assert_eq!(pending.paths.len(), 1_075);
+        assert!(pending.estimate.requires_confirmation());
+        assert_eq!(
+            app.session_clock.current(),
+            generation,
+            "preflight must not clear or replace the current session"
+        );
+    }
+
+    #[test]
+    fn one_user_selected_path_also_enters_worker_preflight() {
+        let mut app = test_app();
+        let generation = app.session_clock.current();
+        app.begin_load_sequence(vec![PathBuf::from(
+            "C:/not-present/single-large-candidate.msg31",
+        )]);
+
+        let pending = app
+            .pending_playlist_preflight
+            .as_ref()
+            .expect("a single browser/drop selection must not bypass RAM planning");
+        assert_eq!(pending.selected, 1);
+        assert_eq!(app.session_clock.current(), generation);
+        assert!(app.file_sequence.is_none());
+
+        // The pure estimator test proves a one-file estimate above 16 GiB
+        // opens the warning. This test proves the app routes that one selected
+        // path to the same worker instead of taking the direct-load shortcut.
+        app.cancel_playlist_preflight();
+    }
+
+    #[test]
+    fn timeline_status_names_unlimited_and_each_configured_dimension() {
+        assert_eq!(
+            history_policy_status(analyst_runtime::HistoryPolicy::unlimited()),
+            "retention Unlimited"
+        );
+        assert_eq!(
+            history_policy_status(analyst_runtime::HistoryPolicy::new(30, 0)),
+            "retention limit 30 frames / Unlimited RAM"
+        );
+        assert_eq!(
+            history_policy_status(analyst_runtime::HistoryPolicy::new(0, 1024 * 1024 * 1024)),
+            "retention limit Unlimited frames / 1.0 GiB RAM"
+        );
+    }
+
+    #[test]
+    fn zero_settings_are_local_unlimited_but_live_safe_per_dimension() {
+        use crate::settings_ui::catalog::keys;
+
+        let mut app = test_app();
+        assert_eq!(
+            app.configured_history_policy(),
+            analyst_runtime::HistoryPolicy::unlimited()
+        );
+        assert_eq!(
+            app.live_history_policy(),
+            analyst_runtime::HistoryPolicy::default()
+        );
+
+        // A local session actively replaces the runtime's live-safe default
+        // with the operator's literal zero/Unlimited settings.
+        let _ = app
+            .history
+            .set_policy(analyst_runtime::HistoryPolicy::default());
+        app.begin_local_session();
+        assert_eq!(
+            app.history.policy(),
+            analyst_runtime::HistoryPolicy::unlimited()
+        );
+
+        app.settings_store.set(
+            keys::data::CATEGORY,
+            keys::data::HISTORY_MAX_FRAMES,
+            settings::SettingValue::Int(45),
+        );
+        assert_eq!(
+            app.live_history_policy(),
+            analyst_runtime::HistoryPolicy::new(
+                45,
+                analyst_runtime::HistoryPolicy::default().max_estimated_bytes,
+            ),
+            "a positive configured dimension is preserved while zero gets only the live fallback"
+        );
+    }
+
+    #[test]
     fn file_playlist_position_tolerates_rounding_but_not_a_moved_radar() {
         assert!(same_playlist_position(
             (Some(35.3330), Some(-97.2770)),
@@ -6614,6 +7913,206 @@ mod tests {
             (None, None),
             (Some(35.3330), Some(-97.2770))
         ));
+    }
+
+    fn proven_playlist_sweep(
+        app: &WorkstationApp,
+        sequence: u16,
+        start_ms: i32,
+        elevation_deg: f32,
+    ) -> (
+        LoadedVolume,
+        nexrad_io::sweep_assembly::ProvenSweepMembership,
+    ) {
+        let mut volume = renderable_volume(1_768_605_600 + i64::from(start_ms / 1_000));
+        let volume_mut = Arc::make_mut(&mut volume);
+        volume_mut.site.id = "DOW7".to_owned();
+        volume_mut.site.latitude_deg = Some(39.7278);
+        volume_mut.site.longitude_deg = Some(-101.5425);
+        volume_mut.site.elevation_m = Some(1_020.0);
+        let cut = &mut volume_mut.cuts[0];
+        cut.elevation_deg = elevation_deg;
+        for (index, radial) in cut.radials.iter_mut().enumerate() {
+            radial.elevation_deg = elevation_deg;
+            radial.time_offset_ms = start_ms + index as i32 * 10;
+        }
+        let last_ms = cut.radials.last().unwrap().time_offset_ms;
+        let evidence = nexrad_io::sweep_assembly::ProvenSweepMembership {
+            key: nexrad_io::sweep_assembly::ArchiveVolumeKey {
+                archive_family: "AR2V0002.".to_owned(),
+                volume_sequence: sequence,
+                site_id: "DOW7".to_owned(),
+                position: nexrad_io::sweep_assembly::RecordedRadarPosition {
+                    latitude_bits: 39.7278f32.to_bits(),
+                    longitude_bits: (-101.5425f32).to_bits(),
+                    elevation_bits: 1_020.0f32.to_bits(),
+                },
+                utc_date: volume.volume_time.date_naive(),
+                vcp: None,
+            },
+            first_radial_ms: start_ms,
+            last_radial_ms: last_ms,
+            elevation_number: Some(1),
+            elevation_angle_bits: elevation_deg.to_bits(),
+            member_count: 1,
+        };
+        let loaded = LoadedVolume {
+            iq: None,
+            assembly: Some(evidence.clone()),
+            assembly_refusal: None,
+            generation: app.session_clock.current(),
+            origin: FrameOrigin::Local,
+            source_label: format!("sweep-{start_ms}.msg31"),
+            stage: FrameStage::Complete,
+            volume,
+            elapsed_ms: 1.0,
+        };
+        (loaded, evidence)
+    }
+
+    #[test]
+    fn playlist_buffers_proven_sweeps_into_one_logical_volume() {
+        let mut app = test_app();
+        app.file_sequence = Some(FileSequence {
+            paths: vec![PathBuf::from("first.msg31"), PathBuf::from("second.msg31")],
+            preflight: crate::playlist_preflight::estimate_paths(&[]),
+            next: 2,
+            loaded: 0,
+            failures: Vec::new(),
+            site_id: Some("DOW7".to_owned()),
+            site_position: Some((Some(39.7278), Some(-101.5425))),
+            level1_files: 0,
+            pending_assembly: None,
+            assembled_files: 0,
+            assembled_groups: 0,
+            assembly_refusals: Vec::new(),
+            evicted_frames: 0,
+        });
+        let (first, first_evidence) = proven_playlist_sweep(&app, 210, 10_000, 0.9);
+        let second_start = first_evidence.last_radial_ms;
+        let (second, second_evidence) = proven_playlist_sweep(&app, 210, second_start, 1.3);
+
+        app.file_sequence.as_mut().unwrap().loaded = 1;
+        app.accept_proven_sweep_member(first, first_evidence);
+        assert_eq!(
+            app.file_sequence.as_ref().unwrap().logical_volumes(),
+            1,
+            "a nonempty pending group is already one logical volume in progress"
+        );
+        app.file_sequence.as_mut().unwrap().loaded = 2;
+        app.accept_proven_sweep_member(second, second_evidence);
+
+        assert!(app.history.is_empty(), "the group waits for a boundary");
+        assert_eq!(
+            app.file_sequence
+                .as_ref()
+                .unwrap()
+                .pending_assembly
+                .as_ref()
+                .unwrap()
+                .evidence
+                .member_count,
+            2
+        );
+        assert_eq!(
+            app.file_sequence.as_ref().unwrap().logical_volumes(),
+            1,
+            "additional cuts in the pending group do not make progress fall to zero"
+        );
+        app.flush_pending_sweep_assembly();
+
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history.current().unwrap().volume.cuts.len(), 2);
+        let sequence = app.file_sequence.as_ref().unwrap();
+        assert_eq!(sequence.assembled_files, 2);
+        assert_eq!(sequence.assembled_groups, 1);
+    }
+
+    #[test]
+    fn failed_member_is_a_hard_assembly_boundary() {
+        let mut app = test_app();
+        app.file_sequence = Some(FileSequence {
+            paths: vec![PathBuf::from("first.msg31"), PathBuf::from("broken.msg31")],
+            preflight: crate::playlist_preflight::estimate_paths(&[]),
+            next: 2,
+            loaded: 1,
+            failures: Vec::new(),
+            site_id: Some("DOW7".to_owned()),
+            site_position: Some((Some(39.7278), Some(-101.5425))),
+            level1_files: 0,
+            pending_assembly: None,
+            assembled_files: 0,
+            assembled_groups: 0,
+            assembly_refusals: Vec::new(),
+            evicted_frames: 0,
+        });
+        let (first, evidence) = proven_playlist_sweep(&app, 210, 10_000, 0.9);
+        app.accept_proven_sweep_member(first, evidence);
+
+        app.finish_sequence_failure("truncated Message 31 member".to_owned());
+
+        assert!(
+            app.file_sequence.is_none(),
+            "the exhausted playlist finished"
+        );
+        assert_eq!(app.history.len(), 1, "the proven prefix was not discarded");
+        let status = app.sequence_status.as_deref().unwrap();
+        assert!(status.contains("2 selected"), "{status}");
+        assert!(status.contains("1 decoded"), "{status}");
+        assert!(status.contains("1 logical volume"), "{status}");
+        assert!(status.contains("1 retained"), "{status}");
+        assert!(status.contains("1 failed"), "{status}");
+        assert!(
+            app.sequence_detail
+                .as_deref()
+                .unwrap()
+                .contains("broken.msg31"),
+            "the corrupt member must remain individually named"
+        );
+    }
+
+    #[test]
+    fn candidate_refusal_is_named_without_becoming_a_load_failure() {
+        let mut app = test_app();
+        app.file_sequence = Some(FileSequence {
+            paths: vec![PathBuf::from("uncertain.msg31")],
+            preflight: crate::playlist_preflight::estimate_paths(&[]),
+            next: 1,
+            loaded: 0,
+            failures: Vec::new(),
+            site_id: None,
+            site_position: None,
+            level1_files: 0,
+            pending_assembly: None,
+            assembled_files: 0,
+            assembled_groups: 0,
+            assembly_refusals: Vec::new(),
+            evicted_frames: 0,
+        });
+        let (mut loaded, _) = proven_playlist_sweep(&app, 210, 10_000, 0.9);
+        loaded.assembly = None;
+        loaded.assembly_refusal =
+            Some(nexrad_io::sweep_assembly::SweepAssemblyRefusal::MissingPosition);
+
+        app.finish_sequence_volume(loaded);
+
+        assert_eq!(
+            app.history.len(),
+            1,
+            "the sweep remains an independent frame"
+        );
+        let status = app.sequence_status.as_deref().unwrap();
+        assert!(status.contains("1 selected"), "{status}");
+        assert!(status.contains("1 decoded"), "{status}");
+        assert!(status.contains("1 logical volume"), "{status}");
+        assert!(status.contains("1 retained"), "{status}");
+        assert!(status.contains("0 failed"), "{status}");
+        let detail = app.sequence_detail.as_deref().unwrap();
+        assert!(detail.contains("uncertain.msg31"), "{detail}");
+        assert!(
+            detail.contains("no complete recorded radar position"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -6634,8 +8133,15 @@ mod tests {
         // Deliberately reversed: the session owns and reports its order.
         app.begin_load_sequence(vec![other_radar, duplicate, missing, first]);
         for _ in 0..4_000 {
+            app.poll_playlist_preflight();
             app.poll_load_results();
-            if app.file_sequence.is_none() {
+            if app.pending_playlist_preflight.is_none()
+                && app.file_sequence.is_none()
+                && app
+                    .sequence_status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("complete"))
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -6646,12 +8152,33 @@ mod tests {
         );
         assert_eq!(
             app.history.len(),
-            1,
-            "two copies of one volume are one timeline identity, never a merged volume"
+            2,
+            "different selected paths remain independent even when site/time metadata matches"
+        );
+        let retained_sources = app
+            .history
+            .frames()
+            .iter()
+            .map(|frame| frame.source_label.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            retained_sources
+                .iter()
+                .any(|source| source.ends_with("001-cfrad.nc")),
+            "{retained_sources:?}"
+        );
+        assert!(
+            retained_sources
+                .iter()
+                .any(|source| source.ends_with("003-cfrad-copy.nc")),
+            "{retained_sources:?}"
         );
         assert_eq!(app.history.current().unwrap().identity.site_id, "XSAPR-SGP");
         let status = app.sequence_status.as_deref().expect("playlist status");
-        assert!(status.contains("2/4 decoded"), "{status}");
+        assert!(status.contains("4 selected"), "{status}");
+        assert!(status.contains("2 decoded"), "{status}");
+        assert!(status.contains("2 logical volume"), "{status}");
+        assert!(status.contains("2 retained"), "{status}");
         assert!(status.contains("2 failed"), "{status}");
         let detail = app.sequence_detail.as_deref().expect("playlist detail");
         assert!(detail.contains("002-missing.nc"), "{detail}");
@@ -6661,6 +8188,41 @@ mod tests {
             "a playlist never retains one file's raw I/Q"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stepping_between_equal_identity_sources_refreshes_frame_and_capabilities() {
+        let mut app = test_app();
+        let volume = renderable_volume(1_768_605_600);
+        let first = VolumeFrame::new(
+            Arc::clone(&volume),
+            FrameOrigin::Local,
+            FrameStage::Complete,
+            "selected/first.nc",
+        );
+        let second = VolumeFrame::new(
+            volume,
+            FrameOrigin::Local,
+            FrameStage::Complete,
+            "selected/second.nc",
+        );
+        let _ = app.history.install_distinct(first);
+        let _ = app.history.install_distinct(second);
+        assert!(app.history.select(0));
+        app.refresh_capabilities();
+        let before_signature = app.current_frame_signature();
+        let before_capabilities = app.capabilities_for.clone();
+        let before_clock = app.frame_clock.current();
+
+        assert!(app.history.select(1));
+        app.commit_history_selection(before_signature);
+        assert_ne!(app.frame_clock.current(), before_clock);
+        app.refresh_capabilities();
+        assert_ne!(app.capabilities_for, before_capabilities);
+        assert_eq!(
+            app.history.current().unwrap().source_label,
+            "selected/second.nc"
+        );
     }
 
     /// Every string one `draw_pane` pass emitted, with the settings cache the
@@ -7547,8 +9109,10 @@ mod tests {
 
     fn install(app: &mut WorkstationApp, volume: Arc<RadarVolume>) {
         let generation = app.session_clock.current();
-        app.install_loaded_volume(LoadedVolume {
+        let _ = app.install_loaded_volume(LoadedVolume {
             iq: None,
+            assembly: None,
+            assembly_refusal: None,
             generation,
             origin: FrameOrigin::Live,
             source_label: "test".to_owned(),
@@ -7561,8 +9125,10 @@ mod tests {
     /// The same, at the stage a live volume still assembling arrives in.
     fn install_partial(app: &mut WorkstationApp, volume: Arc<RadarVolume>) {
         let generation = app.session_clock.current();
-        app.install_loaded_volume(LoadedVolume {
+        let _ = app.install_loaded_volume(LoadedVolume {
             iq: None,
+            assembly: None,
+            assembly_refusal: None,
             generation,
             origin: FrameOrigin::Live,
             source_label: "test".to_owned(),
@@ -7778,6 +9344,180 @@ mod tests {
         assert!(
             app.visible_panes_ready(),
             "an unavailable product froze playback"
+        );
+    }
+
+    #[test]
+    fn source_field_static_tools_stop_before_the_reflectivity_default() {
+        let context = egui::Context::default();
+        crate::theme::apply(&context, &crate::theme::Appearance::default());
+        let mut app = test_app();
+        let pane = first_pane();
+        app.apply_source_field_selection(pane, "VL1_CRR");
+        let source_id = app.workspace.pane(pane).product.clone();
+        assert_eq!(
+            modeled_product_or_source_field(&source_id),
+            Err("VL1_CRR"),
+            "a producer-native id crossed the static resolver's REF default"
+        );
+        for tool in ["3D Volume", "Cross-section"] {
+            let refusal = source_field_2d_only_message(tool, "VL1_CRR");
+            assert!(refusal.contains("VL1_CRR"), "{refusal}");
+            assert!(refusal.contains("2D only"), "{refusal}");
+            assert!(!refusal.contains("REF"), "REF leaked into {refusal}");
+            assert!(
+                !refusal.contains("Reflectivity"),
+                "reflectivity leaked into {refusal}"
+            );
+        }
+        app.vol3d.open = true;
+
+        // A slice and an armed placement from the previously selected modeled
+        // product must not remain on glass behind the refusal.
+        app.xsection.armed = true;
+        assert!(app.xsection.handle_pane_click((1.0, 2.0)));
+        assert!(app.xsection.handle_pane_click((3.0, 4.0)));
+        assert!(app.xsection.line.is_some());
+        app.xsection.armed = true;
+
+        let _ = app_frame(&mut app, &context, Vec::new());
+        assert!(!app.xsection.armed);
+        assert!(
+            app.xsection.line.is_none(),
+            "a modeled-product section line survived the source-field refusal"
+        );
+    }
+
+    #[test]
+    fn source_field_tilt_hover_reads_the_exact_grid_and_states_the_2d_limit() {
+        let mut volume = Arc::try_unwrap(renderable_volume(1_700_000_000))
+            .expect("the test volume has one owner");
+        let gate_range = volume.cuts[0].radials[0].gate_range.clone();
+        let radial_count = volume.cuts[0].radials.len();
+        let moment = radar_core::MomentType::Unknown("VL1_CRR".to_owned());
+        let mut grid = radar_core::MomentGrid::new_u8(
+            moment.clone(),
+            gate_range.clone(),
+            1.0,
+            0.0,
+            Some(0),
+            None,
+        );
+        grid.producer_name = Some("VL1_CRR".to_owned());
+        grid.producer_description = Some("verbatim producer description".to_owned());
+        // Deliberately odd for this name: the hover must call this a token,
+        // preserve it, and never use it to infer a canonical product.
+        grid.producer_units = Some("dBm".to_owned());
+        let row = vec![7_u8; gate_range.gate_count];
+        for radial_index in 0..radial_count {
+            grid.push_u8_row_slice(radial_index, &row)
+                .expect("the exact source row fits its grid");
+        }
+        volume.cuts[0].moments.insert(moment, grid);
+
+        let mut app = test_app();
+        install(&mut app, Arc::new(volume));
+        app.refresh_capabilities();
+        app.apply_source_field_selection(first_pane(), "VL1_CRR");
+        let hover = app.active_tilt_hover();
+
+        assert!(
+            hover.contains("Exact source field VL1_CRR · 2D only"),
+            "{hover}"
+        );
+        assert!(
+            hover.contains("Producer description: verbatim producer description"),
+            "{hover}"
+        );
+        assert!(hover.contains("Producer unit token: dBm"), "{hover}");
+        assert!(
+            hover.contains("no modeled product was substituted"),
+            "{hover}"
+        );
+        assert!(!hover.contains("REF"), "REF leaked into {hover}");
+        assert!(
+            !hover.contains("Reflectivity"),
+            "reflectivity leaked into {hover}"
+        );
+    }
+
+    #[test]
+    fn an_absent_source_field_clears_the_stale_product_raster() {
+        let context = egui::Context::default();
+        let mut app = test_app();
+        install(&mut app, renderable_volume(1_700_000_000));
+        pump_render(&mut app, &context);
+        let pane = first_pane();
+        assert!(app.panes[pane.index()].texture.is_some());
+
+        app.apply_source_field_selection(pane, "ABSENT_NATIVE_FIELD");
+        let volume = app
+            .history
+            .current()
+            .map(|frame| Arc::clone(&frame.volume))
+            .expect("a frame");
+        app.ensure_render_requested(pane, volume, VIEWPORT);
+
+        assert!(app.panes[pane.index()].texture.is_none());
+        assert!(
+            app.panes[pane.index()]
+                .status
+                .contains("ABSENT_NATIVE_FIELD unavailable")
+        );
+        assert_eq!(
+            app.panes[pane.index()].terminal,
+            Some(RenderTerminal::Unavailable(app.current_stamp(pane)))
+        );
+    }
+
+    #[test]
+    fn an_all_nodata_source_field_clears_the_stale_product_raster() {
+        let context = egui::Context::default();
+        let mut volume = Arc::try_unwrap(renderable_volume(1_700_000_000))
+            .expect("the test volume has one owner");
+        let cut = &mut volume.cuts[0];
+        let gate_range = cut.radials[0].gate_range.clone();
+        let moment = radar_core::MomentType::Unknown("EMPTY_NATIVE".to_owned());
+        let mut empty = radar_core::MomentGrid::new_u8(
+            moment.clone(),
+            gate_range.clone(),
+            1.0,
+            0.0,
+            Some(0),
+            None,
+        );
+        empty.producer_name = Some("EMPTY_NATIVE".to_owned());
+        let row = vec![0_u8; gate_range.gate_count];
+        for radial_index in 0..cut.radials.len() {
+            empty
+                .push_u8_row_slice(radial_index, &row)
+                .expect("a nodata row fits the source grid");
+        }
+        cut.moments.insert(moment, empty);
+
+        let mut app = test_app();
+        install(&mut app, Arc::new(volume));
+        pump_render(&mut app, &context);
+        let pane = first_pane();
+        assert!(app.panes[pane.index()].texture.is_some());
+
+        app.apply_source_field_selection(pane, "EMPTY_NATIVE");
+        let volume = app
+            .history
+            .current()
+            .map(|frame| Arc::clone(&frame.volume))
+            .expect("a frame");
+        app.ensure_render_requested(pane, volume, VIEWPORT);
+
+        assert!(app.panes[pane.index()].texture.is_none());
+        assert!(
+            app.panes[pane.index()]
+                .status
+                .contains("EMPTY_NATIVE has no finite values")
+        );
+        assert_eq!(
+            app.panes[pane.index()].terminal,
+            Some(RenderTerminal::Unavailable(app.current_stamp(pane)))
         );
     }
 
@@ -9949,6 +11689,8 @@ mod tests {
         let volume = Arc::new(session.volume(site));
         LoadedVolume {
             iq: Some(Box::new(session)),
+            assembly: None,
+            assembly_refusal: None,
             generation: app.session_clock.current(),
             origin: FrameOrigin::Local,
             source_label: "stare.iqd".to_owned(),
@@ -9961,7 +11703,7 @@ mod tests {
     /// Open that sweep in the application, through the shipped install path.
     fn install_time_series(app: &mut WorkstationApp, sweep: nexrad_io::iq::IqSweep) {
         let loaded = loaded_time_series(app, sweep);
-        app.install_loaded_volume(loaded);
+        let _ = app.install_loaded_volume(loaded);
     }
 
     #[test]
@@ -10060,12 +11802,18 @@ mod tests {
         let loaded = loaded_time_series(&app, relative);
         app.file_sequence = Some(FileSequence {
             paths: vec![PathBuf::from("ouprime-relative.mat")],
+            preflight: crate::playlist_preflight::estimate_paths(&[]),
             next: 1,
             loaded: 0,
             failures: Vec::new(),
             site_id: None,
             site_position: None,
             level1_files: 0,
+            pending_assembly: None,
+            assembled_files: 0,
+            assembled_groups: 0,
+            assembly_refusals: Vec::new(),
+            evicted_frames: 0,
         });
 
         app.finish_sequence_volume(loaded);

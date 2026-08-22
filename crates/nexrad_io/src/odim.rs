@@ -218,10 +218,11 @@ fn decode_sweep(
     let mut plane_meta = BTreeMap::<MomentType, PlaneWhat>::new();
     for plane_name in &data_names {
         let what_path = format!("/{dataset}/{plane_name}/what");
-        let quantity = file
+        let declared_quantity = file
             .attr(&what_path, "quantity")
-            .and_then(|attr| attr.as_str().map(str::to_owned))
-            .unwrap_or_else(|| plane_name.to_uppercase());
+            .and_then(|attr| attr.as_str().map(str::to_owned));
+        let (quantity, producer_name) =
+            quantity_and_native_name(declared_quantity.as_deref(), plane_name);
         let gain = attr_finite_f64(file, &what_path, "gain")?.unwrap_or(1.0);
         let gain = if gain.abs() > 1.0e-9 { gain } else { 1.0 };
         let offset = attr_finite_f64(file, &what_path, "offset")?.unwrap_or(0.0);
@@ -320,6 +321,7 @@ fn decode_sweep(
                 };
                 let mut grid = MomentGrid {
                     moment: moment.clone(),
+                    producer_name: Some(producer_name.clone()),
                     producer_description: None,
                     producer_units: None,
                     gate_range: gate_range.clone(),
@@ -342,6 +344,11 @@ fn decode_sweep(
             }
         };
         grid.moment = moment.clone();
+        // Preserve the exact ODIM `quantity` token, or the literal `dataN`
+        // group key when quantity is absent, even when this plane also has a
+        // canonical display meaning. It is source identity, not a synonym
+        // reconstructed by this reader.
+        grid.producer_name = Some(producer_name);
         if let Some(canonical) = canonical {
             canonical_priorities.insert(canonical, canonical_quantity_priority(&quantity));
         }
@@ -663,6 +670,19 @@ fn decode_moment_for_quantity(
     }
 }
 
+/// Keep the decoder's legacy fallback token separate from source identity.
+///
+/// `dataN` is the literal HDF group key when `/what/quantity` is absent. The
+/// uppercase form remains the internal quantity token used by the existing
+/// canonical matcher, but must never be presented as producer metadata: no
+/// producer wrote `DATAN` into that file.
+fn quantity_and_native_name(declared_quantity: Option<&str>, plane_name: &str) -> (String, String) {
+    match declared_quantity.filter(|quantity| !quantity.is_empty()) {
+        Some(quantity) => (quantity.to_owned(), quantity.to_owned()),
+        None => (plane_name.to_uppercase(), plane_name.to_owned()),
+    }
+}
+
 fn parse_site(file: &H5File<'_>) -> RadarSite {
     let source = file
         .attr("/what", "source")
@@ -852,6 +872,22 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_quantity_preserves_the_literal_hdf_group_name() {
+        assert_eq!(
+            quantity_and_native_name(None, "data17"),
+            ("DATA17".to_owned(), "data17".to_owned())
+        );
+        assert_eq!(
+            quantity_and_native_name(Some("DBZH"), "data17"),
+            ("DBZH".to_owned(), "DBZH".to_owned())
+        );
+        assert_eq!(
+            quantity_and_native_name(Some(""), "data17"),
+            ("DATA17".to_owned(), "data17".to_owned())
+        );
+    }
+
+    #[test]
     fn duplicate_tilts_keep_distinct_declared_sweep_start_offsets() {
         let volume_time = Utc.with_ymd_and_hms(2026, 8, 12, 23, 35, 0).unwrap();
         let starts = [
@@ -942,6 +978,7 @@ mod tests {
         };
         let mut grid = MomentGrid {
             moment,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,

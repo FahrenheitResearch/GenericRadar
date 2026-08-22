@@ -234,6 +234,35 @@ impl XSection {
         if open { self.open = true } else { self.close() }
     }
 
+    /// Keep an exact source-field selection out of the modeled-moment slice
+    /// builder while leaving a visible explanation in the tool the analyst
+    /// opened.
+    ///
+    /// Any old line and slice belonged to a modeled product and are removed;
+    /// leaving either on the pane while this refusal is shown would still
+    /// imply that the selected source field had been sliced.
+    pub fn source_field_2d_only_window(
+        &mut self,
+        context: &egui::Context,
+        producer_name: &str,
+        message: &str,
+    ) {
+        if !self.open {
+            return;
+        }
+        self.armed = false;
+        self.clear_line();
+        let mut open = self.open;
+        egui::Window::new("Cross Section")
+            .open(&mut open)
+            .default_size([460.0, 150.0])
+            .show(context, |ui| {
+                ui.label(egui::RichText::new(producer_name).monospace().strong());
+                ui.label(message);
+            });
+        if open { self.open = true } else { self.close() }
+    }
+
     /// The window was dismissed. Closing is walking away from the tool, so
     /// the whole tool goes away: the placement cursor comes down (leaving
     /// `armed` set would keep stealing pane clicks, and every completed pair
@@ -925,6 +954,7 @@ mod build {
                     MomentType::Reflectivity,
                     MomentGrid {
                         moment: MomentType::Reflectivity,
+                        producer_name: None,
                         producer_description: None,
                         producer_units: None,
                         gate_range,

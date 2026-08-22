@@ -11,7 +11,7 @@
 //! synthesised across its own declared range. The ramp is stretched to the
 //! product, not the product squeezed onto the ramp.
 
-use color_tables::{ColorStop, ColorTable, ColorTableSet, Rgba8};
+use color_tables::{ColorStop, ColorTable, ColorTableFamily, ColorTableSet, Rgba8};
 use product_engine::registry::{DerivedVolumeId, ProductDescriptor};
 use render2d::color_family_for_moment;
 
@@ -62,6 +62,74 @@ pub fn table_for(descriptor: &ProductDescriptor, tables: &ColorTableSet) -> Colo
         }
         Some(_) => ramp_over(descriptor, &SEQUENTIAL_RAMP),
     }
+}
+
+/// The explicitly generic table for one producer-native field.
+///
+/// Only the stop positions move: the source field's observed finite minimum
+/// and maximum replace Generic's 0..100 authoring span. That makes every
+/// finite value visible without claiming the field is reflectivity, velocity,
+/// power, or any other scientific quantity. The producer's own unit token is
+/// shown separately by the pane and is never read here.
+pub fn source_field_table(
+    producer_name: &str,
+    minimum: f32,
+    maximum: f32,
+    tables: &ColorTableSet,
+) -> ColorTable {
+    source_field_table_from_template(
+        producer_name,
+        minimum,
+        maximum,
+        tables.for_family(ColorTableFamily::Generic),
+    )
+}
+
+/// Stretch one chosen palette over raw producer values for one exact source
+/// field. This is also the restart path for a persisted field override: the
+/// named user table supplies the colours while the exact field entry supplies
+/// the numeric range.
+pub fn source_field_table_from_template(
+    producer_name: &str,
+    minimum: f32,
+    maximum: f32,
+    template: &ColorTable,
+) -> ColorTable {
+    let (minimum, maximum) = drawable_source_range(minimum, maximum);
+    let first = template
+        .stops()
+        .first()
+        .map(|stop| stop.value)
+        .unwrap_or(0.0);
+    let last = template
+        .stops()
+        .last()
+        .map(|stop| stop.value)
+        .unwrap_or(100.0);
+    let span = (last - first).max(f32::EPSILON);
+    let stops = template
+        .stops()
+        .iter()
+        .map(|stop| {
+            let fraction = (stop.value - first) / span;
+            ColorStop {
+                value: minimum + (maximum - minimum) * fraction,
+                color: stop.color,
+                end_color: stop.end_color,
+            }
+        })
+        .collect();
+    ColorTable::new(format!("Source field {producer_name}"), stops)
+        .expect("the source template keeps at least two ascending stops")
+        .rendered(template.rendering())
+}
+
+pub fn drawable_source_range(minimum: f32, maximum: f32) -> (f32, f32) {
+    if minimum < maximum {
+        return (minimum, maximum);
+    }
+    let padding = minimum.abs().mul_add(0.01, 0.0).max(0.5);
+    (minimum - padding, maximum + padding)
 }
 
 mod color_families {

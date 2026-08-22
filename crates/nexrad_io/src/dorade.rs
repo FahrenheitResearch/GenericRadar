@@ -1014,7 +1014,11 @@ impl SweepParse {
         // their DORADE name as MomentType::Unknown so nothing is dropped.
         let mut taken: BTreeSet<MomentType> = BTreeSet::new();
         for param in &mut self.params {
-            let canonical = canonical_moment(&param.name);
+            let canonical = canonical_dorade_param_moment(
+                &self.instrument,
+                &param.name,
+                param.description.as_deref(),
+            );
             param.moment = match canonical {
                 Some(moment) if !taken.contains(&moment) => {
                     taken.insert(moment.clone());
@@ -1100,6 +1104,7 @@ fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
         // float passthrough and bad gates are already NaN.
         _ => MomentGrid {
             moment: param.moment.clone(),
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,
@@ -1115,6 +1120,7 @@ fn new_grid(param: &ParamState, gate_range: GateRange) -> MomentGrid {
             storage: MomentStorage::F32(Vec::new()),
         },
     };
+    grid.producer_name = Some(param.name.clone());
     grid.producer_description = param.description.clone();
     grid.producer_units = param.units.clone();
     grid
@@ -1147,6 +1153,42 @@ pub(crate) fn canonical_moment(name: &str) -> Option<MomentType> {
             return Some(moment);
         }
         stem = strip_one_affix(stem)?;
+    }
+}
+
+fn canonical_dorade_param_moment(
+    instrument: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Option<MomentType> {
+    canonical_moment(name).or_else(|| {
+        matches!(instrument, "DOW6" | "DOW7")
+            .then(|| exact_dow_description_moment(name, description?))
+            .flatten()
+    })
+}
+
+/// A narrow DOW6/7 exception for producer-described reflectivity fields whose storage
+/// key is not their scientific product name.
+///
+/// In the observed DOW7 sweepfile, `ZH1C`, `ZH2C`, `ZV1C`, and `ZV2C` are the
+/// RDAT/PARM keys while the producer wrote the exact modeled product tokens
+/// `DBZH1`, `DBZH2`, `DBZV1`, and `DBZV2` into the PARM description. DORADE
+/// defines those as separate name and description fields, so treating an exact
+/// description as the semantic name is using producer metadata, not deriving
+/// a moment from the `ZH1C` spelling.
+///
+/// The caller enables this only when RADD says exactly DOW6 or DOW7. There is
+/// deliberately no fuzzy matching and no rule for the `V*` dBm fields: their
+/// descriptions repeat the storage names and do not say which DBMH/DBMV
+/// receiver chain they represent. There is also no merged product in this
+/// file, so none is invented.
+fn exact_dow_description_moment(name: &str, description: &str) -> Option<MomentType> {
+    match (name, description) {
+        ("ZH1C", "DBZH1") | ("ZH2C", "DBZH2") | ("ZV1C", "DBZV1") | ("ZV2C", "DBZV2") => {
+            ResearchMoment::from_producer_name(description).map(MomentType::Research)
+        }
+        _ => None,
     }
 }
 
@@ -1742,6 +1784,98 @@ mod tests {
             Some(MomentType::Reflectivity),
             "a second DOW reflectivity must not collide with the first"
         );
+    }
+
+    #[test]
+    fn only_exact_dow6_or_dow7_descriptions_promote_reflectivity_storage_names() {
+        let h1 = canonical_moment("DBZH1").expect("modeled DOW field");
+        assert_eq!(
+            canonical_dorade_param_moment("DOW7", "ZH1C", Some("DBZH1")),
+            Some(h1.clone())
+        );
+        assert_eq!(
+            canonical_dorade_param_moment("DOW6", "ZH1C", Some("DBZH1")),
+            Some(h1)
+        );
+
+        // A description is not a global alias table. Both the instrument and
+        // the producer token must be exact before it changes field identity.
+        assert_eq!(
+            canonical_dorade_param_moment("UMass-XP", "ZH1C", Some("DBZH1")),
+            None
+        );
+        assert_eq!(
+            canonical_dorade_param_moment("DOW8", "ZH1C", Some("DBZH1")),
+            None
+        );
+        assert_eq!(
+            canonical_dorade_param_moment("DOW7", "ZH1C", Some("dbzh1")),
+            None
+        );
+        assert_eq!(
+            canonical_dorade_param_moment("DOW7", "V1", Some("V1")),
+            None,
+            "a dBm unit does not say which DBMH/DBMV receiver chain V1 is"
+        );
+        assert_eq!(
+            canonical_dorade_param_moment("DOW7", "V1", Some("DBMH1")),
+            None,
+            "the measured rule is the exact reflectivity name/description pair"
+        );
+    }
+
+    /// Manual pin for the public/field sample that exposed the split between
+    /// the DORADE storage name and producer description. Kept ignored because
+    /// the multi-megabyte sweep is not part of the repository.
+    #[ignore = "set DOW_DORADE_SAMPLE to the real DOW7 sweepfile"]
+    #[test]
+    fn real_dow7_reflectivity_descriptions_are_exact_products() {
+        let path = std::env::var("DOW_DORADE_SAMPLE")
+            .expect("set DOW_DORADE_SAMPLE to a real DOW7 DORADE sweep");
+        let bytes = std::fs::read(&path).expect("read DOW_DORADE_SAMPLE");
+        let volume = decode_dorade_sweep(&bytes).expect("decode DOW7 sweep");
+        assert_eq!(volume.site.id, "DOW7");
+        let cut = volume.cuts.first().expect("one decoded sweep");
+
+        for (storage_name, product_name) in [
+            ("ZH1C", "DBZH1"),
+            ("ZH2C", "DBZH2"),
+            ("ZV1C", "DBZV1"),
+            ("ZV2C", "DBZV2"),
+        ] {
+            let moment = canonical_moment(product_name).expect("modeled DOW product");
+            let grid = cut
+                .moments
+                .get(&moment)
+                .unwrap_or_else(|| panic!("{storage_name}/{product_name} was not promoted"));
+            assert_eq!(grid.producer_description.as_deref(), Some(product_name));
+            assert_eq!(grid.producer_units.as_deref(), Some("none"));
+            assert!(
+                !cut.moments
+                    .contains_key(&MomentType::Unknown(storage_name.to_owned())),
+                "the promoted field also survived under a second identity"
+            );
+        }
+
+        for name in [
+            "NCP1", "NCP2", "V1", "V2", "VL1", "VL1_CRR", "VL2", "VL2_CRR", "VS1", "VS1_CRR",
+            "VS2", "VS2_CRR",
+        ] {
+            assert!(
+                cut.moments
+                    .contains_key(&MomentType::Unknown(name.to_owned())),
+                "{name} was inferred into a product the file did not name"
+            );
+        }
+        for absent in [
+            "DBZHM", "DBZVM", "DBMH1", "DBMH2", "DBMHM", "DBMV1", "DBMV2", "DBMVM",
+        ] {
+            let moment = canonical_moment(absent).expect("modeled DOW product");
+            assert!(
+                !cut.moments.contains_key(&moment),
+                "{absent} was fabricated from a field that did not name it"
+            );
+        }
     }
 
     #[test]

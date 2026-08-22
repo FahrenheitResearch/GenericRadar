@@ -2515,6 +2515,7 @@ mod tests {
         let mut state = ProductPickerState::default();
         state.opened(DisplayProduct::Reflectivity);
         let availability = ProductAvailabilityIndex::unrestricted();
+        let source_fields = crate::source_fields::SourceFieldCatalog::default();
         let tables = ColorTableSet::default();
 
         // Several frames: the one the picker opens on, and the steady state
@@ -2535,7 +2536,9 @@ mod tests {
                         ProductPickerInput {
                             state: &mut state,
                             current: DisplayProduct::Reflectivity,
+                            current_source_field: None,
                             availability: &availability,
+                            source_fields: &source_fields,
                             tables: &tables,
                             user_tables: None,
                             show_experimental: false,

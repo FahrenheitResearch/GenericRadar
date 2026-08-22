@@ -1373,6 +1373,19 @@ impl Bench {
         bench
     }
 
+    fn opened_on_source_field(id: radar_core::ProductId, table: &ColorTable) -> Self {
+        let mut state = PaletteEditorState::default();
+        state.set_directory(scratch_dir("source-field-window"));
+        state.edit_source_field(id, table, true, false);
+        let mut bench = Self {
+            context: egui::Context::default(),
+            state,
+        };
+        bench.idle();
+        bench.idle();
+        bench
+    }
+
     fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1496,6 +1509,152 @@ impl Bench {
         }
         painted
     }
+}
+
+#[test]
+fn a_source_field_editor_applies_only_to_its_exact_product_id() {
+    let id = crate::source_fields::product_id("V1");
+    let table = crate::palettes::source_field_table(
+        "V1",
+        -23.07,
+        23.07,
+        &color_tables::ColorTableSet::default(),
+    );
+    let mut bench = Bench::opened_on_source_field(id.clone(), &table);
+    assert_eq!(bench.state.source_target(), Some(&id));
+    let painted = bench.painted();
+    assert!(
+        painted.iter().any(|line| line == "Source field")
+            && painted.iter().any(|line| line == "V1")
+            && painted
+                .iter()
+                .any(|line| line.contains("raw producer numbers")),
+        "the exact target and raw-value rule were not visible: {painted:?}"
+    );
+
+    let outcome = bench.press("Apply only to V1");
+    assert!(outcome.install.is_none());
+    let applied = outcome.source_install.expect("source-specific apply");
+    assert_eq!(applied.id, id);
+    assert_eq!(applied.table, table);
+    assert!(!applied.durable, "an unsaved Apply is session-only");
+    assert!(
+        bench.state.status().expect("Apply status").0.contains(
+            "Session-only preview applied to V1 · undo: CUSTOM → Reset to observed range"
+        )
+    );
+}
+
+#[test]
+fn source_save_then_apply_marks_the_clean_file_backed_binding_durable() {
+    let id = crate::source_fields::product_id("V1");
+    let table = crate::palettes::source_field_table(
+        "V1",
+        -23.07,
+        23.07,
+        &color_tables::ColorTableSet::default(),
+    );
+    let mut bench = Bench::opened_on_source_field(id.clone(), &table);
+
+    let saved = bench.press("Save");
+    assert!(saved.saved.is_some());
+    assert!(saved.source_saved.is_some());
+    let applied = bench
+        .press("Apply only to V1")
+        .source_install
+        .expect("source-specific apply");
+    assert_eq!(applied.id, id);
+    assert_eq!(applied.table, table);
+    assert!(applied.durable, "a clean saved table should persist");
+}
+
+#[test]
+fn source_apply_then_save_promotes_only_that_matching_session_preview() {
+    let id = crate::source_fields::product_id("V1");
+    let table = crate::palettes::source_field_table(
+        "V1",
+        -23.07,
+        23.07,
+        &color_tables::ColorTableSet::default(),
+    );
+    let mut bench = Bench::opened_on_source_field(id.clone(), &table);
+    let applied = bench
+        .press("Apply only to V1")
+        .source_install
+        .expect("source-specific apply");
+    assert!(!applied.durable);
+
+    let mut bindings = crate::source_field_palettes::SourceFieldPaletteOverrides::default();
+    assert!(bindings.apply_session(applied.id, applied.table));
+    assert!(bindings.capture().is_empty());
+
+    let saved = bench.press("Save");
+    let (saved_id, saved_table) = saved.source_saved.expect("source save identity");
+    assert_eq!(saved_id, id);
+    assert!(bindings.promote_matching_saved(&saved_id, &saved_table));
+    assert!(bindings.capture().contains_key(&id.0));
+}
+
+#[test]
+fn automatic_or_session_source_edit_does_not_reopen_a_stale_same_named_palette() {
+    let directory = scratch_dir("source-reset-stays-reset");
+    std::fs::write(
+        directory.join("source-field-v1.pal"),
+        "Name: Source field V1\nProduct: Generic\nMode: continuous\nColor4: -100 255 0 0 255\nColor4: 100 0 0 255 255\n",
+    )
+    .expect("stale saved override");
+    let automatic = crate::palettes::source_field_table(
+        "V1",
+        -23.07,
+        23.07,
+        &color_tables::ColorTableSet::default(),
+    );
+    let mut state = PaletteEditorState::default();
+    state.set_directory(directory.clone());
+
+    state.edit_source_field(
+        crate::source_fields::product_id("V1"),
+        &automatic,
+        true,
+        false,
+    );
+
+    let opened = state
+        .table()
+        .expect("automatic source table")
+        .to_color_table()
+        .expect("builds");
+    assert_eq!(opened.stops().first().expect("first").value, -23.07);
+    assert_eq!(opened.stops().last().expect("last").value, 23.07);
+    assert!(
+        state.file().is_none(),
+        "Reset must not adopt the stale file"
+    );
+
+    let session = crate::palettes::source_field_table(
+        "V1",
+        -12.0,
+        12.0,
+        &color_tables::ColorTableSet::default(),
+    );
+    state.edit_source_field(
+        crate::source_fields::product_id("V1"),
+        &session,
+        false,
+        false,
+    );
+    let opened = state
+        .table()
+        .expect("session source table")
+        .to_color_table()
+        .expect("builds");
+    assert_eq!(opened.stops().first().expect("first").value, -12.0);
+    assert_eq!(opened.stops().last().expect("last").value, 12.0);
+    assert!(
+        state.file().is_none(),
+        "a session preview must not be replaced by the older file"
+    );
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 fn collect_text(shape: &egui::Shape, into: &mut Vec<String>) {

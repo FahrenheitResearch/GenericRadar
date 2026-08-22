@@ -937,6 +937,7 @@ fn build_moment_grids(
             let values: Vec<f32> = estimates.iter().map(extract).collect();
             let grid = MomentGrid {
                 moment: moment.clone(),
+                producer_name: None,
                 producer_description: None,
                 producer_units: None,
                 gate_range: plan.gate_range.clone(),

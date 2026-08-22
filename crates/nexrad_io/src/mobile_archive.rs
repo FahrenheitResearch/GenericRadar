@@ -6,8 +6,10 @@
 //! several radars in one archive (a Goodland deployment zip carries
 //! `DORADE/DOW7/...` next to `DORADE/COW2/...`). This module discovers radar
 //! members, groups DORADE sweeps into volume scans, and decodes everything
-//! into [`radar_core::RadarVolume`]s. `.msg31`/Archive II members (either tape identifier) are routed back
-//! through this crate's Level II decoder.
+//! into [`radar_core::RadarVolume`]s. `.msg31`/Archive II members (either tape
+//! identifier) are routed back through this crate's Level II decoder, then
+//! joined only when [`crate::sweep_assembly`] proves a shared internal volume
+//! identity.
 //!
 //! Sibling-directory grouping for loose (non-zip) sweepfiles lives here too:
 //! opening one `swp.*` file pulls in the rest of its ascending run from the
@@ -54,6 +56,11 @@
 //! is the only convention that holds across radars. A new run also starts
 //! after a 15-minute gap (deployment pause).
 //!
+//! One-cut Archive II exports have a stronger source-specific fact: their
+//! internal three-digit volume-header sequence. They are grouped per radar
+//! only when that sequence, exact recorded position, UTC day and VCP all match
+//! and radial time is contiguous. A `vNNN` filename is never used as a key.
+//!
 //! Ported from the Fahrenheit Research BowEcho archive reader; the zip layer
 //! is new, because that one used a zip crate and this workspace does not
 //! take the dependency.
@@ -92,6 +99,10 @@ use rayon::prelude::*;
 use crate::dorade::{
     append_dorade_sweep, decode_dorade_sweep, empty_dorade_volume, finalize_dorade_volume,
     looks_like_dorade_bytes, looks_like_dorade_name, peek_dorade_sweep,
+};
+use crate::sweep_assembly::{
+    ProvenSweepMembership, SweepAssemblyClassification, SweepAssemblyDecision, append_proven_sweep,
+    classify_archive_sweep, decide_adjacent_sweeps,
 };
 use crate::{NexradError, Result, decode_volume_from_bytes};
 
@@ -982,20 +993,24 @@ fn decode_members(
     // deployment archive carrying a variable-framed `.msg31` decodes it in
     // full rather than stopping after the first radial. Pinned by
     // `a_variable_framed_msg31_member_decodes_through_the_framing_latch`.
-    let level2_volumes: Vec<MobileVolume> = level2_members
+    let level2_volumes: Vec<(MobileVolume, SweepAssemblyClassification)> = level2_members
         .into_par_iter()
         .map(|member| {
             let mut volume = decode_volume_from_bytes(&member.bytes)
                 .map_err(|err| with_member(&member.name, err))?;
+            let assembly = classify_archive_sweep(&member.bytes, &volume);
             volume.metadata.source_path = Some(source_path(&member.name));
-            Ok(MobileVolume {
-                volume,
-                member_label: member.name,
-                member_count: 1,
-            })
+            Ok((
+                MobileVolume {
+                    volume,
+                    member_label: member.name,
+                    member_count: 1,
+                },
+                assembly,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
-    volumes.extend(level2_volumes);
+    volumes.extend(assemble_level2_sweeps(level2_volumes));
 
     volumes.sort_by(|left, right| {
         left.volume
@@ -1004,6 +1019,64 @@ fn decode_members(
             .then_with(|| left.member_label.cmp(&right.member_label))
     });
     Ok(volumes)
+}
+
+/// Group decoded Archive II members per radar. Other-radar members may be
+/// interleaved in archive-time order, so each radar gets its own ordered walk
+/// before the completed volumes are merged back into the global timeline.
+fn assemble_level2_sweeps(
+    decoded: Vec<(MobileVolume, SweepAssemblyClassification)>,
+) -> Vec<MobileVolume> {
+    let mut per_radar: BTreeMap<String, Vec<(MobileVolume, SweepAssemblyClassification)>> =
+        BTreeMap::new();
+    for member in decoded {
+        per_radar
+            .entry(member.0.volume.site.id.trim().to_ascii_uppercase())
+            .or_default()
+            .push(member);
+    }
+
+    let mut assembled = Vec::new();
+    for mut members in per_radar.into_values() {
+        members.sort_by(|left, right| {
+            left.0
+                .volume
+                .volume_time
+                .cmp(&right.0.volume.volume_time)
+                .then_with(|| left.0.member_label.cmp(&right.0.member_label))
+        });
+        let mut pending: Option<(MobileVolume, Option<ProvenSweepMembership>)> = None;
+        for (member, classification) in members {
+            let evidence = match classification {
+                SweepAssemblyClassification::Proven(evidence) => Some(evidence),
+                SweepAssemblyClassification::Refused(_) => None,
+            };
+            let can_append = pending
+                .as_ref()
+                .and_then(|(_, current)| current.as_ref())
+                .zip(evidence.as_ref())
+                .is_some_and(|(current, next)| {
+                    decide_adjacent_sweeps(current, next) == SweepAssemblyDecision::ProvenSameVolume
+                });
+            if can_append {
+                let (target, current) = pending.as_mut().expect("checked pending above");
+                let current = current.as_mut().expect("checked evidence above");
+                let next = evidence.expect("checked evidence above");
+                append_proven_sweep(&mut target.volume, current, member.volume, next)
+                    .expect("a proven adjacent sweep remains proven while appending");
+                target.member_count += member.member_count;
+                continue;
+            }
+
+            if let Some((complete, _)) = pending.replace((member, evidence)) {
+                assembled.push(complete);
+            }
+        }
+        if let Some((complete, _)) = pending {
+            assembled.push(complete);
+        }
+    }
+    assembled
 }
 
 fn with_member(name: &str, err: NexradError) -> NexradError {
@@ -1249,6 +1322,59 @@ mod tests {
         assert_eq!(
             volumes[0].volume.metadata.decoded_radial_count, loose.metadata.decoded_radial_count,
             "the archive member and the loose file are the same decode"
+        );
+    }
+
+    fn one_radial_export(sequence: &[u8; 3], collect_ms: u32) -> Vec<u8> {
+        let mut export = crate::tests::synthetic_variable_framed_archive(1);
+        export[9..12].copy_from_slice(sequence);
+        export[16..20].copy_from_slice(&collect_ms.to_be_bytes());
+        // Volume header (24) + control word (12) + message header (16), then
+        // collection milliseconds at bytes 4..8 of the Message 31 header.
+        export[56..60].copy_from_slice(&collect_ms.to_be_bytes());
+        export
+    }
+
+    #[test]
+    fn msg31_members_group_by_internal_volume_identity() {
+        let first = one_radial_export(b"210", 79_691_000);
+        let second = one_radial_export(b"210", 79_700_000);
+        let next_volume = one_radial_export(b"211", 79_709_000);
+        let archive = build_zip(&[
+            ("DOW7/first.msg31", first, METHOD_STORE),
+            ("DOW7/second.msg31", second, METHOD_STORE),
+            ("DOW7/next.msg31", next_volume, METHOD_STORE),
+        ]);
+
+        let volumes = decode_deployment_zip(&archive).expect("archive decodes");
+
+        assert_eq!(volumes.len(), 2);
+        let assembled = volumes
+            .iter()
+            .find(|volume| volume.member_count == 2)
+            .expect("the internal 210 sequence forms one logical volume");
+        assert_eq!(assembled.volume.cuts.len(), 2);
+        assert_eq!(assembled.volume.metadata.decoded_radial_count, 2);
+        assert_eq!(assembled.member_label, "DOW7/first.msg31");
+    }
+
+    #[test]
+    fn refused_msg31_member_is_a_hard_group_boundary() {
+        let first = one_radial_export(b"210", 79_691_000);
+        let refused = one_radial_export(b"x10", 79_700_000);
+        let third = one_radial_export(b"210", 79_709_000);
+        let archive = build_zip(&[
+            ("DOW7/first.msg31", first, METHOD_STORE),
+            ("DOW7/refused.msg31", refused, METHOD_STORE),
+            ("DOW7/third.msg31", third, METHOD_STORE),
+        ]);
+
+        let volumes = decode_deployment_zip(&archive).expect("archive decodes");
+
+        assert_eq!(volumes.len(), 3);
+        assert!(
+            volumes.iter().all(|volume| volume.member_count == 1),
+            "members on either side of refused evidence must not bridge across it"
         );
     }
 

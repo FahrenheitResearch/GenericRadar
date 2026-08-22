@@ -74,6 +74,7 @@ pub fn smooth_moment_grid(grid: &MomentGrid) -> MomentGrid {
     }
     MomentGrid {
         moment: grid.moment.clone(),
+        producer_name: grid.producer_name.clone(),
         producer_description: grid.producer_description.clone(),
         producer_units: grid.producer_units.clone(),
         gate_range: grid.gate_range.clone(),
@@ -97,6 +98,7 @@ mod tests {
     fn grid(rows: usize, gates: usize, data: Vec<f32>) -> MomentGrid {
         MomentGrid {
             moment: MomentType::Reflectivity,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range: GateRange {

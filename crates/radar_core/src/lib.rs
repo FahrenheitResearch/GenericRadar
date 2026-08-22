@@ -493,6 +493,12 @@ pub fn format_snr_threshold_db(threshold_db: f32) -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MomentGrid {
     pub moment: MomentType,
+    /// Exact field key used by the source container, when it differs from (or
+    /// is more specific than) the canonical moment identity. DORADE, for
+    /// example, can store `ZH1C` while its PARM description names `DBZH1`.
+    /// Kept separately so canonical access never erases native access.
+    #[serde(default)]
+    pub producer_name: Option<String>,
     /// Acquisition-system description attached to this exact field, when its
     /// container supplies one (for example DORADE PARM bytes 16..56).
     #[serde(default)]
@@ -527,6 +533,7 @@ impl MomentGrid {
     ) -> Self {
         Self {
             moment,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,
@@ -551,6 +558,7 @@ impl MomentGrid {
     ) -> Self {
         Self {
             moment,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,

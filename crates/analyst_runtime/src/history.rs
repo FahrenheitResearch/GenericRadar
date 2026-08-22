@@ -89,20 +89,29 @@ pub struct HistoryPolicy {
 }
 
 impl HistoryPolicy {
+    /// Build a history policy. Zero means unlimited for that dimension.
+    ///
+    /// This is intentionally literal rather than replacing zero with a small
+    /// positive value: local research playlists may contain thousands of
+    /// operator-selected volumes, and an unstated eviction ceiling is data
+    /// loss from the timeline even when the source files remain on disk.
     pub const fn new(max_frames: usize, max_estimated_bytes: usize) -> Self {
         Self {
-            max_frames: if max_frames == 0 { 1 } else { max_frames },
-            max_estimated_bytes: if max_estimated_bytes == 0 {
-                1
-            } else {
-                max_estimated_bytes
-            },
+            max_frames,
+            max_estimated_bytes,
         }
+    }
+
+    pub const fn unlimited() -> Self {
+        Self::new(0, 0)
     }
 }
 
 impl Default for HistoryPolicy {
     fn default() -> Self {
+        // Safe for an unattended live feed. Operator-selected local sessions
+        // explicitly install `HistoryPolicy::unlimited()` unless the settings
+        // store carries a positive limit.
         Self::new(DEFAULT_HISTORY_FRAMES, DEFAULT_HISTORY_BYTES)
     }
 }
@@ -120,11 +129,14 @@ pub struct InstallReport {
     pub evicted: Vec<FrameIdentity>,
 }
 
-/// Chronological, byte-budgeted volume history.
+/// Chronological volume history with optional operator-configured ceilings.
 ///
 /// The selected frame is protected from ordinary eviction while another frame
 /// can be removed. A single frame larger than the byte budget is retained so
-/// loading a large volume never produces an empty display.
+/// loading a large volume never produces an empty display. Both policy values
+/// use zero as Unlimited. The runtime's general default remains bounded for an
+/// unattended live feed; the workstation explicitly chooses Unlimited for a
+/// local operator-selected session.
 pub struct VolumeHistory {
     frames: VecDeque<VolumeFrame>,
     selected: Option<usize>,
@@ -247,6 +259,38 @@ impl VolumeHistory {
         }
     }
 
+    /// Insert an independently admitted local-playlist frame even when its
+    /// radar/time identity matches another frame already retained.
+    ///
+    /// Live previews and growing live volumes must continue to use
+    /// [`Self::install`] so a newer stage replaces the earlier one. This mode
+    /// exists for different operator-selected source paths: equal timestamps
+    /// are common in research exports and are not proof that one file may be
+    /// discarded. Equal identities remain adjacent in their input order.
+    pub fn install_distinct(&mut self, frame: VolumeFrame) -> InstallReport {
+        let selected_before = self.selected;
+        let insert_at = self
+            .frames
+            .iter()
+            .position(|existing| existing.identity > frame.identity)
+            .unwrap_or(self.frames.len());
+        self.estimated_bytes = self.estimated_bytes.saturating_add(frame.estimated_bytes);
+        self.frames.insert(insert_at, frame);
+
+        if self.follow_live {
+            self.selected = self.frames.len().checked_sub(1);
+        } else if let Some(selected) = selected_before {
+            self.selected = Some(selected + usize::from(insert_at <= selected));
+        } else {
+            self.selected = self.frames.len().checked_sub(1);
+        }
+
+        InstallReport {
+            disposition: InstallDisposition::Inserted,
+            evicted: self.enforce_policy(),
+        }
+    }
+
     pub fn set_policy(&mut self, policy: HistoryPolicy) -> Vec<FrameIdentity> {
         self.policy = HistoryPolicy::new(policy.max_frames, policy.max_estimated_bytes);
         self.enforce_policy()
@@ -305,8 +349,9 @@ impl VolumeHistory {
     fn enforce_policy(&mut self) -> Vec<FrameIdentity> {
         let mut evicted = Vec::new();
         while self.frames.len() > 1
-            && (self.frames.len() > self.policy.max_frames
-                || self.estimated_bytes > self.policy.max_estimated_bytes)
+            && ((self.policy.max_frames > 0 && self.frames.len() > self.policy.max_frames)
+                || (self.policy.max_estimated_bytes > 0
+                    && self.estimated_bytes > self.policy.max_estimated_bytes))
         {
             let selected = self.selected.unwrap_or(self.frames.len() - 1);
             let remove_at = (0..self.frames.len())
@@ -502,6 +547,72 @@ mod tests {
         history.install(frame(0, FrameStage::Complete, 100));
         assert_eq!(history.len(), 1);
         assert_eq!(history.estimated_bytes(), 100);
+    }
+
+    #[test]
+    fn unlimited_history_retains_1075_operator_selected_frames() {
+        let mut history = VolumeHistory::new(HistoryPolicy::unlimited());
+        let base = Utc.with_ymd_and_hms(2026, 5, 20, 0, 0, 0).unwrap();
+        for index in 0..1_075 {
+            let mut volume = (*volume(0, 16)).clone();
+            volume.volume_time = base + chrono::TimeDelta::seconds(index);
+            let report = history.install(
+                VolumeFrame::new(
+                    Arc::new(volume),
+                    FrameOrigin::Local,
+                    FrameStage::Complete,
+                    format!("selected-{index:04}"),
+                )
+                .with_estimated_bytes(10),
+            );
+            assert!(
+                report.evicted.is_empty(),
+                "frame {index} was silently evicted"
+            );
+        }
+
+        assert_eq!(history.policy(), HistoryPolicy::unlimited());
+        assert_eq!(history.len(), 1_075);
+        assert_eq!(history.estimated_bytes(), 10_750);
+    }
+
+    #[test]
+    fn either_positive_limit_remains_independently_optional() {
+        let mut frame_limited = VolumeHistory::new(HistoryPolicy::new(2, 0));
+        frame_limited.install(frame(0, FrameStage::Complete, 100));
+        frame_limited.install(frame(10, FrameStage::Complete, 100));
+        let frame_report = frame_limited.install(frame(20, FrameStage::Complete, 100));
+        assert_eq!(frame_report.evicted.len(), 1);
+        assert_eq!(frame_limited.len(), 2);
+
+        let mut byte_limited = VolumeHistory::new(HistoryPolicy::new(0, 25));
+        byte_limited.install(frame(0, FrameStage::Complete, 10));
+        byte_limited.install(frame(10, FrameStage::Complete, 10));
+        let byte_report = byte_limited.install(frame(20, FrameStage::Complete, 10));
+        assert_eq!(byte_report.evicted.len(), 1);
+        assert_eq!(byte_limited.len(), 2);
+    }
+
+    #[test]
+    fn distinct_local_sources_with_the_same_site_and_time_are_both_retained() {
+        let mut history = VolumeHistory::new(HistoryPolicy::unlimited());
+        let mut first = frame(0, FrameStage::Complete, 10);
+        first.origin = FrameOrigin::Local;
+        let mut second = frame(0, FrameStage::Complete, 10);
+        second.origin = FrameOrigin::Local;
+        second.source_label = "different-selected-path".to_owned();
+
+        assert_eq!(
+            history.install_distinct(first).disposition,
+            InstallDisposition::Inserted
+        );
+        assert_eq!(
+            history.install_distinct(second).disposition,
+            InstallDisposition::Inserted
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.frames()[0].source_label, "test");
+        assert_eq!(history.frames()[1].source_label, "different-selected-path");
     }
 
     #[test]

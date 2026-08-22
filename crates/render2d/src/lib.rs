@@ -26,8 +26,8 @@ use std::path::Path;
 pub use color_tables::{ColorTable, ColorTableFamily, ColorTableSet};
 pub use gate_filter::{
     CompanionSampler, CompanionSweep, GateFilter, GateFilterMask, GateFilterOutcome,
-    GateFilterReport, apply_gate_filter, evaluate_gate_filter, masked_grid,
-    resolve_companion_sweep,
+    GateFilterReason, GateFilterReasons, GateFilterReport, apply_gate_filter, evaluate_gate_filter,
+    masked_grid, resolve_companion_sweep,
 };
 use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{InterpolatedGrid, UpsampleFactors, upsample_moment_grid};
@@ -3820,6 +3820,7 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
 
     MomentGrid {
         moment: MomentType::Velocity,
+        producer_name: None,
         producer_description: source.producer_description.clone(),
         producer_units: source.producer_units.clone(),
         gate_range: source.gate_range.clone(),
@@ -4732,6 +4733,7 @@ mod tests {
         });
         let grid = MomentGrid {
             moment: MomentType::Velocity,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,
@@ -5645,6 +5647,7 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Velocity,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,

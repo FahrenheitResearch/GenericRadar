@@ -389,6 +389,7 @@ pub fn upsample_moment_grid(cut: &ElevationCut, grid: &MomentGrid) -> Option<Int
     Some(InterpolatedGrid {
         grid: MomentGrid {
             moment: grid.moment.clone(),
+            producer_name: grid.producer_name.clone(),
             producer_description: grid.producer_description.clone(),
             producer_units: grid.producer_units.clone(),
             gate_range,
@@ -447,6 +448,7 @@ mod tests {
         };
         let grid = MomentGrid {
             moment,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,
@@ -1728,6 +1730,7 @@ mod real_data_tests {
             }
             let coarse = MomentGrid {
                 moment: MomentType::Reflectivity,
+                producer_name: None,
                 producer_description: None,
                 producer_units: None,
                 gate_range: GateRange {

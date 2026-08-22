@@ -48,7 +48,8 @@ pub mod transfer;
 pub mod value;
 
 pub use document::{
-    PaletteChoice, PaneSnapshot, SettingsDocument, WindowSnapshot, WorkspaceSnapshot,
+    PaletteChoice, PaneSnapshot, SettingsDocument, SourceFieldPaletteChoice, WindowSnapshot,
+    WorkspaceSnapshot,
 };
 pub use paths::{
     app_cache_root, app_config_root, default_settings_file, is_fallback_root, profiles_dir,

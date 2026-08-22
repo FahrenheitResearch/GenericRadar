@@ -36,12 +36,15 @@ use render2d::color_family_for_moment;
 use crate::product::DisplayProduct;
 use crate::product_availability::{ProductAvailabilityIndex, ProductEntry};
 use crate::settings_ui::PaletteOfferCache;
+use crate::source_fields::{SourceField, SourceFieldCatalog, SourceFieldMetadata};
 
 /// Wide enough for a display name and its range on one line without wrapping.
 const PICKER_WIDTH: f32 = 468.0;
 /// Roughly ten rows. Past that the list scrolls rather than growing off-screen.
 const LIST_MAX_HEIGHT: f32 = 340.0;
 const ROW_HEIGHT: f32 = 34.0;
+const SOURCE_FIELD_NAME_HEIGHT: f32 = 25.0;
+const SOURCE_FIELD_METADATA_HEIGHT: f32 = 17.0;
 const GROUP_HEADER_HEIGHT: f32 = 26.0;
 const PALETTE_ROW_HEIGHT: f32 = 26.0;
 const SWATCH_WIDTH: f32 = 150.0;
@@ -153,9 +156,14 @@ pub struct ProductPickerInput<'a> {
     pub state: &'a mut ProductPickerState,
     /// The product the active pane is drawing now.
     pub current: DisplayProduct,
+    /// Exact producer name when the pane is drawing a native source field.
+    pub current_source_field: Option<&'a str>,
     /// What the volume on screen can draw. Build it once per volume with
     /// [`ProductAvailabilityIndex::from_optional_capabilities`].
     pub availability: &'a ProductAvailabilityIndex,
+    /// Exact producer-native fields preserved by this volume's decoder.
+    /// Some may also have a separately selectable canonical interpretation.
+    pub source_fields: &'a SourceFieldCatalog,
     /// The colour tables in force, so the palette section can mark the one
     /// already installed for the family.
     pub tables: &'a ColorTableSet,
@@ -195,6 +203,8 @@ pub struct PaletteEditRequest {
 pub struct ProductPickerOutcome {
     /// A product was chosen. Never a product the volume cannot draw.
     pub product: Option<DisplayProduct>,
+    /// A producer-native field was chosen by its exact source key.
+    pub source_field: Option<String>,
     /// A palette was chosen for the focused product's family.
     pub palette: Option<PaletteSelection>,
     /// A palette row asked to be opened in the colour table editor.
@@ -275,6 +285,32 @@ fn matches_filter(descriptor: &ProductDescriptor, needle: &str) -> bool {
         || hit(descriptor.short_name)
         || hit(descriptor.display_name)
         || descriptor.aliases.iter().any(|alias| hit(alias))
+}
+
+/// A source field is searchable by every producer-supplied string we show.
+/// The match is forgiving; the stored and displayed strings remain exact.
+fn source_field_matches_filter(field: &SourceField, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hit = |text: &str| normalized(text).contains(needle);
+    hit(&field.producer_name)
+        || field.metadata.iter().any(|metadata| {
+            metadata.producer_description.as_deref().is_some_and(hit)
+                || metadata.producer_units.as_deref().is_some_and(hit)
+        })
+}
+
+fn visible_source_fields<'a>(
+    filter: &str,
+    catalog: &'a SourceFieldCatalog,
+) -> Vec<&'a SourceField> {
+    let needle = normalized(filter.trim());
+    catalog
+        .fields()
+        .iter()
+        .filter(|field| source_field_matches_filter(field, &needle))
+        .collect()
 }
 
 /// The rows to draw, in registry group order.
@@ -375,7 +411,9 @@ pub fn draw_product_picker(
     let ProductPickerInput {
         state,
         current,
+        current_source_field,
         availability,
+        source_fields,
         tables,
         user_tables,
         show_experimental,
@@ -403,6 +441,7 @@ pub fn draw_product_picker(
             // and reading the field afterwards leaves Enter choosing whatever
             // the previous frame's filter had focused.
             let entries = visible_entries(&state.filter, availability, show_experimental);
+            let source_fields = visible_source_fields(&state.filter, source_fields);
             // A filter that hides the focused row, or a group folded shut over
             // it, must not leave Enter pointing at something the analyst
             // cannot see.
@@ -437,7 +476,15 @@ pub fn draw_product_picker(
             }
 
             ui.add_space(6.0);
-            list(ui, state, &entries, current, &mut outcome);
+            list(
+                ui,
+                state,
+                &entries,
+                &source_fields,
+                current,
+                current_source_field,
+                &mut outcome,
+            );
             ui.add_space(6.0);
             separator(ui);
             ui.add_space(6.0);
@@ -491,7 +538,7 @@ fn filter_field(ui: &mut egui::Ui, state: &mut ProductPickerState) {
         egui::TextEdit::singleline(&mut state.filter)
             .id(id)
             .desired_width(f32::INFINITY)
-            .hint_text("filter: id, name or alias")
+            .hint_text("filter: id, name, alias or source field")
             .margin(egui::Margin::symmetric(8, 5)),
     );
 }
@@ -500,10 +547,12 @@ fn list(
     ui: &mut egui::Ui,
     state: &mut ProductPickerState,
     entries: &[ProductEntry<'_>],
+    source_fields: &[&SourceField],
     current: DisplayProduct,
+    current_source_field: Option<&str>,
     outcome: &mut ProductPickerOutcome,
 ) {
-    if entries.is_empty() {
+    if entries.is_empty() && source_fields.is_empty() {
         // Cleared here too: a request to scroll that outlives the row it was
         // made for would jump the list the next time anything matches.
         state.scroll_to_focus = false;
@@ -523,6 +572,7 @@ fn list(
     let focus = state.focus;
     let mut toggled_group = None;
     let mut chosen = None;
+    let mut chosen_source = None;
     let mut scroll_to = None;
 
     egui::ScrollArea::vertical()
@@ -547,7 +597,12 @@ fn list(
                     continue;
                 }
                 for entry in members {
-                    let selected = entry.product == current;
+                    // A namespaced source-field id falls back to REF when it
+                    // passes through the fixed DisplayProduct enum. That is a
+                    // routing fallback, not a second selection: highlighting
+                    // REF beside the selected native row claims two active
+                    // products at once.
+                    let selected = current_source_field.is_none() && entry.product == current;
                     let focused = Some(entry.product) == focus;
                     let response = product_row(ui, entry, selected, focused);
                     if focused && state.scroll_to_focus {
@@ -555,6 +610,15 @@ fn list(
                     }
                     if response.clicked() && entry.is_available() {
                         chosen = Some(entry.product);
+                    }
+                }
+            }
+            if !source_fields.is_empty() {
+                source_field_header(ui, source_fields.len());
+                for field in source_fields {
+                    let selected = current_source_field == Some(field.producer_name.as_str());
+                    if source_field_row(ui, field, selected).clicked() {
+                        chosen_source = Some(field.producer_name.clone());
                     }
                 }
             }
@@ -575,6 +639,187 @@ fn list(
         state.focus = Some(product);
         outcome.product = Some(product);
         outcome.dismissed = true;
+    }
+    if let Some(producer_name) = chosen_source {
+        outcome.source_field = Some(producer_name);
+        outcome.dismissed = true;
+    }
+}
+
+/// The producer-native catalog is deliberately separate from the fixed DOW
+/// dual-frequency group. These fields came from this file; they are not a
+/// claim that every research radar implements one universal product suite.
+fn source_field_header(ui: &mut egui::Ui, count: usize) -> egui::Response {
+    let width = ui.available_width();
+    let (_, rect) = ui.allocate_space(egui::vec2(width, GROUP_HEADER_HEIGHT));
+    let response = ui.interact(
+        rect,
+        egui::Id::new("radar-product-picker-source-fields"),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.text(
+        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "SOURCE FIELDS FROM THIS FILE",
+        egui::FontId::proportional(11.0),
+        TEXT_DIM,
+    );
+    painter.text(
+        rect.right_center() - egui::vec2(10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        format!("{count} preserved · selectable"),
+        egui::FontId::proportional(10.5),
+        WARNING,
+    );
+    response.on_hover_text(
+        "Exact fields preserved by this file's decoder. Names, descriptions and unit tokens are \
+         producer metadata, not validated units, aliases or inferences. A selected field uses a generic source \
+         palette stretched only across its observed finite values. The modeled DOW DBMH*/DBZH* \
+         suite remains a separate group above.",
+    )
+}
+
+fn source_field_row(ui: &mut egui::Ui, field: &SourceField, selected: bool) -> egui::Response {
+    let detail_rows = field.metadata.len().max(1) as f32 + 1.0;
+    let height = SOURCE_FIELD_NAME_HEIGHT + detail_rows * SOURCE_FIELD_METADATA_HEIGHT;
+    let width = ui.available_width();
+    let (_, rect) = ui.allocate_space(egui::vec2(width, height));
+    let response = ui.interact(
+        rect,
+        source_field_row_id(&field.producer_name),
+        egui::Sense::CLICK,
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        4.0,
+        if selected {
+            ROW_SELECTED
+        } else if response.hovered() {
+            ROW_HOVER
+        } else {
+            BACKGROUND
+        },
+    );
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height())),
+            2.0,
+            ACCENT,
+        );
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(12.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        &field.producer_name,
+        egui::FontId::monospace(11.0),
+        ACCENT,
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-10.0, 6.0),
+        egui::Align2::RIGHT_TOP,
+        "SOURCE FIELD · GENERIC DISPLAY",
+        egui::FontId::proportional(10.0),
+        WARNING,
+    );
+    for (index, metadata) in field.metadata.iter().enumerate() {
+        painter.text(
+            rect.left_top()
+                + egui::vec2(
+                    24.0,
+                    SOURCE_FIELD_NAME_HEIGHT + index as f32 * SOURCE_FIELD_METADATA_HEIGHT,
+                ),
+            egui::Align2::LEFT_TOP,
+            source_field_metadata_line(metadata),
+            egui::FontId::proportional(10.5),
+            TEXT_DIM,
+        );
+    }
+    painter.text(
+        rect.left_top()
+            + egui::vec2(
+                24.0,
+                SOURCE_FIELD_NAME_HEIGHT
+                    + field.metadata.len().max(1) as f32 * SOURCE_FIELD_METADATA_HEIGHT,
+            ),
+        egui::Align2::LEFT_TOP,
+        source_field_value_line(field),
+        egui::FontId::proportional(10.5),
+        WARNING.gamma_multiply(0.9),
+    );
+    response.on_hover_text(source_field_hover(field))
+}
+
+fn source_field_metadata_line(metadata: &SourceFieldMetadata) -> String {
+    format!(
+        "description: {} · producer unit token: {} · {}",
+        metadata
+            .producer_description
+            .as_deref()
+            .unwrap_or("not provided"),
+        metadata.producer_units.as_deref().unwrap_or("not provided"),
+        cut_summary(&metadata.cut_indices)
+    )
+}
+
+fn cut_summary(cut_indices: &[usize]) -> String {
+    let cuts = cut_indices
+        .iter()
+        .map(|index| (index + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if cut_indices.len() == 1 {
+        format!("cut {cuts}")
+    } else {
+        format!("cuts {cuts}")
+    }
+}
+
+fn source_field_hover(field: &SourceField) -> String {
+    let mut lines = vec![
+        field.producer_name.clone(),
+        "producer-native field · exact container identity".to_owned(),
+    ];
+    lines.extend(field.metadata.iter().map(source_field_metadata_line));
+    lines.extend(field.occurrences.iter().map(|occurrence| {
+        format!(
+            "cut {} · {} finite gates · observed {}",
+            occurrence.cut_index + 1,
+            occurrence.finite_count,
+            observed_range(occurrence.finite_min, occurrence.finite_max)
+        )
+    }));
+    lines.push("generic source display · no meaning or units inferred".to_owned());
+    lines.join("\n")
+}
+
+fn source_field_value_line(field: &SourceField) -> String {
+    let finite_count: usize = field
+        .occurrences
+        .iter()
+        .map(|occurrence| occurrence.finite_count)
+        .sum();
+    let minimum = field
+        .occurrences
+        .iter()
+        .filter_map(|occurrence| occurrence.finite_min)
+        .min_by(f32::total_cmp);
+    let maximum = field
+        .occurrences
+        .iter()
+        .filter_map(|occurrence| occurrence.finite_max)
+        .max_by(f32::total_cmp);
+    format!(
+        "observed: {} · {finite_count} finite gates · generic palette",
+        observed_range(minimum, maximum)
+    )
+}
+
+fn observed_range(minimum: Option<f32>, maximum: Option<f32>) -> String {
+    match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) => format!("{minimum:.3} to {maximum:.3}"),
+        _ => "no finite values".to_owned(),
     }
 }
 
@@ -629,7 +874,16 @@ fn group_header(
             WARNING.gamma_multiply(0.8),
         );
     }
-    response
+    if group == ProductGroup::DowDualFrequency {
+        response.on_hover_text(
+            "Raw DOW6/7 dual-frequency receiver-chain products. These rows require the exact \
+             DBMH1/DBMH2/DBMHM, DBMV1/DBMV2/DBMVM, DBZH1/DBZH2/DBZHM, or \
+             DBZV1/DBZV2/DBZVM fields; ordinary DOW Message 31 REF/VEL/ZDR/RHO/PHI moments \
+             remain in their standard product groups.",
+        )
+    } else {
+        response
+    }
 }
 
 fn product_row(
@@ -978,6 +1232,10 @@ fn row_id(product: DisplayProduct) -> egui::Id {
     egui::Id::new(("radar-product-picker-row", product.id()))
 }
 
+fn source_field_row_id(producer_name: &str) -> egui::Id {
+    egui::Id::new(("radar-product-picker-source-field", producer_name))
+}
+
 fn group_id(group: ProductGroup) -> egui::Id {
     egui::Id::new(("radar-product-picker-group", group.label()))
 }
@@ -1011,7 +1269,7 @@ mod tests {
     use product_engine::{
         CutCapabilities, ProductAvailability, UnavailableReason, VolumeCapabilities,
     };
-    use radar_core::MomentType;
+    use radar_core::{GateRange, MomentGrid, MomentType, RadarSite, RadarVolume};
     use std::collections::BTreeMap;
 
     fn ids(entries: &[ProductEntry<'_>]) -> Vec<&'static str> {
@@ -1032,7 +1290,62 @@ mod tests {
         visible_entries(filter, availability, false)
     }
 
+    fn one_source_field() -> SourceFieldCatalog {
+        let mut volume = RadarVolume::new(RadarSite::new("DOW7"), chrono::Utc::now());
+        let cut = volume.push_cut(0.5, Some(1));
+        let moment = MomentType::Unknown("NVM".to_owned());
+        let mut grid = MomentGrid::new_u16(
+            moment.clone(),
+            GateRange {
+                first_gate_m: 100,
+                gate_spacing_m: 75,
+                gate_count: 800,
+            },
+            100.0,
+            32768.0,
+            Some(0),
+            None,
+        );
+        grid.producer_description = Some("Normalized velocity metric".to_owned());
+        grid.producer_units = Some("arb".to_owned());
+        grid.producer_name = Some("NVM".to_owned());
+        cut.moments.insert(moment, grid);
+        SourceFieldCatalog::from_volume(&volume)
+    }
+
     // --- the catalog ------------------------------------------------------
+
+    #[test]
+    fn producer_native_fields_are_visible_with_exact_metadata() {
+        let mut picker = Harness::open(DisplayProduct::Reflectivity).inspecting(one_source_field());
+        let painted = picker.painted();
+        assert!(
+            painted
+                .iter()
+                .any(|text| text == "SOURCE FIELDS FROM THIS FILE"),
+            "the native-field catalog has no visible home: {painted:?}"
+        );
+        assert!(painted.iter().any(|text| text == "NVM"));
+        assert!(painted.iter().any(|text| {
+            text == "description: Normalized velocity metric · producer unit token: arb · cut 1"
+        }));
+        assert!(picker.drawn(source_field_row_id("NVM")));
+    }
+
+    #[test]
+    fn source_field_metadata_is_searchable_but_not_mistaken_for_a_product_alias() {
+        let mut picker = Harness::open(DisplayProduct::Reflectivity)
+            .inspecting(one_source_field())
+            .filtered("normalized velocity metric");
+        let painted = picker.painted();
+        assert!(painted.iter().any(|text| text == "NVM"));
+
+        let outcome = picker.click(source_field_row_id("NVM"));
+        assert_eq!(outcome.product, None);
+        assert_eq!(outcome.source_field.as_deref(), Some("NVM"));
+        assert!(outcome.dismissed);
+        assert_eq!(picker.state.focused(), None);
+    }
 
     #[test]
     fn every_registry_product_appears_exactly_once_across_the_groups() {
@@ -1961,7 +2274,9 @@ Color:  60 220  60  60   255 255 255
         /// test here is about.
         user_tables: Option<UserTableLibrary>,
         availability: ProductAvailabilityIndex,
+        source_fields: SourceFieldCatalog,
         current: DisplayProduct,
+        current_source_field: Option<String>,
     }
 
     impl Harness {
@@ -1975,8 +2290,15 @@ Color:  60 220  60  60   255 255 255
                 tables: ColorTableSet::default(),
                 user_tables: None,
                 availability: ProductAvailabilityIndex::unrestricted(),
+                source_fields: SourceFieldCatalog::default(),
                 current,
+                current_source_field: None,
             }
+        }
+
+        fn inspecting(mut self, source_fields: SourceFieldCatalog) -> Self {
+            self.source_fields = source_fields;
+            self
         }
 
         /// Give this picker an analyst's colour table folder, scanned now.
@@ -2037,7 +2359,9 @@ Color:  60 220  60  60   255 255 255
                     ProductPickerInput {
                         state: &mut self.state,
                         current: self.current,
+                        current_source_field: self.current_source_field.as_deref(),
                         availability: &self.availability,
+                        source_fields: &self.source_fields,
                         tables: &self.tables,
                         user_tables: self.user_tables.as_ref(),
                         show_experimental: false,

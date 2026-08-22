@@ -39,6 +39,14 @@ pub struct LoadedVolume {
     pub stage: FrameStage,
     pub volume: Arc<RadarVolume>,
     pub elapsed_ms: f32,
+    /// Internal Archive II evidence that this complete file is one sweep of a
+    /// larger logical source volume. `None` means the conservative classifier
+    /// refused assembly; the filename is never used as a fallback key.
+    pub assembly: Option<nexrad_io::sweep_assembly::ProvenSweepMembership>,
+    /// The classifier's reason when `assembly` is absent. The playlist keeps
+    /// candidate-specific refusals for its completion detail; ordinary formats
+    /// and already-complete volumes remain quiet.
+    pub assembly_refusal: Option<nexrad_io::sweep_assembly::SweepAssemblyRefusal>,
     /// Present only for a NEXRAD Level 1 (time series) file: the pulses the
     /// volume above was estimated FROM, so the knobs can re-run the estimator
     /// and the spectrum readout can transform a gate without the file being
@@ -123,10 +131,20 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
                 sender,
                 context,
             )
+            .map(|decoded| (raw, decoded))
         });
 
     match result {
-        Ok(Decoded { mut volume, iq }) => {
+        Ok((raw, Decoded { mut volume, iq })) => {
+            let (assembly, assembly_refusal) =
+                match nexrad_io::sweep_assembly::classify_archive_sweep(&raw, &volume) {
+                    nexrad_io::sweep_assembly::SweepAssemblyClassification::Proven(evidence) => {
+                        (Some(evidence), None)
+                    }
+                    nexrad_io::sweep_assembly::SweepAssemblyClassification::Refused(reason) => {
+                        (None, Some(reason))
+                    }
+                };
             // Normally the file is the whole answer. A deployment archive is
             // not: its reader has already written which member this scan came
             // from, and that half is the informative one, so the file name is
@@ -142,6 +160,8 @@ fn process_request(request: LoadRequest, sender: &SyncSender<LoadUpdate>, contex
                 stage: final_stage,
                 volume: Arc::new(volume),
                 elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
+                assembly,
+                assembly_refusal,
                 iq,
             }));
         }
@@ -190,6 +210,8 @@ fn decode_with_previews(
             stage: FrameStage::Preview,
             volume: Arc::new(preview),
             elapsed_ms: started.elapsed().as_secs_f32() * 1_000.0,
+            assembly: None,
+            assembly_refusal: None,
             iq: None,
         });
         if sender.try_send(update).is_ok() {

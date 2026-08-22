@@ -57,6 +57,7 @@ mod source {
     pub mod palette_editor;
     pub mod palettes;
     pub mod pane_canvas;
+    pub mod playlist_preflight;
     pub mod popup;
     pub mod probe;
     pub mod product;
@@ -66,6 +67,8 @@ mod source {
     pub mod research_sites;
     pub mod settings_ui;
     pub mod sites_service;
+    pub mod source_field_palettes;
+    pub mod source_fields;
     pub mod sweep;
     pub mod theme;
     pub mod units;
@@ -80,9 +83,10 @@ mod source {
 pub(crate) use source::{
     annotation, app, app_support, current_view_export, file_browser, gate_filter_ui, hazards,
     iq_session, iq_spectrum_ui, legend, live_service, load_service, nearest_site, net_tuning,
-    north_up, palette_editor, palettes, pane_canvas, popup, probe, product, product_availability,
-    product_picker, render_service, research_sites, settings_ui, sites_service, sweep, theme,
-    units, user_tables, vol3d, vrot, warnings_service, xsection,
+    north_up, palette_editor, palettes, pane_canvas, playlist_preflight, popup, probe, product,
+    product_availability, product_picker, render_service, research_sites, settings_ui,
+    sites_service, source_field_palettes, source_fields, sweep, theme, units, user_tables, vol3d,
+    vrot, warnings_service, xsection,
 };
 
 use std::path::{Path, PathBuf};

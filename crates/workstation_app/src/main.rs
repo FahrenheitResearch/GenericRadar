@@ -20,6 +20,7 @@ mod north_up;
 mod palette_editor;
 mod palettes;
 mod pane_canvas;
+mod playlist_preflight;
 mod popup;
 mod probe;
 mod product;
@@ -27,6 +28,8 @@ mod product_availability;
 mod product_picker;
 mod render_service;
 mod research_sites;
+mod source_field_palettes;
+mod source_fields;
 // `settings_ui` and `theme` are each compiled in a second home as well - the
 // `settings` crate's ui harness and the `theme_gallery` example include them
 // by `#[path]` - so items this binary does not call (the deep-link openers,

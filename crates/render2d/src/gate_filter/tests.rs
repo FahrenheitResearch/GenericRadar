@@ -529,7 +529,7 @@ fn an_unknown_companion_value_keeps_the_gate_and_is_counted() {
         &[vec![rho_word(0.40), 0]],
     );
 
-    let (filtered, report) = apply_gate_filter(
+    let outcome = evaluate_gate_filter(
         &volume,
         0,
         reflectivity_of(&volume, 0),
@@ -538,10 +538,23 @@ fn an_unknown_companion_value_keeps_the_gate_and_is_counted() {
             ..GateFilter::OFF
         },
     );
-    let filtered = filtered.unwrap();
+    let mask = outcome
+        .mask
+        .as_ref()
+        .expect("one known-low gate was hidden");
+    let filtered = masked_grid(reflectivity_of(&volume, 0), mask).unwrap();
 
-    assert_eq!(report.hidden_by_min_correlation, 1);
-    assert_eq!(report.kept_unknown_correlation, 1);
+    assert_eq!(outcome.report.hidden_by_min_correlation, 1);
+    assert_eq!(outcome.report.kept_unknown_correlation, 1);
+    assert!(
+        mask.reasons(0, 0)
+            .contains(GateFilterReason::MinCorrelation)
+    );
+    assert!(
+        mask.reasons(0, 1).is_empty(),
+        "unknown companion evidence keeps the gate and records no censor reason"
+    );
+    assert!(!mask.hides(0, 1));
     assert_eq!(filtered.scaled_value(0, 0), None);
     assert_eq!(filtered.scaled_value(0, 1), Some(30.0));
 }
@@ -1040,6 +1053,208 @@ fn filters_compose_into_a_union_regardless_of_order() {
     assert_eq!(weak_then_noisy.storage, both_grid.storage);
 }
 
+/// Reason bookkeeping is richer than the old union bit but changes none of
+/// its filtering semantics.  One velocity gate deliberately satisfies four
+/// criteria at once; another satisfies two.  The source words must remain
+/// byte-for-byte intact while the masked copy matches the old censor result.
+#[test]
+fn a_gate_retains_combined_reasons_without_mutating_the_source() {
+    let range = range_of(2_125, 250, 3);
+    let azimuths = [0.0];
+    let reflectivity = moment_grid(
+        MomentType::Reflectivity,
+        range.clone(),
+        REF_SCALE,
+        REF_OFFSET,
+        &[vec![dbz_word(2.0), dbz_word(40.0), dbz_word(2.0)]],
+    );
+    let correlation = moment_grid(
+        MomentType::CorrelationCoefficient,
+        range.clone(),
+        RHO_SCALE,
+        RHO_OFFSET,
+        &[vec![rho_word(0.40), rho_word(0.99), rho_word(0.40)]],
+    );
+    let velocity = moment_grid(
+        MomentType::Velocity,
+        range,
+        VEL_SCALE,
+        VEL_OFFSET,
+        &[vec![1, velocity_word(10.0), velocity_word(10.0)]],
+    );
+    let volume = radar_volume(vec![elevation_cut(
+        0.5,
+        1,
+        &azimuths,
+        0,
+        vec![reflectivity, correlation, velocity],
+    )]);
+    let source = volume.cuts[0]
+        .moments
+        .get(&MomentType::Velocity)
+        .expect("fixture carries velocity");
+    let source_storage = source.storage.clone();
+
+    let outcome = evaluate_gate_filter(
+        &volume,
+        0,
+        source,
+        &GateFilter {
+            velocity_requires_reflectivity_dbz: Some(5.0),
+            min_correlation: Some(0.80),
+            hide_range_folded: true,
+            min_range_km: Some(2.2),
+            ..GateFilter::OFF
+        },
+    );
+    let mask = outcome.mask.as_ref().expect("two gates satisfy criteria");
+
+    let first = mask.reasons(0, 0);
+    assert_eq!(first.iter().count(), 4);
+    for reason in [
+        GateFilterReason::CompanionReflectivity,
+        GateFilterReason::MinCorrelation,
+        GateFilterReason::RangeFolded,
+        GateFilterReason::MinRange,
+    ] {
+        assert!(first.contains(reason), "missing {}", reason.id());
+    }
+    assert!(!first.contains(GateFilterReason::MinReflectivity));
+
+    let second = mask.reasons(0, 1);
+    assert!(second.is_empty());
+    let third = mask.reasons(0, 2);
+    assert_eq!(third.iter().count(), 2);
+    assert!(third.contains(GateFilterReason::CompanionReflectivity));
+    assert!(third.contains(GateFilterReason::MinCorrelation));
+
+    assert_eq!(mask.hidden_count(), 2);
+    assert_eq!(outcome.report.gates_hidden, 2);
+    assert_eq!(
+        outcome
+            .report
+            .hidden_by_reason(GateFilterReason::CompanionReflectivity),
+        2
+    );
+    assert_eq!(
+        outcome
+            .report
+            .hidden_by_reason(GateFilterReason::MinCorrelation),
+        2
+    );
+    assert_eq!(
+        outcome
+            .report
+            .hidden_by_reason(GateFilterReason::RangeFolded),
+        1
+    );
+    assert_eq!(
+        outcome.report.hidden_by_reason(GateFilterReason::MinRange),
+        1
+    );
+    assert_eq!(
+        outcome
+            .report
+            .hidden_by_reason(GateFilterReason::MinReflectivity),
+        0
+    );
+    assert_eq!(
+        mask.hidden_by_reason(GateFilterReason::CompanionReflectivity),
+        2
+    );
+    assert_eq!(mask.hidden_by_reason(GateFilterReason::MinCorrelation), 2);
+    assert_eq!(mask.hidden_by_reason(GateFilterReason::RangeFolded), 1);
+    assert_eq!(mask.hidden_by_reason(GateFilterReason::MinRange), 1);
+
+    for gate in 0..3 {
+        assert_eq!(
+            mask.hides(0, gate),
+            !mask.reasons(0, gate).is_empty(),
+            "reason planes and the render union disagree at gate {gate}"
+        );
+    }
+    assert_eq!(
+        source.storage, source_storage,
+        "evaluation changed source words"
+    );
+
+    let censored = masked_grid(source, mask).expect("fixture has a nodata word");
+    assert_eq!(
+        source.storage, source_storage,
+        "masking changed source words"
+    );
+    let MomentStorage::U8(words) = &censored.storage else {
+        panic!("fixture uses u8 storage")
+    };
+    assert_eq!(
+        words,
+        &[0, velocity_word(10.0), 0],
+        "reason retention changed which raw words the original union censors"
+    );
+}
+
+#[test]
+fn direct_reflectivity_reason_combines_with_rhohv_and_near_range() {
+    let volume = single_cut_volume(
+        &[vec![dbz_word(2.0), dbz_word(40.0)]],
+        &[vec![rho_word(0.40), rho_word(0.99)]],
+    );
+    let outcome = evaluate_gate_filter(
+        &volume,
+        0,
+        reflectivity_of(&volume, 0),
+        &GateFilter {
+            min_reflectivity_dbz: Some(5.0),
+            min_correlation: Some(0.80),
+            min_range_km: Some(2.2),
+            ..GateFilter::OFF
+        },
+    );
+    let mask = outcome.mask.expect("first gate satisfies three criteria");
+    let reasons = mask.reasons(0, 0);
+
+    assert_eq!(reasons.iter().count(), 3);
+    assert!(reasons.contains(GateFilterReason::MinReflectivity));
+    assert!(reasons.contains(GateFilterReason::MinCorrelation));
+    assert!(reasons.contains(GateFilterReason::MinRange));
+    assert_eq!(mask.hidden_by_reason(GateFilterReason::MinReflectivity), 1);
+    assert_eq!(
+        outcome.report.reason_counts().next().unwrap(),
+        (GateFilterReason::MinReflectivity, 1)
+    );
+}
+
+/// The representation is a fixed set of u64 bit planes per 64 gates, not a
+/// heap object or byte-sized record for every gate.  Keep the renderer's union
+/// in its own compact allocation and pin the audited total payload cost: seven
+/// bits per nominal gate plus row-end padding.
+#[test]
+fn reason_mask_storage_remains_bit_packed() {
+    assert_eq!(
+        std::mem::size_of::<GateFilterReasonWord>(),
+        GateFilterReason::all().len() * std::mem::size_of::<u64>()
+    );
+
+    let mut row = vec![dbz_word(40.0); 130];
+    row[129] = dbz_word(0.0);
+    let volume = single_cut_volume(&[row], &[]);
+    let outcome = evaluate_gate_filter(
+        &volume,
+        0,
+        reflectivity_of(&volume, 0),
+        &GateFilter {
+            min_reflectivity_dbz: Some(5.0),
+            ..GateFilter::OFF
+        },
+    );
+    let mask = outcome.mask.expect("one gate was hidden");
+    assert_eq!(mask.words_per_row, 3);
+    assert_eq!(mask.bits.len(), 3);
+    assert_eq!(mask.bits.capacity(), 3);
+    assert_eq!(mask.reason_words.len(), 3);
+    assert_eq!(mask.reason_words.capacity(), 3);
+}
+
 #[test]
 fn the_mask_indexes_the_grid_it_was_built_for() {
     let volume = single_cut_volume(
@@ -1064,11 +1279,25 @@ fn the_mask_indexes_the_grid_it_was_built_for() {
     assert_eq!(mask.rows(), 2);
     assert_eq!(mask.gate_count(), 2);
     assert_eq!(mask.hidden_count(), 2);
+    assert!(mask.matches_grid(reflectivity_of(&volume, 0)));
     assert!(mask.hides(0, 0));
     assert!(!mask.hides(0, 1));
     assert!(!mask.hides(1, 0));
     assert!(mask.hides(1, 1));
     assert!(!mask.hides(9, 9), "out of range is not hidden");
+    assert!(mask.reasons(9, 9).is_empty());
+
+    let mut wrong_shape = reflectivity_of(&volume, 0).clone();
+    wrong_shape.gate_range.gate_count += 1;
+    assert!(
+        !mask.matches_grid(&wrong_shape),
+        "a reason mask must not index a different gate lattice"
+    );
+    #[cfg(not(debug_assertions))]
+    assert!(
+        masked_grid(&wrong_shape, &mask).is_none(),
+        "release builds must refuse a mismatched mask rather than blanking wrong gates"
+    );
 }
 
 /// A mask spanning more than one 64-gate word, so the bit arithmetic is
@@ -1466,6 +1695,10 @@ fn a_product_the_filter_cannot_run_against_says_so_rather_than_going_quiet() {
         "FILTER NOT APPLIED: RhoHV below 0.80 - this product is integrated from the whole volume, \
          not rastered from one sweep"
     );
+    assert!(
+        report.reason_counts().all(|(_, count)| count == 0),
+        "not-applicable reports must not invent per-gate reasons"
+    );
 
     // A filter that is off is not a filter that failed to apply.
     assert_eq!(
@@ -1507,6 +1740,15 @@ fn the_absence_delta_names_exactly_the_gates_that_went_missing() {
                 mask.hides(row, gate),
                 "{row},{gate}"
             );
+            if delta.hides(row, gate) {
+                assert_eq!(
+                    delta.reasons(row, gate),
+                    GateFilterReasons::only(GateFilterReason::Unattributed),
+                    "a before/after transport mask must not fabricate a source criterion"
+                );
+            } else {
+                assert!(delta.reasons(row, gate).is_empty());
+            }
         }
     }
 

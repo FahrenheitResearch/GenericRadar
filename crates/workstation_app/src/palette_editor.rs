@@ -27,8 +27,9 @@
 //!
 //! # Shipped presets are never overwritten
 //!
-//! [`ui::PaletteEditorState::edit_or_duplicate`] is the only way in, and it is
-//! **told** which case it is in rather than working it out: the caller asks
+//! Shared-family rows enter through
+//! [`ui::PaletteEditorState::edit_or_duplicate`], and it is **told** which
+//! case it is in rather than working it out: the caller asks
 //! `color_tables::is_builtin_table`, which is where the catalogue lives. A
 //! built-in is duplicated under a new name and claims no file at all; anything
 //! else is edited in place, in the file whose `Name:` row matches it. There is
@@ -39,6 +40,12 @@
 //! name existed, and a filename is not an identity: a palette that had never
 //! been saved opened as a copy of itself, and Copy on a preset opened an
 //! unrelated file whose name reduced to the same stem.
+//!
+//! Producer-native fields enter through
+//! [`ui::PaletteEditorState::edit_source_field`]. That path locks measurement
+//! and unit conversion and returns a source-specific Apply outcome, so an
+//! exact field can use this editor without installing its table into the
+//! shared Generic family.
 
 pub mod model;
 pub mod pal;

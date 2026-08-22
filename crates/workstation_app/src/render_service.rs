@@ -7,7 +7,7 @@ use analyst_runtime::{
     Camera2D, LatestLaneSender, PaneId, RenderStamp, StormMotionIntent, ViewportMetrics,
     latest_lane_channel,
 };
-use color_tables::ColorTableSet;
+use color_tables::{ColorTable, ColorTableSet};
 use eframe::egui;
 use radar_core::RadarVolume;
 use render2d::derived::compute::{INTERACTIVE_SPACING_KM, compute_volume_field};
@@ -19,7 +19,7 @@ use render2d::sweep_blend::{
 };
 use render2d::{
     DisplayQuality, GateFilter, GateFilterReport, StormMotion, ViewportMomentCache,
-    ViewportRasterOptions, evaluate_gate_filter, viewport_rgba_buffer_len,
+    ViewportRasterOptions, color_family_for_moment, evaluate_gate_filter, viewport_rgba_buffer_len,
 };
 
 use crate::product::DisplayProduct;
@@ -38,6 +38,10 @@ pub struct RenderRequest {
     pub environment: product_engine::HailEnvironment,
     pub cut_index: usize,
     pub product: DisplayProduct,
+    /// Exact producer-native field selected outside the fixed product enum.
+    /// Its observed range controls only a generic palette; it carries no
+    /// inferred unit or scientific meaning.
+    pub source_field: Option<SourceFieldRender>,
     pub camera: Camera2D,
     pub viewport: ViewportMetrics,
     pub storm_motion: StormMotionIntent,
@@ -60,6 +64,15 @@ pub struct RenderRequest {
     /// part of the sweep that has landed over the last complete picture of the
     /// same tilt"; absent means the ordinary single-sweep raster.
     pub sweep: Option<SweepBlendRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceFieldRender {
+    pub moment: radar_core::MomentType,
+    /// Already resolved against the exact-id override map. The pane legend
+    /// uses the same resolver, so the worker must not independently stretch a
+    /// shared Generic table and risk explaining different colours.
+    pub table: ColorTable,
 }
 
 /// Why a volume-derived product does not obey a per-gate filter, in the words
@@ -210,7 +223,9 @@ impl RenderService {
 /// is hidden - is a nuisance; the failure that matters is a censored picture
 /// that says nothing, so nothing here is allowed to drop the report.
 fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderFailure> {
-    if let Some(derived) = request.product.derived_volume() {
+    if request.source_field.is_none()
+        && let Some(derived) = request.product.derived_volume()
+    {
         return render_derived(request, derived);
     }
     let started = Instant::now();
@@ -239,21 +254,48 @@ fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderFailure>
         return render_blended_sweep(&request, blend, options, rgba, started);
     }
 
-    let cache = if request.product.uses_dealiased_velocity() {
+    let source_tables = request.source_field.as_ref().map(|source| {
+        let mut tables = (*request.color_tables).clone();
+        tables.set_family(
+            color_family_for_moment(&source.moment),
+            source.table.clone(),
+        );
+        tables
+    });
+    let color_tables = source_tables.as_ref().unwrap_or(&request.color_tables);
+    let moment = request
+        .source_field
+        .as_ref()
+        .map(|source| source.moment.clone())
+        .unwrap_or_else(|| request.product.source_moment());
+    // Unknown source fields can be categorical, angular, folded, or otherwise
+    // discontinuous. Until their semantics are modeled, do not soften them or
+    // synthesize values between gates. Pixel supersampling remains a screen
+    // antialiasing choice and does not rewrite the source grid.
+    let quality = if request.source_field.is_some() {
+        DisplayQuality {
+            soften: false,
+            interpolate: false,
+            supersample: request.quality.supersample,
+        }
+    } else {
+        request.quality
+    };
+    let cache = if request.source_field.is_none() && request.product.uses_dealiased_velocity() {
         ViewportMomentCache::new_dealiased_velocity_display_quality_filtered(
             &request.volume,
             request.cut_index,
-            &request.color_tables,
-            request.quality,
+            color_tables,
+            quality,
             &request.gate_filter,
         )
     } else {
         ViewportMomentCache::new_display_quality_filtered(
             &request.volume,
             request.cut_index,
-            request.product.source_moment(),
-            &request.color_tables,
-            request.quality,
+            moment,
+            color_tables,
+            quality,
             &request.gate_filter,
         )
     }
@@ -263,7 +305,7 @@ fn render_request(request: RenderRequest) -> Result<RenderedPane, RenderFailure>
         message: error.to_string(),
     })?;
 
-    let dimensions = if request.product.is_storm_relative() {
+    let dimensions = if request.source_field.is_none() && request.product.is_storm_relative() {
         let direction_toward_deg =
             (request.storm_motion.direction_from_deg + 180.0).rem_euclid(360.0);
         cache.render_storm_relative_velocity_rgba_into(

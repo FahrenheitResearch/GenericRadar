@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use color_tables::{ColorTable, ColorTableFamily, Rgba8};
 use eframe::egui;
-use radar_core::{MomentType, RadarVolume};
+use radar_core::{MomentType, ProductId, RadarVolume};
 
 use super::model::{
     EditorTable, EditorUnits, Sampling, StopId, family_from_product_token, product_token,
@@ -75,6 +75,12 @@ pub struct PaletteEditorState {
     /// Which family the application installs this into. Follows the header's
     /// family combo.
     family: ColorTableFamily,
+    /// `Some` changes the Apply boundary from a shared measurement family to
+    /// one exact producer-native product id. The editor remains the same real
+    /// `.pal` editor, but the measurement and units controls are locked: an
+    /// unvalidated producer unit token must not be reinterpreted as dBZ, dBm,
+    /// knots, or any other modeled unit merely to edit colours.
+    source_target: Option<ProductId>,
     selected: Option<StopId>,
     drag: Option<HandleDrag>,
     status: Option<Status>,
@@ -98,6 +104,7 @@ impl Default for PaletteEditorState {
             // with no table has no family, and reflectivity is the one the
             // application opens on.
             family: ColorTableFamily::Reflectivity,
+            source_target: None,
             selected: None,
             drag: None,
             status: None,
@@ -129,10 +136,10 @@ struct HandleDrag {
 #[derive(Default)]
 struct Preview {
     texture: Option<egui::TextureHandle>,
-    /// `(table signature, volume identity, cut)`. The signature moves whenever
-    /// the table would paint differently, which is exactly when the raster is
-    /// stale.
-    key: Option<(u64, usize, usize)>,
+    /// `(table signature, volume identity, cut, moment)`. The moment matters
+    /// for exact source fields: two producer keys can share one cut and one
+    /// palette signature while still naming different grids.
+    key: Option<(u64, usize, usize, MomentType)>,
     /// What the last attempt produced, when it produced no picture.
     note: Option<String>,
 }
@@ -151,6 +158,12 @@ pub struct PaletteEditorInput<'a> {
 pub struct PaletteEditorOutcome {
     /// Install this table into this family in the live set, and repaint.
     pub install: Option<(ColorTableFamily, ColorTable)>,
+    /// Install this table only for one exact producer-native field.
+    pub source_install: Option<SourcePaletteInstall>,
+    /// A source editor table was written successfully. The application may
+    /// use this only to promote an identical session-only Apply; saving a
+    /// reusable file by itself does not install or bind it.
+    pub source_saved: Option<(ProductId, ColorTable)>,
     /// A file was written here.
     ///
     /// The file is picked up again by
@@ -159,6 +172,14 @@ pub struct PaletteEditorOutcome {
     /// catalogue does not hold it - so a table saved here and applied is the
     /// table that comes back on the next launch.
     pub saved: Option<PathBuf>,
+}
+
+/// One exact-field Apply, including whether the editor state proves that the
+/// table is the clean contents of a saved file.
+pub struct SourcePaletteInstall {
+    pub id: ProductId,
+    pub table: ColorTable,
+    pub durable: bool,
 }
 
 impl PaletteEditorState {
@@ -186,6 +207,7 @@ impl PaletteEditorState {
         table: &ColorTable,
         duplicate: bool,
     ) {
+        self.source_target = None;
         let mut editable = EditorTable::from_color_table(family, table);
         // A shipped preset never adopts a file, whatever is in the directory.
         // The stem a name reduces to is many-to-one, so a file sitting at the
@@ -275,6 +297,72 @@ impl PaletteEditorState {
         self.preview = Preview::default();
         self.table = Some(editable);
         self.open = true;
+    }
+
+    /// Open the ordinary editor on one exact producer-native field.
+    ///
+    /// The table already carries either that field's explicit range or the
+    /// automatic observed range. Editing stop values is therefore the fixed
+    /// range control; Apply crosses the source-specific outcome above rather
+    /// than installing into the shared Generic family.
+    pub fn edit_source_field(
+        &mut self,
+        id: ProductId,
+        table: &ColorTable,
+        automatic: bool,
+        current_is_durable: bool,
+    ) {
+        if automatic || !current_is_durable {
+            // Automatic mode and a session-only Apply both start from the
+            // exact table on the pane. A same-named file left from an older
+            // binding must not silently undo Reset or replace a live preview
+            // when the editor opens again.
+            self.source_target = None;
+            self.table = Some(EditorTable::from_color_table(
+                ColorTableFamily::Generic,
+                table,
+            ));
+            self.saved = None;
+            self.file = None;
+            self.selected = self
+                .table
+                .as_ref()
+                .and_then(|editable| editable.stops().first().map(|stop| stop.id));
+            self.drag = None;
+            self.status = Some(Status {
+                text: if automatic {
+                    format!(
+                        "Started from this field's observed finite range. Save writes a reusable .pal into {}.",
+                        self.directory.display()
+                    )
+                } else {
+                    "Opened the session-only table currently on the pane. Save promotes it only if it still matches the active preview."
+                        .to_owned()
+                },
+                failed: false,
+            });
+            self.built = None;
+            self.build_error = None;
+            self.preview = Preview::default();
+            self.open = true;
+        } else {
+            // A durable override names a saved `.pal`; use the ordinary editor
+            // lookup so its ramp pairs and authored sampling return.
+            self.edit_or_duplicate(ColorTableFamily::Generic, table, false);
+        }
+        self.source_target = Some(id);
+        self.family = ColorTableFamily::Generic;
+        for editable in self.table.iter_mut().chain(self.saved.iter_mut()) {
+            editable.family = ColorTableFamily::Generic;
+            editable.product = product_token(ColorTableFamily::Generic).map(str::to_owned);
+            editable.units = EditorUnits::Unstated;
+            editable.scale = None;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn source_target(&self) -> Option<&ProductId> {
+        self.source_target.as_ref()
     }
 
     /// The table being edited. Read by the tests, which assert on the state
@@ -499,23 +587,31 @@ fn header(ui: &mut egui::Ui, state: &mut PaletteEditorState) {
             if name.lost_focus() {
                 table.name = table.pal_name();
             }
-            ui.label("Measurement");
-            let mut family = table.family;
-            egui::ComboBox::from_id_salt("palette-editor-family")
-                .selected_text(family.label())
-                .width(230.0)
-                .show_ui(ui, |ui| {
-                    for candidate in ColorTableFamily::ALL {
-                        ui.selectable_value(&mut family, candidate, candidate.label());
-                    }
-                });
-            if family != table.family {
-                table.family = family;
-                // The `Product:` row follows the measurement, because the row
-                // is how another tool - and this build's own reader - works
-                // out which measurement the file is for.
-                table.product = product_token(family).map(str::to_owned);
-                state.family = family;
+            if let Some(id) = state.source_target.as_ref() {
+                ui.label("Source field");
+                ui.monospace(
+                    crate::source_fields::producer_name_from_product_id(id)
+                        .unwrap_or(id.0.as_str()),
+                );
+            } else {
+                ui.label("Measurement");
+                let mut family = table.family;
+                egui::ComboBox::from_id_salt("palette-editor-family")
+                    .selected_text(family.label())
+                    .width(230.0)
+                    .show_ui(ui, |ui| {
+                        for candidate in ColorTableFamily::ALL {
+                            ui.selectable_value(&mut family, candidate, candidate.label());
+                        }
+                    });
+                if family != table.family {
+                    table.family = family;
+                    // The `Product:` row follows the measurement, because the row
+                    // is how another tool - and this build's own reader - works
+                    // out which measurement the file is for.
+                    table.product = product_token(family).map(str::to_owned);
+                    state.family = family;
+                }
             }
         });
         // Said while the name is still on screen and a field edit away from
@@ -552,52 +648,62 @@ fn header(ui: &mut egui::Ui, state: &mut PaletteEditorState) {
                 ),
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Units");
-            let mut units = table.units;
-            egui::ComboBox::from_id_salt("palette-editor-units")
-                .selected_text(units.label())
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    for candidate in EditorUnits::ALL {
-                        ui.selectable_value(&mut units, candidate, candidate.label());
+        if state.source_target.is_some() {
+            ui.label(
+                egui::RichText::new(
+                    "Stop values are raw producer numbers; the first and last stops set the fixed display range. The file's unit token is metadata, not a validated conversion, so this exact-field editor never reinterprets it.",
+                )
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Units");
+                let mut units = table.units;
+                egui::ComboBox::from_id_salt("palette-editor-units")
+                    .selected_text(units.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for candidate in EditorUnits::ALL {
+                            ui.selectable_value(&mut units, candidate, candidate.label());
+                        }
+                    });
+                if units != table.units {
+                    table.set_units(units);
+                }
+
+                bevel::etched_separator(ui);
+                let mut scaled = table.scale.is_some();
+                let scale_response = ui.checkbox(&mut scaled, "Scale");
+                if scale_response.changed() {
+                    table.set_scale(scaled.then_some(table.scale.unwrap_or(1.0)));
+                }
+                let mut scale = table.scale.unwrap_or(1.0);
+                ui.add_enabled_ui(table.scale.is_some(), |ui| {
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut scale)
+                                .speed(0.05)
+                                .range(0.001..=1000.0),
+                        )
+                        .changed()
+                    {
+                        table.set_scale(Some(scale));
                     }
                 });
-            if units != table.units {
-                table.set_units(units);
-            }
-
-            bevel::etched_separator(ui);
-            let mut scaled = table.scale.is_some();
-            let scale_response = ui.checkbox(&mut scaled, "Scale");
-            if scale_response.changed() {
-                table.set_scale(scaled.then_some(table.scale.unwrap_or(1.0)));
-            }
-            let mut scale = table.scale.unwrap_or(1.0);
-            ui.add_enabled_ui(table.scale.is_some(), |ui| {
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut scale)
-                            .speed(0.05)
-                            .range(0.001..=1000.0),
-                    )
-                    .changed()
-                {
-                    table.set_scale(Some(scale));
-                }
             });
-        });
-        ui.label(
-            egui::RichText::new(
-                "Units CONVERT: switching kt to m/s multiplies every stop by 0.514444, the \
-                 factor the palette parser uses, so each colour stays on the wind speed it \
-                 was on. Scale REINTERPRETS: the numbers stay where they are typed and the \
-                 file declares that each one means 1/scale of an engine unit. A scale also \
-                 overrides the unit entirely, which is why setting one freezes the values.",
-            )
-            .small()
-            .weak(),
-        );
+            ui.label(
+                egui::RichText::new(
+                    "Units CONVERT: switching kt to m/s multiplies every stop by 0.514444, the \
+                     factor the palette parser uses, so each colour stays on the wind speed it \
+                     was on. Scale REINTERPRETS: the numbers stay where they are typed and the \
+                     file declares that each one means 1/scale of an engine unit. A scale also \
+                     overrides the unit entirely, which is why setting one freezes the values.",
+                )
+                .small()
+                .weak(),
+            );
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Sampling");
@@ -1300,28 +1406,49 @@ fn preview_section(
             ui.label("Nothing to preview until the table has two stops.");
             return;
         };
-        let moment = preview_moment(state.family);
-        match (volume, moment) {
-            (Some(volume), Some(moment)) => {
-                update_preview(ui.ctx(), &mut state.preview, volume, &moment, &built);
-            }
-            (None, _) => {
+        if let (Some(volume), Some(target)) = (volume, state.source_target.as_ref()) {
+            let producer_name = crate::source_fields::producer_name_from_product_id(target)
+                .unwrap_or(target.0.as_str());
+            if let Some((cut_index, moment)) = first_cut_with_source(volume, producer_name) {
+                update_preview_at_cut(
+                    ui.ctx(),
+                    &mut state.preview,
+                    volume,
+                    cut_index,
+                    &moment,
+                    &built,
+                );
+            } else {
                 state.preview.texture = None;
                 state.preview.key = None;
-                state.preview.note = Some(
-                    "No volume is loaded, so there is no echo to draw this on. The ramp above \
+                state.preview.note = Some(format!(
+                    "The loaded volume carries no exact {producer_name} field, so there is nothing to draw this palette on."
+                ));
+            }
+        } else {
+            let moment = preview_moment(state.family);
+            match (volume, moment) {
+                (Some(volume), Some(moment)) => {
+                    update_preview(ui.ctx(), &mut state.preview, volume, &moment, &built);
+                }
+                (None, _) => {
+                    state.preview.texture = None;
+                    state.preview.key = None;
+                    state.preview.note = Some(
+                        "No volume is loaded, so there is no echo to draw this on. The ramp above \
                      is sampled through the same table the pane would use."
-                        .to_owned(),
-                );
-            }
-            (Some(_), None) => {
-                state.preview.texture = None;
-                state.preview.key = None;
-                state.preview.note = Some(
-                    "This measurement has no radar moment of its own, so there is nothing to \
+                            .to_owned(),
+                    );
+                }
+                (Some(_), None) => {
+                    state.preview.texture = None;
+                    state.preview.key = None;
+                    state.preview.note = Some(
+                        "This measurement has no radar moment of its own, so there is nothing to \
                      render. The ramp above is the whole preview."
-                        .to_owned(),
-                );
+                            .to_owned(),
+                    );
+                }
             }
         }
 
@@ -1381,6 +1508,13 @@ fn first_cut_with(volume: &RadarVolume, moment: &MomentType) -> Option<usize> {
         .position(|cut| cut.moments.contains_key(moment))
 }
 
+fn first_cut_with_source(volume: &RadarVolume, producer_name: &str) -> Option<(usize, MomentType)> {
+    volume.cuts.iter().enumerate().find_map(|(cut_index, _)| {
+        crate::source_fields::grid_in_cut(volume, cut_index, producer_name)
+            .map(|(moment, _)| (cut_index, moment.clone()))
+    })
+}
+
 fn update_preview(
     context: &egui::Context,
     preview: &mut Preview,
@@ -1398,12 +1532,24 @@ fn update_preview(
         ));
         return;
     };
+    update_preview_at_cut(context, preview, volume, cut_index, moment, table);
+}
+
+fn update_preview_at_cut(
+    context: &egui::Context,
+    preview: &mut Preview,
+    volume: &RadarVolume,
+    cut_index: usize,
+    moment: &MomentType,
+    table: &ColorTable,
+) {
     let key = (
         table.signature(),
         std::ptr::from_ref(volume) as usize,
         cut_index,
+        moment.clone(),
     );
-    if preview.key == Some(key) && preview.texture.is_some() {
+    if preview.key.as_ref() == Some(&key) && preview.texture.is_some() {
         return;
     }
     let options = render2d::RasterOptions {
@@ -1456,15 +1602,22 @@ fn footer(ui: &mut egui::Ui, state: &mut PaletteEditorState, outcome: &mut Palet
     ui.horizontal(|ui| {
         let can_build = state.current_table().is_some();
         ui.add_enabled_ui(can_build, |ui| {
+            let save_hint = if state.source_target.is_some() {
+                "Writes the .pal after a read-back check. If this exact edit is already applied, Save promotes that matching session-only preview; otherwise it only creates a reusable file."
+            } else {
+                "Writes the .pal into the user colour tables directory, but only after reading it back and checking it paints exactly what is on screen."
+            };
             if ui
                 .add_sized([96.0, bevel::MIN_TOUCH_POINTS], egui::Button::new("Save"))
-                .on_hover_text(
-                    "Writes the .pal into the user colour tables directory, but only after \
-                     reading it back and checking it paints exactly what is on screen.",
-                )
+                .on_hover_text(save_hint)
                 .clicked()
                 && let Some(path) = state.save()
             {
+                if let Some(id) = state.source_target.clone()
+                    && let Some(table) = state.current_table().cloned()
+                {
+                    outcome.source_saved = Some((id, table));
+                }
                 outcome.saved = Some(path);
             }
         });
@@ -1480,20 +1633,67 @@ fn footer(ui: &mut egui::Ui, state: &mut PaletteEditorState, outcome: &mut Palet
             }
         });
         let family = state.family;
+        let source_target = state.source_target.clone();
+        let source_apply_is_durable = source_target.is_some()
+            && state.file.is_some()
+            && state.saved.as_ref() == state.table.as_ref();
         ui.add_enabled_ui(can_build, |ui| {
+            let apply_label = source_target.as_ref().map_or_else(
+                || format!("Apply to {}", family.label()),
+                |id| {
+                    format!(
+                        "Apply only to {}",
+                        crate::source_fields::producer_name_from_product_id(id)
+                            .unwrap_or(id.0.as_str())
+                    )
+                },
+            );
             if ui
                 .add_sized(
-                    [190.0, bevel::MIN_TOUCH_POINTS],
-                    egui::Button::new(format!("Apply to {}", family.label())),
+                    [210.0, bevel::MIN_TOUCH_POINTS],
+                    egui::Button::new(apply_label),
                 )
                 .on_hover_text(
-                    "Installs this table for the measurement family without saving it, so it \
-                     can be judged on the live pane first.",
+                    if source_target.is_some() {
+                        if source_apply_is_durable {
+                            "Applies this clean, saved table only to the exact producer field and keeps that binding across restart."
+                        } else {
+                            "Applies a session-only preview to the exact producer field. It remains active in this run; use CUSTOM → Reset to observed range to undo it. Save is required before it can persist across restart."
+                        }
+                    } else {
+                        "Installs this table for the measurement family without saving it, so it can be judged on the live pane first."
+                    },
                 )
                 .clicked()
                 && let Some(built) = state.current_table().cloned()
             {
-                outcome.install = Some((family, built));
+                match source_target.clone() {
+                    Some(id) => {
+                        let label = crate::source_fields::producer_name_from_product_id(&id)
+                            .unwrap_or(id.0.as_str());
+                        if source_apply_is_durable {
+                            state.status = Some(Status {
+                                text: format!(
+                                    "Saved palette binding applied only to {label}; it will return after restart."
+                                ),
+                                failed: false,
+                            });
+                        } else {
+                            state.status = Some(Status {
+                                text: format!(
+                                    "Session-only preview applied to {label} · undo: CUSTOM → Reset to observed range"
+                                ),
+                                failed: false,
+                            });
+                        }
+                        outcome.source_install = Some(SourcePaletteInstall {
+                            id,
+                            table: built,
+                            durable: source_apply_is_durable,
+                        });
+                    }
+                    None => outcome.install = Some((family, built)),
+                }
             }
         });
     });

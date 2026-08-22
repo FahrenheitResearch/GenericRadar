@@ -328,6 +328,7 @@ pub fn decode_cfradial1_source(file: &dyn NcSource) -> Result<RadarVolume> {
         for sweep in &mut sweeps {
             let mut grid = MomentGrid {
                 moment: moment.clone(),
+                producer_name: Some(field.name.clone()),
                 producer_description: field
                     .attr_str("long_name")
                     .map(str::trim)

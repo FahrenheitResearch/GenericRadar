@@ -768,6 +768,7 @@ mod tests {
         }
         let grid = MomentGrid {
             moment: MomentType::Reflectivity,
+            producer_name: None,
             producer_description: None,
             producer_units: None,
             gate_range,

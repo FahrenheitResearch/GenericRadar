@@ -29,6 +29,7 @@ pub mod mobile_archive;
 pub mod netcdf3;
 pub mod netcdf4;
 pub mod odim;
+pub mod sweep_assembly;
 
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -2007,6 +2008,18 @@ fn parse_message_31(
     volume: &mut RadarVolume,
 ) -> Result<()> {
     let header = parse_message_31_header(body, 0)?;
+    // GR2Analyst-style Message 31 exports may leave the outer Archive II
+    // volume date and time at zero even though every radial retains its NEXRAD
+    // collection date and milliseconds. Falling back only for the epoch
+    // sentinel preserves the authoritative volume-header start time in normal
+    // Archive II data while keeping these exports out of 1970.
+    if volume.metadata.decoded_radial_count == 0
+        && volume.volume_time == DateTime::<Utc>::UNIX_EPOCH
+        && header.collect_date > 0
+    {
+        volume.volume_time =
+            nexrad_date_ms_to_datetime(u32::from(header.collect_date), header.collect_ms);
+    }
     let expected_radials = expected_radials_for_azimuth_resolution(header.azimuth_resolution);
 
     let mut nyquist_velocity_mps = None;
@@ -2875,6 +2888,19 @@ mod tests {
         assert_eq!(
             volume.metadata.decoded_radial_count, 3,
             "all three variable-framed radials should decode"
+        );
+    }
+
+    #[test]
+    fn a_msg31_export_with_a_zero_volume_clock_uses_its_first_radial_clock() {
+        let mut bytes = synthetic_variable_framed_archive(3);
+        bytes[12..20].fill(0);
+
+        let volume = decode_volume_from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            volume.volume_time,
+            nexrad_date_ms_to_datetime(19_724, 1_000)
         );
     }
 

@@ -304,6 +304,130 @@ impl CompanionSweep {
     }
 }
 
+/// Why a gate is absent from a [`GateFilterMask`].
+///
+/// These are stable categorical identifiers, not display strings and not
+/// algorithm provenance.  A later persistent QC layer can attach one operation,
+/// parameter set and citation to an entire reason plane; it must not repeat that
+/// metadata in an object at every gate.  Appending another category therefore
+/// costs one bit per gate, while combinations remain lossless.
+///
+/// This follows the quality-field shape used by OPERA ODIM_H5 and BALTRAD: a
+/// measured field remains intact, one or more quality arrays describe it, and
+/// metadata live with each quality array.  See Michelson et al. (2018),
+/// "BALTRAD Advanced Weather Radar Networking", Journal of Open Research
+/// Software 6(1), 12, doi:10.5334/jors.193, and EUMETNET OPERA (2024),
+/// "ODIM_H5 2.4.1", sections 2 and 5.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum GateFilterReason {
+    /// The displayed reflectivity itself was below the configured threshold.
+    MinReflectivity = 0,
+    /// A velocity gate's companion reflectivity was below the threshold.
+    CompanionReflectivity = 1,
+    /// The companion correlation coefficient was below the configured value.
+    MinCorrelation = 2,
+    /// The source gate carried the range-folded code and the filter hides it.
+    RangeFolded = 3,
+    /// The gate centre was inside the configured near-range cutoff.
+    MinRange = 4,
+    /// A transport mask knows that a gate disappeared but not which source
+    /// criterion caused it.  This is used only by [`absence_delta_mask`], whose
+    /// before/after inputs do not carry criterion provenance.
+    Unattributed = 5,
+}
+
+impl GateFilterReason {
+    const FILTER_CRITERIA: [Self; 5] = [
+        Self::MinReflectivity,
+        Self::CompanionReflectivity,
+        Self::MinCorrelation,
+        Self::RangeFolded,
+        Self::MinRange,
+    ];
+
+    const ALL: [Self; 6] = [
+        Self::MinReflectivity,
+        Self::CompanionReflectivity,
+        Self::MinCorrelation,
+        Self::RangeFolded,
+        Self::MinRange,
+        Self::Unattributed,
+    ];
+
+    /// The five reasons produced directly by [`evaluate_gate_filter`], in
+    /// stable bit order.  The opaque iterator keeps this contract appendable
+    /// without exposing an array length as part of the API.
+    pub fn filter_criteria() -> impl ExactSizeIterator<Item = Self> {
+        Self::FILTER_CRITERIA.into_iter()
+    }
+
+    /// Every reason a mask can currently retain, in stable bit order.
+    pub fn all() -> impl ExactSizeIterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
+
+    /// A stable local identifier suitable for logs, reports and future
+    /// provenance records.  These are deliberately not claimed to be ODIM
+    /// `how/task` identifiers.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::MinReflectivity => "filter.min_reflectivity",
+            Self::CompanionReflectivity => "filter.companion_reflectivity",
+            Self::MinCorrelation => "filter.min_correlation",
+            Self::RangeFolded => "filter.range_folded",
+            Self::MinRange => "filter.min_range",
+            Self::Unattributed => "filter.unattributed",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn bit(self) -> u16 {
+        1 << (self as u8)
+    }
+}
+
+/// A compact, combinable set of [`GateFilterReason`] values for one gate.
+///
+/// The value is returned by copy for inspection; the mask itself stores the
+/// same information as bit planes rather than allocating this (or any other
+/// object) per gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct GateFilterReasons(u16);
+
+impl GateFilterReasons {
+    pub const NONE: Self = Self(0);
+
+    pub const fn only(reason: GateFilterReason) -> Self {
+        Self(reason.bit())
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, reason: GateFilterReason) -> bool {
+        self.0 & reason.bit() != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = GateFilterReason> {
+        GateFilterReason::all().filter(move |reason| self.contains(*reason))
+    }
+
+    fn insert(&mut self, reason: GateFilterReason) {
+        self.0 |= reason.bit();
+    }
+}
+
 /// What one application of a [`GateFilter`] did.
 ///
 /// The per-criterion counts are each measured INDEPENDENTLY: every one of them
@@ -438,6 +562,26 @@ impl GateFilterReport {
         self.gates_hidden > 0
     }
 
+    /// Visible gates hidden by one criterion, counted independently of all
+    /// other criteria.  Asking for [`GateFilterReason::Unattributed`] returns
+    /// zero because reports are produced before any shape-changing display
+    /// transform and therefore always know their direct criterion.
+    pub fn hidden_by_reason(&self, reason: GateFilterReason) -> usize {
+        match reason {
+            GateFilterReason::MinReflectivity => self.hidden_by_min_reflectivity,
+            GateFilterReason::CompanionReflectivity => self.hidden_by_velocity_reflectivity,
+            GateFilterReason::MinCorrelation => self.hidden_by_min_correlation,
+            GateFilterReason::RangeFolded => self.hidden_by_range_folded,
+            GateFilterReason::MinRange => self.hidden_by_min_range,
+            GateFilterReason::Unattributed => 0,
+        }
+    }
+
+    /// All direct per-reason counts in stable order, without allocating.
+    pub fn reason_counts(&self) -> impl ExactSizeIterator<Item = (GateFilterReason, usize)> + '_ {
+        GateFilterReason::filter_criteria().map(|reason| (reason, self.hidden_by_reason(reason)))
+    }
+
     /// Fraction of the visible gates that were hidden, 0.0..=1.0.
     pub fn hidden_fraction(&self) -> f32 {
         if self.gates_visible == 0 {
@@ -497,18 +641,41 @@ impl GateFilterReport {
 
 /// Which gates of one moment grid a filter hides.
 ///
-/// One bit per gate, laid out row-major over the grid it was built for. Kept
-/// separate from the masked grid so a readout can answer "this gate is hidden
-/// by the filter" rather than reporting the censored gate as an absence, which
-/// would make the filter invisible at exactly the moment an analyst is asking
-/// about it.
+/// A union bit and one reason bit per category per gate, laid out row-major over
+/// the grid this mask was built for.  The union stays in the same standalone
+/// `Vec<u64>` the renderer used before reason coding, so its hot path retains
+/// the same compact cache footprint, indexed word load and bit test.  The reason
+/// planes live in a separate allocation read only by probes, reports and future
+/// QC tools.
+///
+/// The old mask payload cost one bit per nominal gate (plus row-end padding).
+/// The six reason planes make this payload seven bits per gate, still below one
+/// byte per gate and smaller than a union bitset plus a byte-sized reason object
+/// for every gate.  Source grids stay immutable: [`masked_grid`] clones before
+/// writing absence codes, while the renderer can consume this mask directly.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GateFilterMask {
     rows: usize,
     gate_count: usize,
     words_per_row: usize,
     bits: Vec<u64>,
+    reason_words: Vec<GateFilterReasonWord>,
     hidden_count: usize,
+}
+
+const GATE_FILTER_REASON_COUNT: usize = GateFilterReason::ALL.len();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GateFilterReasonWord {
+    by_reason: [u64; GATE_FILTER_REASON_COUNT],
+}
+
+impl GateFilterReasonWord {
+    fn add(&mut self, bit: u64, reasons: GateFilterReasons) {
+        for reason in reasons.iter() {
+            self.by_reason[reason.index()] |= bit;
+        }
+    }
 }
 
 impl GateFilterMask {
@@ -524,12 +691,50 @@ impl GateFilterMask {
         self.hidden_count
     }
 
+    /// True when this mask indexes the same rectangular lattice as `grid`.
+    pub fn matches_grid(&self, grid: &MomentGrid) -> bool {
+        self.gate_count == grid.gate_range.gate_count && self.rows == grid.radial_count()
+    }
+
     pub fn hides(&self, row: usize, gate: usize) -> bool {
         if row >= self.rows || gate >= self.gate_count {
             return false;
         }
         let word = row * self.words_per_row + gate / 64;
         self.bits[word] & (1 << (gate % 64)) != 0
+    }
+
+    /// Every known reason attached to one gate.  A kept gate and an out-of-range
+    /// coordinate both return [`GateFilterReasons::NONE`].
+    pub fn reasons(&self, row: usize, gate: usize) -> GateFilterReasons {
+        if row >= self.rows || gate >= self.gate_count {
+            return GateFilterReasons::NONE;
+        }
+        let word = &self.reason_words[row * self.words_per_row + gate / 64];
+        let bit = 1 << (gate % 64);
+        let mut reasons = GateFilterReasons::NONE;
+        for reason in GateFilterReason::all() {
+            if word.by_reason[reason.index()] & bit != 0 {
+                reasons.insert(reason);
+            }
+        }
+        reasons
+    }
+
+    pub fn hides_for(&self, row: usize, gate: usize, reason: GateFilterReason) -> bool {
+        if row >= self.rows || gate >= self.gate_count {
+            return false;
+        }
+        let word = &self.reason_words[row * self.words_per_row + gate / 64];
+        word.by_reason[reason.index()] & (1 << (gate % 64)) != 0
+    }
+
+    /// Gates carrying `reason`, independent of any other reasons they carry.
+    pub fn hidden_by_reason(&self, reason: GateFilterReason) -> usize {
+        self.reason_words
+            .iter()
+            .map(|word| word.by_reason[reason.index()].count_ones() as usize)
+            .sum()
     }
 }
 
@@ -706,6 +911,7 @@ pub fn evaluate_gate_filter(
 
     let words_per_row = gate_count.div_ceil(64);
     let mut bits = vec![0_u64; words_per_row * rows];
+    let mut reason_words = vec![GateFilterReasonWord::default(); words_per_row * rows];
     let values = GridValues::new(grid);
     let azimuths = row_azimuths(cut, grid);
     let first_gate_m = grid.gate_range.first_gate_m as f32;
@@ -713,8 +919,9 @@ pub fn evaluate_gate_filter(
 
     let counts = bits
         .par_chunks_exact_mut(words_per_row)
+        .zip(reason_words.par_chunks_exact_mut(words_per_row))
         .enumerate()
-        .map(|(row, row_bits)| {
+        .map(|(row, (row_bits, row_reasons))| {
             let azimuth_deg = azimuths[row];
             let base = row * gate_count;
             let mut counts = Counts::default();
@@ -728,13 +935,13 @@ pub fn evaluate_gate_filter(
                 counts.visible += 1;
 
                 let range_m = first_gate_m + gate as f32 * gate_spacing_m;
-                let mut hide = false;
+                let mut reasons = GateFilterReasons::NONE;
 
                 if let Some(threshold) = self_threshold
                     && value.is_some_and(|value| value < threshold)
                 {
                     counts.min_reflectivity += 1;
-                    hide = true;
+                    reasons.insert(GateFilterReason::MinReflectivity);
                 }
                 if let (Some(threshold), Some(sampler)) =
                     (reflectivity_threshold, reflectivity_sampler.as_ref())
@@ -742,7 +949,7 @@ pub fn evaluate_gate_filter(
                     match sampler.value_at(azimuth_deg, range_m) {
                         Some(dbz) if dbz < threshold => {
                             counts.velocity_reflectivity += 1;
-                            hide = true;
+                            reasons.insert(GateFilterReason::CompanionReflectivity);
                         }
                         Some(_) => {}
                         None => counts.unknown_reflectivity += 1,
@@ -754,7 +961,7 @@ pub fn evaluate_gate_filter(
                     match sampler.value_at(azimuth_deg, range_m) {
                         Some(rho) if rho < threshold => {
                             counts.min_correlation += 1;
-                            hide = true;
+                            reasons.insert(GateFilterReason::MinCorrelation);
                         }
                         Some(_) => {}
                         None => counts.unknown_correlation += 1,
@@ -762,18 +969,20 @@ pub fn evaluate_gate_filter(
                 }
                 if filter.hide_range_folded && folded {
                     counts.range_folded += 1;
-                    hide = true;
+                    reasons.insert(GateFilterReason::RangeFolded);
                 }
                 if let Some(min_range_m) = min_range_m
                     && range_m < min_range_m
                 {
                     counts.min_range += 1;
-                    hide = true;
+                    reasons.insert(GateFilterReason::MinRange);
                 }
 
-                if hide {
+                if !reasons.is_empty() {
                     counts.hidden += 1;
-                    row_bits[gate / 64] |= 1 << (gate % 64);
+                    let bit = 1 << (gate % 64);
+                    row_bits[gate / 64] |= bit;
+                    row_reasons[gate / 64].add(bit, reasons);
                 }
             }
             counts
@@ -806,6 +1015,7 @@ pub fn evaluate_gate_filter(
             gate_count,
             words_per_row,
             bits,
+            reason_words,
             hidden_count: counts.hidden,
         }),
         report,
@@ -873,12 +1083,12 @@ pub fn apply_gate_filter(
 /// The mask must have been built for this grid; a mask of a different shape
 /// refuses rather than blanking the wrong gates.
 pub fn masked_grid(grid: &MomentGrid, mask: &GateFilterMask) -> Option<MomentGrid> {
-    let gate_count = grid.gate_range.gate_count;
-    if mask.gate_count != gate_count || mask.rows != grid.radial_count() {
+    if !mask.matches_grid(grid) {
         debug_assert!(false, "gate filter mask does not match its grid");
         return None;
     }
 
+    let gate_count = grid.gate_range.gate_count;
     let mut filtered = grid.clone();
     let words_per_row = mask.words_per_row;
     let bits = &mask.bits;
@@ -910,6 +1120,11 @@ pub fn masked_grid(grid: &MomentGrid, mask: &GateFilterMask) -> Option<MomentGri
 /// gates that went absent between them, gives a mask that indexes the grid the
 /// raster actually walks - without having to model what the interpolator did.
 ///
+/// The two grids carry no reason planes, so each recovered legacy-style union
+/// bit is retained as [`GateFilterReason::Unattributed`].  The source mask and
+/// its exact criterion counts remain available to the cache; this transport
+/// mask refuses to fabricate a more specific cause from before/after absence.
+///
 /// `None` when the two grids are not the same shape, or when nothing went
 /// absent.
 pub fn absence_delta_mask(before: &MomentGrid, after: &MomentGrid) -> Option<GateFilterMask> {
@@ -925,12 +1140,14 @@ pub fn absence_delta_mask(before: &MomentGrid, after: &MomentGrid) -> Option<Gat
 
     let words_per_row = gate_count.div_ceil(64);
     let mut bits = vec![0_u64; words_per_row * rows];
+    let mut reason_words = vec![GateFilterReasonWord::default(); words_per_row * rows];
     let before_values = GridValues::new(before);
     let after_values = GridValues::new(after);
     let hidden_count: usize = bits
         .par_chunks_exact_mut(words_per_row)
+        .zip(reason_words.par_chunks_exact_mut(words_per_row))
         .enumerate()
-        .map(|(row, row_bits)| {
+        .map(|(row, (row_bits, row_reasons))| {
             let base = row * gate_count;
             let mut hidden = 0;
             for gate in 0..gate_count {
@@ -938,7 +1155,10 @@ pub fn absence_delta_mask(before: &MomentGrid, after: &MomentGrid) -> Option<Gat
                 let is_drawn = after_values.read(after, base + gate) != GateReading::Absent;
                 if was_drawn && !is_drawn {
                     hidden += 1;
-                    row_bits[gate / 64] |= 1 << (gate % 64);
+                    let bit = 1 << (gate % 64);
+                    row_bits[gate / 64] |= bit;
+                    row_reasons[gate / 64]
+                        .add(bit, GateFilterReasons::only(GateFilterReason::Unattributed));
                 }
             }
             hidden
@@ -950,6 +1170,7 @@ pub fn absence_delta_mask(before: &MomentGrid, after: &MomentGrid) -> Option<Gat
         gate_count,
         words_per_row,
         bits,
+        reason_words,
         hidden_count,
     })
 }

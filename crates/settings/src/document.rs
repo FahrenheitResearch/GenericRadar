@@ -84,6 +84,15 @@ pub struct WorkspaceSnapshot {
     /// the vocabulary, e.g. `"reflectivity"`) to palette name and rendering.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub palettes: BTreeMap<String, PaletteChoice>,
+    /// Per-producer-field colour choices. Keys are the exact namespaced
+    /// product ids the application stores in panes (for example
+    /// `"SOURCE_FIELD:ZH1C"`), never a shared colour-table family.
+    ///
+    /// An absent key means the source field follows its observed finite range
+    /// automatically. A present key records an explicit palette and range,
+    /// so adjusting one research-radar channel cannot recolour another.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_field_palettes: BTreeMap<String, SourceFieldPaletteChoice>,
     /// The live site last viewed, e.g. `"KTLX"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_site: Option<String>,
@@ -148,6 +157,27 @@ pub struct PaletteChoice {
     pub unknown: JsonMap<String, Json>,
 }
 
+/// One exact producer-native field's explicit colour-table choice.
+///
+/// The palette itself remains an ordinary `.pal` file when the analyst saves
+/// it; this snapshot keeps the stable name, current rendering, and the raw
+/// producer-value span that the field was edited over. Optional bounds make
+/// older and hand-edited files tolerant: an incomplete entry is ignored by
+/// the application rather than blanking a pane.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct SourceFieldPaletteChoice {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rendering: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f32>,
+    #[serde(flatten)]
+    pub unknown: JsonMap<String, Json>,
+}
+
 /// Outer window geometry in logical points.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct WindowSnapshot {
@@ -192,6 +222,15 @@ mod tests {
                 "layout": "four",
                 "panes": [ { "product": "REF", "neural_annotations": [1, 2] } ],
                 "palettes": { "reflectivity": { "name": "X", "rendering": "smooth", "gamut": "p3" } },
+                "source_field_palettes": {
+                    "SOURCE_FIELD:V1": {
+                        "name": "DOW velocity",
+                        "rendering": "smooth",
+                        "minimum": -48.0,
+                        "maximum": 48.0,
+                        "future_sampler": "cyclic"
+                    }
+                },
                 "teleporter": { "target": "KTLX" }
             },
             "biometrics": { "retina_lock": false }
@@ -213,6 +252,10 @@ mod tests {
         assert_eq!(
             rewritten["workspace"]["palettes"]["reflectivity"]["gamut"],
             json!("p3")
+        );
+        assert_eq!(
+            rewritten["workspace"]["source_field_palettes"]["SOURCE_FIELD:V1"]["future_sampler"],
+            json!("cyclic")
         );
         assert_eq!(
             rewritten["workspace"]["teleporter"]["target"],

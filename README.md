@@ -18,17 +18,34 @@ API keys, no telemetry.
 - An in-app browser for NOAA/NSSL's public KOUN RVP Level 1 archive, with
   background download progress, cancellation, non-overwriting writes to
   Downloads, and optional open-after-download
-- Multiple local files can be selected or dropped together. They are decoded
-  independently into a filename-ordered timeline; a bad file does not stop
-  the rest, and data from different radar positions is never silently combined
+- Multiple local files can be selected or dropped together. Operator-selected
+  local playlists are unlimited by default; a background preflight estimates
+  decoded RAM and asks **Continue** or **Cancel** above 16 GiB rather than
+  refusing the load. Optional frame and RAM limits remain available;
+  unattended live feeds retain a 30-frame/1-GiB fallback when those settings
+  are zero
+- Files decode in filename order into a timeline ordered by radar volume time.
+  A bad file does not stop the rest, different selected files with the same
+  radar and time remain distinct, and data from different radar positions is
+  never silently combined
+- One-cut Archive II/Message 31 research exports assemble into one logical
+  multi-elevation volume only when their internal volume sequence, radar
+  identity, exact recorded position, acquisition date/VCP and radial timing
+  agree. Ambiguous files stay independent; the same conservative assembly
+  applies inside mobile deployment ZIPs
 - **Export current view** writes the fully composited application window as a
   non-overwriting PNG directly to Downloads
 - Up to four linked panes: reflectivity, velocity (dealiased and
   storm-relative), spectrum width, ZDR, CC, PHI, KDP, and derived products
   (CREF, ET, VIL, VILD, MESH, POH/POSH)
-- Native DOW frequency/receiver-chain products DBMH1/2/M, DBMV1/2/M,
-  DBZH1/2/M and DBZV1/2/M, with received power kept in dBm and equivalent
-  reflectivity kept in dBZ
+- A dedicated DOW dual-frequency group models DBMH1/2/M, DBMV1/2/M,
+  DBZH1/2/M and DBZV1/2/M when available, keeping received power in dBm and
+  equivalent reflectivity in dBZ
+- DORADE, CfRadial and ODIM volumes also expose exact producer-native fields
+  under **SOURCE FIELDS FROM THIS FILE**. Names, descriptions, unit tokens and
+  observed ranges come from the file rather than inferred semantics; exact
+  source fields are 2D-only, and unsupported 3D/cross-section views say so
+  instead of substituting a modeled product
 - Gate filters on the 2D panes: a reflectivity floor, velocity gated on its
   companion reflectivity sweep, RhoHV censoring, range-folded gates, and a
   near-range cutoff, with presets. A pane that is hiding gates says so on its
@@ -41,7 +58,11 @@ API keys, no telemetry.
   orthographic globe at far zoom; beyond the radar's own surveillance range
   the view is turned to put north up at the middle of the pane
 - Optional raster imagery: USGS The National Map and OpenStreetMap
-- Colour tables rendered continuous (Oklab) or stepped, switchable per palette
+- Colour tables render continuous (Oklab) or stepped and are switchable and
+  editable per palette. Exact source fields start in automatic observed-range
+  display and support separate field-specific colours and fixed endpoints;
+  **Apply** is session-only unless the matching edit is saved, and **Reset to
+  observed range** restores automatic display
 - Eight themes, with interface scale, density, accent colour, and bevelled or
   flat chrome chosen separately; every theme holds 7:1 body-text contrast
   (WCAG AAA), and one is drawn so that all of its text does
