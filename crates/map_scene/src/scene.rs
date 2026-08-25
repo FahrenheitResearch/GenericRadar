@@ -258,18 +258,48 @@ impl MapSceneController {
         true
     }
 
-    /// Convenience for the common "make sure this pane can draw" call.
+    /// Find the closest drawable generation without crossing dataset,
+    /// projection, or style boundaries.
+    ///
+    /// A coarser bucket wins ties because its build region covers at least as
+    /// much ground as the finer alternative. Going through `geometry` also
+    /// keeps the fallback alive in the normal LRU residency policy.
+    fn nearest_resident(&mut self, key: GeometryCacheKey) -> Option<Arc<MapGeometry>> {
+        let nearest = self
+            .geometry
+            .iter()
+            .filter(|(candidate, geometry)| {
+                !geometry.is_empty()
+                    && candidate.dataset == key.dataset
+                    && candidate.projection == key.projection
+                    && candidate.style == key.style
+            })
+            .min_by_key(|(candidate, _)| {
+                let distance = (i32::from(candidate.lod.0) - i32::from(key.lod.0)).unsigned_abs();
+                (distance, std::cmp::Reverse(candidate.lod.0))
+            })
+            .map(|(candidate, _)| *candidate)?;
+        self.geometry(&nearest)
+    }
+
+    /// Return the exact pane geometry, or the closest drawable resident
+    /// generation while the exact level of detail is being built.
+    ///
+    /// Keeping previously rendered boundaries visible across an LOD transition
+    /// prevents the map from flashing blank during an ordinary zoom. A genuinely
+    /// empty cache still returns `None`: no geometry is invented or reused from
+    /// a different radar projection, dataset, or map style.
     pub fn geometry_for_pane(
         &mut self,
         pane_index: usize,
         km_per_point: f32,
     ) -> Option<Arc<MapGeometry>> {
         let key = self.key_for_pane(pane_index, km_per_point)?;
-        let existing = self.geometry(&key);
-        if existing.is_none() {
-            self.request(key);
+        if let Some(exact) = self.geometry(&key) {
+            return Some(exact);
         }
-        existing
+        self.request(key);
+        self.nearest_resident(key)
     }
 
     /// The display scale, which the tile zoom depends on.
@@ -689,5 +719,203 @@ mod tests {
     fn settle_request(controller: &mut MapSceneController, key: GeometryCacheKey) {
         controller.request(key);
         settle(controller, key);
+    }
+
+    /// Cross the selector's hysteresis bands the same way a real zoom does.
+    /// Looking up keys does not request geometry, so intermediate buckets stay
+    /// genuinely cold until a test explicitly builds them.
+    fn zoom_until(controller: &mut MapSceneController, target: LodBucket) -> f32 {
+        let mut scale = LOD_REFERENCE_KM_PER_POINT;
+        for _ in 0..4_000 {
+            let lod = controller.key_for_pane(0, scale).expect("anchored").lod;
+            if lod == target {
+                return scale;
+            }
+            scale *= if lod.0 > target.0 { 0.98 } else { 1.0 / 0.98 };
+        }
+        panic!("the camera never reached {target:?}");
+    }
+
+    #[test]
+    fn a_cold_bucket_falls_back_to_the_nearest_resident_one() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+
+        let warm_scale = zoom_until(&mut controller, LodBucket(0));
+        let warm = controller.key_for_pane(0, warm_scale).expect("anchored");
+        settle_request(&mut controller, warm);
+
+        let cold_scale = zoom_until(&mut controller, LodBucket(-1));
+        let cold = controller.key_for_pane(0, cold_scale).expect("anchored");
+        assert!(!controller.geometry.contains_key(&cold));
+
+        let drawn = controller
+            .geometry_for_pane(0, cold_scale)
+            .expect("a warm neighbor must prevent a blank frame");
+        assert!(!drawn.is_empty());
+        assert_eq!(drawn.key, warm);
+        assert!(
+            controller.pending.contains(&cold) || controller.geometry.contains_key(&cold),
+            "the exact bucket must still be requested"
+        );
+    }
+
+    #[test]
+    fn a_resident_bucket_is_never_displaced_by_a_neighbour() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+
+        for lod in [LodBucket(0), LodBucket(-1), LodBucket(-2)] {
+            let scale = zoom_until(&mut controller, lod);
+            let key = controller.key_for_pane(0, scale).expect("anchored");
+            settle_request(&mut controller, key);
+        }
+
+        for lod in [LodBucket(0), LodBucket(-1), LodBucket(-2)] {
+            let scale = zoom_until(&mut controller, lod);
+            let exact = controller.key_for_pane(0, scale).expect("anchored");
+            let drawn = controller.geometry_for_pane(0, scale).expect("resident");
+            assert_eq!(drawn.key, exact);
+        }
+    }
+
+    #[test]
+    fn an_empty_cache_still_answers_none() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+        assert!(
+            controller
+                .geometry_for_pane(0, LOD_REFERENCE_KM_PER_POINT)
+                .is_none(),
+            "no geometry can be drawn before the first build arrives"
+        );
+    }
+
+    #[test]
+    fn the_fallback_never_crosses_a_projection_change() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+        let warm_scale = zoom_until(&mut controller, LodBucket(0));
+        let warm = controller.key_for_pane(0, warm_scale).expect("anchored");
+        settle_request(&mut controller, warm);
+
+        controller.set_radar_anchor(41.36, -96.37);
+        let cold_scale = zoom_until(&mut controller, LodBucket(-1));
+        assert!(
+            controller.geometry_for_pane(0, cold_scale).is_none(),
+            "a different radar projection cannot reuse old coordinates"
+        );
+    }
+
+    #[test]
+    fn the_fallback_never_crosses_a_style_change() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+        let warm_scale = zoom_until(&mut controller, LodBucket(0));
+        let warm = controller.key_for_pane(0, warm_scale).expect("anchored");
+        settle_request(&mut controller, warm);
+
+        let mut style = controller.style();
+        style.county.width_px += 1.0;
+        controller.set_style(style);
+
+        let cold_scale = zoom_until(&mut controller, LodBucket(-1));
+        assert!(
+            controller.geometry_for_pane(0, cold_scale).is_none(),
+            "geometry from a previous visual style cannot be reused"
+        );
+    }
+
+    #[test]
+    fn equidistant_buckets_resolve_to_the_coarser_one() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+
+        for lod in [LodBucket(-1), LodBucket(1)] {
+            let scale = zoom_until(&mut controller, lod);
+            let key = controller.key_for_pane(0, scale).expect("anchored");
+            settle_request(&mut controller, key);
+        }
+
+        let scale = zoom_until(&mut controller, LodBucket(0));
+        let middle = controller.key_for_pane(0, scale).expect("anchored");
+        assert!(!controller.geometry.contains_key(&middle));
+
+        let drawn = controller.nearest_resident(middle).expect("two neighbors");
+        assert_eq!(drawn.key.lod, LodBucket(1));
+    }
+
+    #[test]
+    fn an_empty_nearer_bucket_cannot_hide_drawable_geometry() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+
+        let drawable_scale = zoom_until(&mut controller, LodBucket(2));
+        let drawable = controller
+            .key_for_pane(0, drawable_scale)
+            .expect("anchored");
+        settle_request(&mut controller, drawable);
+
+        let empty = GeometryCacheKey {
+            lod: LodBucket(1),
+            ..drawable
+        };
+        controller.geometry.insert(
+            empty,
+            Arc::new(MapGeometry::new(
+                empty,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+            )),
+        );
+
+        let cold_scale = zoom_until(&mut controller, LodBucket(0));
+        let cold = controller.key_for_pane(0, cold_scale).expect("anchored");
+        let drawn = controller
+            .nearest_resident(cold)
+            .expect("a farther drawable bucket remains available");
+        assert_eq!(drawn.key, drawable);
+        assert!(!drawn.is_empty());
+    }
+
+    #[test]
+    fn the_fallback_rejects_every_mismatched_generation() {
+        let mut controller = controller();
+        controller.set_radar_anchor(35.33, -97.28);
+
+        let warm_scale = zoom_until(&mut controller, LodBucket(0));
+        let warm = controller.key_for_pane(0, warm_scale).expect("anchored");
+        settle_request(&mut controller, warm);
+        let geometry = controller.geometry.remove(&warm).expect("resident");
+
+        let stale_generation = Generation::new(u64::MAX);
+        for candidate in [
+            GeometryCacheKey {
+                dataset: stale_generation,
+                ..warm
+            },
+            GeometryCacheKey {
+                projection: stale_generation,
+                ..warm
+            },
+            GeometryCacheKey {
+                style: stale_generation,
+                ..warm
+            },
+        ] {
+            controller.geometry.insert(candidate, Arc::clone(&geometry));
+        }
+
+        let cold = GeometryCacheKey {
+            lod: LodBucket(-1),
+            ..warm
+        };
+        assert!(
+            controller.nearest_resident(cold).is_none(),
+            "dataset, projection, and style generation mismatches must all be rejected"
+        );
     }
 }

@@ -555,6 +555,9 @@ const RESOLUTION_NOTICE_WIDTH: f32 = 560.0;
 
 const MAX_LOAD_RESULTS_PER_FRAME: usize = 4;
 const MAX_RENDER_RESULTS_PER_FRAME: usize = 4;
+/// Smooth display-only reprojection while a newer radar render is in flight.
+/// Scientific readouts sample the decoded volume, never this screen texture.
+const RADAR_TEXTURE_OPTIONS: egui::TextureOptions = egui::TextureOptions::LINEAR;
 const TIMELINE_HEIGHT: f32 = 34.0;
 /// How long the loop holds each frame, by default.
 ///
@@ -1516,6 +1519,11 @@ impl WorkstationApp {
                 registry,
                 keys::navigation::CATEGORY,
                 keys::navigation::DOUBLE_CLICK_RESET,
+            ),
+            smooth_camera: store.effective_bool(
+                registry,
+                keys::navigation::CATEGORY,
+                keys::navigation::SMOOTH_CAMERA,
             ),
         };
         self.settings_cache = SettingsCache {
@@ -3624,7 +3632,7 @@ impl WorkstationApp {
         });
         if can_update {
             if let Some(texture) = &mut runtime.texture {
-                texture.handle.set(image, egui::TextureOptions::NEAREST);
+                texture.handle.set(image, RADAR_TEXTURE_OPTIONS);
                 texture.stamp = rendered.stamp;
                 texture.camera = rendered.camera;
                 texture.viewport = rendered.viewport;
@@ -3641,7 +3649,7 @@ impl WorkstationApp {
                     rendered.height
                 ),
                 image,
-                egui::TextureOptions::NEAREST,
+                RADAR_TEXTURE_OPTIONS,
             );
             runtime.texture = Some(InstalledTexture {
                 handle,
@@ -9866,6 +9874,23 @@ mod tests {
         let app = test_app();
         assert_eq!(app.appearance(), crate::theme::Appearance::default());
         assert_eq!(app.appearance().theme.id, "light");
+    }
+
+    #[test]
+    fn smooth_camera_motion_defaults_on_and_can_be_disabled_in_navigation_settings() {
+        use crate::settings_ui::catalog::keys;
+
+        let mut app = test_app();
+        assert!(app.settings_cache.nav.smooth_camera);
+
+        app.settings_store.set(
+            keys::navigation::CATEGORY,
+            keys::navigation::SMOOTH_CAMERA,
+            settings::SettingValue::Bool(false),
+        );
+        app.recompute_settings_cache();
+
+        assert!(!app.settings_cache.nav.smooth_camera);
     }
 
     /// ...and a stored id this build does not know resolves around, without

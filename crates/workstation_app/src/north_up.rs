@@ -1569,4 +1569,115 @@ mod tests {
         }
         difference
     }
+
+    /// AN EASED GESTURE IS THE SAME GESTURE, resolved through the same frame.
+    ///
+    /// `analyst_runtime::CameraMotion` turns one wheel notch into a run of
+    /// small zooms spread over about a fifth of a second, and every one of them
+    /// comes through here. Two things had to be true for that to be safe and
+    /// neither is obvious:
+    ///
+    /// * The run has to LAND where the single gesture lands. The rule turns the
+    ///   map as a function of the view centre, so each small step is resolved
+    ///   through a slightly different rotation than the whole step would have
+    ///   been; the midpoint resolution is what keeps that from accumulating,
+    ///   and this is the proof that it does for a run of forty steps and not
+    ///   only for a pair.
+    /// * The run and its REVERSE still have to compose to the identity, because
+    ///   an analyst who eases in and eases straight back out has done nothing.
+    ///
+    /// Both are asserted in screen points, on the whole probe table, at the
+    /// same tolerance the single-gesture proofs use.
+    #[test]
+    fn an_eased_zoom_lands_where_the_same_zoom_in_one_step_lands() {
+        use analyst_runtime::CameraMotion;
+
+        const FRAME: f32 = 1.0 / 60.0;
+        let notches = zoom_factor_for_notches(3.0);
+        let mut worst_landing = 0.0f64;
+        let mut worst_round_trip = 0.0f64;
+        let mut worst_where = String::new();
+        for (id, lat, lon) in shipped_sites().into_iter().step_by(11) {
+            let frame = frame_at(lat, lon);
+            for centre in probe_centres(lat) {
+                for &scale in PROBE_SCALES {
+                    let start = camera_at(centre, scale);
+
+                    let mut instant = frame.display_camera(start);
+                    frame.resolve(
+                        &mut instant,
+                        Gesture::Zoom {
+                            factor: notches,
+                            anchor: CORNER,
+                        },
+                    );
+
+                    let mut motion = CameraMotion::new();
+                    motion.retarget_zoom(notches, CORNER);
+                    let mut eased = frame.display_camera(start);
+                    for _ in 0..600 {
+                        let step = motion.step(FRAME);
+                        frame.resolve(
+                            &mut eased,
+                            Gesture::Zoom {
+                                factor: step.zoom_factor,
+                                anchor: step.zoom_anchor,
+                            },
+                        );
+                        if motion.is_idle() {
+                            break;
+                        }
+                    }
+                    assert!(motion.is_idle(), "{id}: the glide never settled");
+
+                    let landing = drift_km(instant, eased) / f64::from(scale);
+                    if landing > worst_landing {
+                        worst_landing = landing;
+                        worst_where = format!("{id} centre={centre:?} scale={scale}");
+                    }
+                    assert!(
+                        landing <= CENTRE_TOLERANCE_POINTS,
+                        "{id} at {centre:?}, {scale} km/point: the eased zoom landed \
+                         {landing:.6} screen points from the same zoom in one step"
+                    );
+                    assert!(
+                        (f64::from(eased.km_per_point) / f64::from(instant.km_per_point) - 1.0)
+                            .abs()
+                            <= SCALE_TOLERANCE,
+                        "{id}: the eased zoom landed on {} instead of {}",
+                        eased.km_per_point,
+                        instant.km_per_point
+                    );
+
+                    // And straight back out, eased as well.
+                    let mut back = CameraMotion::new();
+                    back.retarget_zoom(1.0 / notches, CORNER);
+                    for _ in 0..600 {
+                        let step = back.step(FRAME);
+                        frame.resolve(
+                            &mut eased,
+                            Gesture::Zoom {
+                                factor: step.zoom_factor,
+                                anchor: step.zoom_anchor,
+                            },
+                        );
+                        if back.is_idle() {
+                            break;
+                        }
+                    }
+                    let round_trip = drift_km(start, eased) / f64::from(scale);
+                    worst_round_trip = worst_round_trip.max(round_trip);
+                    assert!(
+                        round_trip <= CENTRE_TOLERANCE_POINTS,
+                        "{id} at {centre:?}, {scale} km/point: an eased zoom out and back \
+                         moved the centre {round_trip:.6} screen points"
+                    );
+                }
+            }
+        }
+        println!(
+            "eased zoom: worst landing error {worst_landing:.9} screen points \
+             ({worst_where}), worst out-and-back drift {worst_round_trip:.9} points"
+        );
+    }
 }

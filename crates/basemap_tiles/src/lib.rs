@@ -54,7 +54,7 @@ mod tile_math;
 mod visibility;
 
 pub use decode::DecodedTile;
-pub use mesh::{TileMesh, TileVertex, build_tile_mesh};
+pub use mesh::{TileMesh, TileVertex, build_tile_mesh, build_tile_mesh_with_floor};
 pub use provider::TileProvider;
 pub use store::{
     TileCacheConfig, TileState, TileStore, TileStoreMetrics, default_cache_dir, default_user_agent,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use analyst_runtime::{
-    Camera2D, NavInput, PaneId, PaneLayout, ScreenPoint, TRACKPAD_POINTS_PER_NOTCH,
+    Camera2D, CameraMotion, NavInput, PaneId, PaneLayout, ScreenPoint, TRACKPAD_POINTS_PER_NOTCH,
     ViewportMetrics, WheelNotches, WorldPoint, ZoomResponder,
 };
 use color_tables::hazards::{HAZARD_FILL_ALPHA, HAZARD_STROKE_WIDTH};
@@ -41,6 +41,16 @@ pub struct NavTuning {
     pub kzoom_exp: f32,
     /// Whether double-clicking a pane resets its camera to the home view.
     pub double_click_reset: bool,
+    /// Whether the wheel eases into its target and a released drag glides,
+    /// rather than both landing between two frames.
+    ///
+    /// The escape hatch the phase design asks for. Motion constants that feel
+    /// right on one machine can feel floaty on another, and the raw path has to
+    /// stay one flag away rather than one revert away: with this `false`,
+    /// `draw_pane` applies every gesture the instant it arrives, which is
+    /// bit-for-bit what shipped before `analyst_runtime::CameraMotion` existed.
+    /// Defaults ON.
+    pub smooth_camera: bool,
 }
 
 impl Default for NavTuning {
@@ -51,6 +61,7 @@ impl Default for NavTuning {
             pan_scale: 1.0,
             kzoom_exp: 1.0,
             double_click_reset: true,
+            smooth_camera: true,
         }
     }
 }
@@ -292,13 +303,41 @@ pub fn draw_pane_with_layers(
     let mut updated_camera = camera;
     let mut camera_changed = false;
 
+    // This pane's carried motion. Kept in egui's temporary memory beside the
+    // pane's `ZoomResponder`, for the same reasons: it is per pane, it is
+    // runtime state rather than analyst intent, and nothing outside this
+    // function needs to see it. A pane that stops being drawn stops moving,
+    // which is the right answer for a layout change.
+    let motion_id = ui.id().with(("pane-camera-motion", pane.get()));
+    let mut motion = if tuning.smooth_camera {
+        ui.ctx()
+            .data(|data| data.get_temp::<CameraMotion>(motion_id))
+            .unwrap_or_default()
+    } else {
+        // Turning smoothing off is a decision, not a pause. Clear any spring
+        // or fling already retained for this pane so turning it back on later
+        // cannot resume an old gesture the analyst explicitly cancelled.
+        ui.ctx()
+            .data_mut(|data| data.remove::<CameraMotion>(motion_id));
+        CameraMotion::new()
+    };
+    let (now_seconds, frame_seconds) = ui.input(|input| (input.time, input.stable_dt));
+
     // Every camera gesture below goes through `north_up.resolve` rather than
     // straight at `Camera2D`, so that a gesture and its reverse still compose
     // to the identity while the map is being turned north-up under them. See
     // `crate::north_up` for what that costs and what it replaced.
+    //
+    // The MOTION goes through it too, one step per frame, for exactly the same
+    // reason plus one more: `Camera2D::zoom_about`'s factor clamp is what stops
+    // an anchor correction walking the map off screen at a scale limit, and a
+    // spring that wrote the scale directly would step around it.
     if response.dragged() {
         let delta = ui.input(|input| input.pointer.delta());
         if delta.length_sq() > 0.0 {
+            // A finger is never sprung: the ground under the pointer is the
+            // ground under the pointer. The motion only WATCHES the drag, so
+            // that the release has a speed to glide with.
             north_up.resolve(
                 &mut updated_camera,
                 Gesture::Pan {
@@ -308,6 +347,10 @@ pub fn draw_pane_with_layers(
             );
             camera_changed = true;
         }
+        motion.record_drag(delta.x, delta.y, now_seconds);
+    }
+    if response.drag_stopped() {
+        motion.release_drag(now_seconds);
     }
 
     if response.hovered() {
@@ -323,14 +366,22 @@ pub fn draw_pane_with_layers(
                 .input(|input| input.pointer.hover_pos())
                 .unwrap_or(rect.center());
             let local = ScreenPoint::new(pointer.x - rect.left(), pointer.y - rect.top());
-            north_up.resolve(
-                &mut updated_camera,
-                Gesture::Zoom {
-                    factor,
-                    anchor: local,
-                },
-            );
-            camera_changed = true;
+            if tuning.smooth_camera {
+                // The notch retargets the spring instead of multiplying the
+                // camera, so the burst gain the responder already computed
+                // becomes a bigger target - a fast scroll is a fast glide
+                // rather than a teleport.
+                motion.retarget_zoom(factor, local);
+            } else {
+                north_up.resolve(
+                    &mut updated_camera,
+                    Gesture::Zoom {
+                        factor,
+                        anchor: local,
+                    },
+                );
+                camera_changed = true;
+            }
         }
     }
 
@@ -338,8 +389,12 @@ pub fn draw_pane_with_layers(
     // be hunting for a scale with a wheel.
     let nav = keyboard_nav(ui, active);
     if !nav.is_idle() {
-        let dt = ui.input(|input| input.stable_dt);
+        let dt = frame_seconds;
         if nav.reset {
+            // A reset is a decision, not a destination: finishing the glide it
+            // interrupted would carry the camera off the home view the analyst
+            // just asked for.
+            motion.stop();
             // Reset wins outright inside `apply_nav`; splitting it would
             // let the zoom pass move a camera the reset just homed.
             camera_changed |= north_up.resolve(
@@ -385,8 +440,58 @@ pub fn draw_pane_with_layers(
     }
 
     if tuning.double_click_reset && response.double_clicked() {
+        // Same as the reset key: the home view is the answer, not a waypoint
+        // on the way to whatever was still gliding.
+        motion.stop();
         updated_camera = Camera2D::default();
         camera_changed = true;
+    }
+
+    // ONE step of carried motion, after this frame's input and before anything
+    // is drawn, so a notch that arrived this frame is already partly on screen
+    // in the frame it arrived - the design's "the spring targets, not delays,
+    // the gesture".
+    if tuning.smooth_camera {
+        let step = motion.step(frame_seconds);
+        if step.zoom_factor != 1.0 {
+            camera_changed |= north_up.resolve(
+                &mut updated_camera,
+                Gesture::Zoom {
+                    factor: step.zoom_factor,
+                    anchor: step.zoom_anchor,
+                },
+            );
+        }
+        if step.pan_delta_points != (0.0, 0.0) {
+            camera_changed |= north_up.resolve(
+                &mut updated_camera,
+                Gesture::Pan {
+                    delta_x_points: step.pan_delta_points.0,
+                    delta_y_points: step.pan_delta_points.1,
+                },
+            );
+        }
+        // CARRIED and MOVING are different questions, and conflating them cost
+        // the fling: a drag in progress is not moving the camera on its own -
+        // the pointer is - but it IS accumulating the pointer history the
+        // release needs, so a motion that is idle can still have something to
+        // remember. Stored on "not pristine", repainted on "not idle".
+        if motion == CameraMotion::new() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<CameraMotion>(motion_id));
+        } else {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(motion_id, motion));
+        }
+        if !motion.is_idle() {
+            // Nothing else will ask for the frame this motion needs: the input
+            // event that started it is long gone. It stops asking the moment
+            // the motion settles, which is why settling exactly matters - a
+            // motion that only approached its target would pin the CPU and
+            // leave the radar raster, keyed on the exact camera, permanently
+            // one render behind.
+            ui.ctx().request_repaint();
+        }
     }
 
     // Ctrl+click asks for the nearest S-band radar, and the site markers have
@@ -2681,6 +2786,21 @@ mod tests {
         active: bool,
         frames: Vec<(f64, Vec<egui::Event>)>,
     ) -> PaneInteraction {
+        pane_frames_tuned(context, rect, camera, active, NavTuning::default(), frames)
+            .pop()
+            .expect("at least one frame")
+    }
+
+    /// Every frame's interaction, so a test can watch a glide rather than only
+    /// its landing.
+    fn pane_frames_tuned(
+        context: &egui::Context,
+        rect: egui::Rect,
+        camera: Camera2D,
+        active: bool,
+        tuning: NavTuning,
+        frames: Vec<(f64, Vec<egui::Event>)>,
+    ) -> Vec<PaneInteraction> {
         let map = PaneMap::default();
         let overlay = PaneOverlay {
             legend: None,
@@ -2691,7 +2811,7 @@ mod tests {
             spectrum: None,
         };
         let mut camera = camera;
-        let mut last = None;
+        let mut out = Vec::with_capacity(frames.len());
         for (time, events) in frames {
             let interaction = run_pass(context, time, events, |ui| {
                 draw_pane(
@@ -2701,7 +2821,7 @@ mod tests {
                     active,
                     camera,
                     NorthUpFrame::unrotated(),
-                    NavTuning::default(),
+                    tuning,
                     None,
                     &map,
                     "KEAX 0.5 REF",
@@ -2710,9 +2830,33 @@ mod tests {
                 )
             });
             camera = interaction.camera;
-            last = Some(interaction);
+            out.push(interaction);
         }
-        last.expect("at least one frame")
+        out
+    }
+
+    /// One frame every sixtieth of a second, starting at `from`. `events` is
+    /// applied on the frame at index `at`; every other frame is empty except
+    /// for the pointer, which egui needs restated to keep the pane hovered.
+    fn frame_schedule(
+        from: f64,
+        count: usize,
+        at: usize,
+        cursor: Option<egui::Pos2>,
+        events: Vec<egui::Event>,
+    ) -> Vec<(f64, Vec<egui::Event>)> {
+        (0..count)
+            .map(|frame| {
+                let mut this = Vec::new();
+                if let Some(cursor) = cursor {
+                    this.push(egui::Event::PointerMoved(cursor));
+                }
+                if frame == at {
+                    this.extend(events.iter().cloned());
+                }
+                (from + frame as f64 / 60.0, this)
+            })
+            .collect()
     }
 
     #[test]
@@ -2731,24 +2875,33 @@ mod tests {
         let local = ScreenPoint::new(cursor.x - rect.left(), cursor.y - rect.top());
         let under_cursor = start.screen_to_world(local, viewport);
 
-        let interaction = pane_frames(
+        // Sixty frames: the notch lands on the second, and the rest are the
+        // glide `analyst_runtime::CameraMotion` carries it in. The camera is
+        // asserted at its DESTINATION, which is where the analyst reads it.
+        let frames = pane_frames_tuned(
             &context,
             rect,
             start,
             true,
-            vec![
-                (1.0, vec![egui::Event::PointerMoved(cursor)]),
-                (
-                    1.016,
-                    vec![
-                        egui::Event::PointerMoved(cursor),
-                        wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE),
-                    ],
-                ),
-            ],
+            NavTuning::default(),
+            frame_schedule(
+                1.0,
+                60,
+                1,
+                Some(cursor),
+                vec![wheel(
+                    egui::MouseWheelUnit::Line,
+                    1.0,
+                    egui::Modifiers::NONE,
+                )],
+            ),
         );
+        let interaction = frames.last().expect("frames");
 
-        assert!(interaction.camera_changed, "the pane reported no change");
+        assert!(
+            frames[1].camera_changed,
+            "the notch did not move the camera in the frame it arrived"
+        );
         assert_eq!(interaction.viewport, viewport);
         let expected = DEFAULT_KM_PER_POINT / ZOOM_PER_NOTCH;
         assert!(
@@ -2770,6 +2923,315 @@ mod tests {
             centred.center_east_km, interaction.camera.center_east_km,
             "the zoom was anchored on the pane centre, not the pointer"
         );
+    }
+
+    /// THE FEEL, at the wiring: a notch arrives as a GLIDE, and the glide is
+    /// what the analyst sees.
+    ///
+    /// Three things, each of which was a separate way to get this wrong:
+    /// the camera has to move in the frame the notch arrives (a spring that
+    /// waits for the next frame is a spring that added latency), it must not be
+    /// most of the way there in that frame (or there is no glide), and it must
+    /// still be moving after the input event is long gone (which is what
+    /// `request_repaint` has to have been asked for).
+    #[test]
+    fn a_notch_arrives_as_a_glide_that_starts_at_once_and_keeps_going() {
+        let context = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cursor = egui::pos2(731.0, 96.0);
+        let frames = pane_frames_tuned(
+            &context,
+            rect,
+            Camera2D::default(),
+            true,
+            NavTuning::default(),
+            frame_schedule(
+                1.0,
+                60,
+                1,
+                Some(cursor),
+                vec![wheel(
+                    egui::MouseWheelUnit::Line,
+                    1.0,
+                    egui::Modifiers::NONE,
+                )],
+            ),
+        );
+        let whole = (DEFAULT_KM_PER_POINT / ZOOM_PER_NOTCH).ln() - DEFAULT_KM_PER_POINT.ln();
+        let covered = |frame: &PaneInteraction| {
+            (frame.camera.km_per_point.ln() - DEFAULT_KM_PER_POINT.ln()) / whole
+        };
+
+        // Frame 1 carries the notch and already shows part of it.
+        let first = covered(&frames[1]);
+        assert!(
+            (0.02..0.20).contains(&first),
+            "the frame the notch arrived in covered {first} of it"
+        );
+        // Still going a quarter of a second later, with no further input.
+        assert!(
+            covered(&frames[3]) > first,
+            "the glide stopped as soon as the event did"
+        );
+        // Monotone all the way, and no overshoot past the notch.
+        let mut previous = 0.0_f32;
+        for (index, frame) in frames.iter().enumerate() {
+            let at = covered(frame);
+            assert!(
+                at >= previous - 1.0e-6,
+                "frame {index} went backwards: {at} after {previous}"
+            );
+            assert!(at <= 1.0 + 1.0e-4, "frame {index} overshot to {at}");
+            previous = at;
+        }
+        // Arrived, and stopped: the last frames are identical, which is what
+        // "no infinite repaint" looks like from outside.
+        assert!(previous > 0.999, "the glide never arrived: {previous}");
+        assert_eq!(
+            frames[58].camera.km_per_point.to_bits(),
+            frames[59].camera.km_per_point.to_bits(),
+            "the camera was still moving after a full second"
+        );
+        assert!(
+            !frames[59].camera_changed,
+            "the pane still reports a moving camera after a full second"
+        );
+    }
+
+    /// THE ESCAPE HATCH. With smoothing off the notch lands between two frames,
+    /// bit for bit as it did before the motion model existed - which is what
+    /// makes the flag a real fallback rather than a slower version of the same
+    /// path.
+    #[test]
+    fn smoothing_off_lands_the_notch_in_one_frame() {
+        let context = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cursor = egui::pos2(731.0, 96.0);
+        let raw = NavTuning {
+            smooth_camera: false,
+            ..NavTuning::default()
+        };
+        let frames = pane_frames_tuned(
+            &context,
+            rect,
+            Camera2D::default(),
+            true,
+            raw,
+            frame_schedule(
+                1.0,
+                4,
+                1,
+                Some(cursor),
+                vec![wheel(
+                    egui::MouseWheelUnit::Line,
+                    1.0,
+                    egui::Modifiers::NONE,
+                )],
+            ),
+        );
+        let expected = DEFAULT_KM_PER_POINT / ZOOM_PER_NOTCH;
+        // The whole notch, in the frame it arrived.
+        assert!(
+            (frames[1].camera.km_per_point / expected - 1.0).abs() < 1.0e-6,
+            "{}",
+            frames[1].camera.km_per_point
+        );
+        // And nothing after it: no glide, no residue.
+        assert_eq!(
+            frames[1].camera.km_per_point.to_bits(),
+            frames[3].camera.km_per_point.to_bits()
+        );
+        assert!(!frames[2].camera_changed && !frames[3].camera_changed);
+    }
+
+    /// Changing the real navigation setting mid-glide must discard its saved
+    /// motion, not leave a spring waiting to jump when smoothing is restored.
+    #[test]
+    fn turning_smoothing_off_discards_motion_before_it_can_be_reenabled() {
+        let context = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cursor = egui::pos2(731.0, 96.0);
+        let smooth = NavTuning::default();
+        let raw = NavTuning {
+            smooth_camera: false,
+            ..smooth
+        };
+
+        let started = pane_frames_tuned(
+            &context,
+            rect,
+            Camera2D::default(),
+            true,
+            smooth,
+            frame_schedule(
+                1.0,
+                3,
+                1,
+                Some(cursor),
+                vec![wheel(
+                    egui::MouseWheelUnit::Line,
+                    1.0,
+                    egui::Modifiers::NONE,
+                )],
+            ),
+        );
+        let interrupted = started.last().expect("a glide was started").camera;
+        let destination = DEFAULT_KM_PER_POINT / ZOOM_PER_NOTCH;
+        assert!(
+            interrupted.km_per_point > destination,
+            "the spring was already settled before smoothing was disabled"
+        );
+
+        let disabled = pane_frames_tuned(
+            &context,
+            rect,
+            interrupted,
+            true,
+            raw,
+            frame_schedule(1.0 + 3.0 / 60.0, 2, usize::MAX, Some(cursor), Vec::new()),
+        );
+        for frame in &disabled {
+            assert_eq!(frame.camera, interrupted);
+            assert!(!frame.camera_changed);
+        }
+
+        let restored = pane_frames_tuned(
+            &context,
+            rect,
+            interrupted,
+            true,
+            smooth,
+            frame_schedule(1.0 + 5.0 / 60.0, 30, usize::MAX, Some(cursor), Vec::new()),
+        );
+        for (index, frame) in restored.iter().enumerate() {
+            assert_eq!(
+                frame.camera, interrupted,
+                "frame {index} resumed a spring that disabling smoothing should discard"
+            );
+            assert!(!frame.camera_changed);
+        }
+    }
+
+    /// A RELEASED DRAG KEEPS GOING, and stops. Inertia is the half of the feel
+    /// fix that the wheel cannot deliver, and a glide that never stopped would
+    /// pin the frame loop.
+    #[test]
+    fn a_released_drag_glides_on_and_then_settles() {
+        let context = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let start = egui::pos2(500.0, 400.0);
+        let mut frames: Vec<(f64, Vec<egui::Event>)> = Vec::new();
+        // Put the pointer on the pane and press.
+        frames.push((0.0, vec![egui::Event::PointerMoved(start)]));
+        frames.push((
+            1.0 / 60.0,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        ));
+        // Eight frames of a brisk drag east.
+        let mut position = start;
+        for step in 0..8 {
+            position.x += 24.0;
+            frames.push((
+                (step + 2) as f64 / 60.0,
+                vec![egui::Event::PointerMoved(position)],
+            ));
+        }
+        // Release, without moving.
+        frames.push((
+            10.0 / 60.0,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ));
+        // And two seconds of nothing at all.
+        for step in 0..120 {
+            frames.push(((11 + step) as f64 / 60.0, Vec::new()));
+        }
+        let interactions = pane_frames_tuned(
+            &context,
+            rect,
+            Camera2D::default(),
+            true,
+            NavTuning::default(),
+            frames,
+        );
+
+        let at_release = interactions[10].camera.center_east_km;
+        assert!(
+            at_release < -10.0,
+            "the drag itself did not pan west: {at_release}"
+        );
+        // The fling carries it further the same way, without any input.
+        let after = interactions[30].camera.center_east_km;
+        assert!(
+            after < at_release - 1.0,
+            "the release did not glide: {at_release} -> {after}"
+        );
+        // And it stops. The last two frames are bit-identical and the pane has
+        // stopped reporting a moving camera, so nothing is asking for the next
+        // frame on the map's account.
+        let last = interactions.len() - 1;
+        assert_eq!(
+            interactions[last].camera.center_east_km.to_bits(),
+            interactions[last - 1].camera.center_east_km.to_bits(),
+            "the fling was still moving two seconds after release"
+        );
+        assert!(!interactions[last].camera_changed);
+    }
+
+    /// A reset is a decision, so it must not be followed by the glide it
+    /// interrupted carrying the camera back off the home view.
+    #[test]
+    fn the_home_key_ends_a_glide_instead_of_being_overtaken_by_it() {
+        let context = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cursor = egui::pos2(900.0, 120.0);
+        let mut frames = frame_schedule(
+            1.0,
+            3,
+            1,
+            Some(cursor),
+            // A hard spin, so there is a long glide to interrupt.
+            (0..6)
+                .map(|_| wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE))
+                .collect(),
+        );
+        frames.push((1.0 + 3.0 / 60.0, vec![key(egui::Key::Home, true)]));
+        for step in 0..30 {
+            frames.push((1.0 + (4 + step) as f64 / 60.0, Vec::new()));
+        }
+        let interactions = pane_frames_tuned(
+            &context,
+            rect,
+            Camera2D::default(),
+            true,
+            NavTuning::default(),
+            frames,
+        );
+        // The spin really was still gliding when Home landed.
+        assert!(
+            interactions[2].camera.km_per_point < DEFAULT_KM_PER_POINT * 0.98,
+            "the spin did not move: {}",
+            interactions[2].camera.km_per_point
+        );
+        for (index, interaction) in interactions.iter().enumerate().skip(3) {
+            assert_eq!(
+                interaction.camera,
+                Camera2D::default(),
+                "frame {index}: the glide carried the camera off the home view"
+            );
+        }
     }
 
     /// The keyboard reaches the camera through the same return path, and only

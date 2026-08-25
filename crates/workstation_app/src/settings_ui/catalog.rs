@@ -94,6 +94,7 @@ pub mod keys {
     }
     pub mod navigation {
         pub const CATEGORY: &str = "navigation";
+        pub const SMOOTH_CAMERA: &str = "smooth_camera";
         pub const ZOOM_PER_NOTCH: &str = "zoom_per_notch";
         pub const BURST_GAIN_CAP: &str = "burst_gain_cap";
         pub const KEY_PAN_RATE: &str = "key_pan_rate";
@@ -689,6 +690,10 @@ fn navigation_category() -> SettingsCategory {
         k::CATEGORY,
         "Navigation",
         vec![
+            SettingSpec::new(k::SMOOTH_CAMERA, "Smooth camera motion", toggle(true)).help(
+                "Animate zoom changes and continue a quick pan naturally after release. Turn \
+                 off for immediate, unsmoothed camera movement.",
+            ),
             SettingSpec::new(
                 k::ZOOM_PER_NOTCH,
                 "Zoom per notch",
@@ -2158,6 +2163,11 @@ mod tests {
             std::env::temp_dir().join("settings-catalog-proof-never-written.json"),
         );
         let f = |id| store.effective_float(&registry, keys::navigation::CATEGORY, id);
+        assert!(store.effective_bool(
+            &registry,
+            keys::navigation::CATEGORY,
+            keys::navigation::SMOOTH_CAMERA,
+        ));
         assert_eq!(
             f(keys::navigation::ZOOM_PER_NOTCH) as f32,
             analyst_runtime::ZOOM_PER_NOTCH

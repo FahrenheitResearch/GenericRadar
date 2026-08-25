@@ -72,6 +72,12 @@ API keys, no telemetry.
   orthographic globe at far zoom; beyond the radar's own surveillance range
   the view is turned to put north up at the middle of the pane
 - Optional raster imagery: USGS The National Map and OpenStreetMap
+- Seam-free raster map tiles and continuous vector boundaries while changing
+  zoom levels; previously loaded map detail stays visible until its exact
+  replacement is ready
+- Cursor-anchored animated zoom and inertial panning, controlled by
+  **Settings → Navigation → Smooth camera motion**. Radar imagery is smoothly
+  resampled during movement without changing decoded gate values or readouts
 - Colour tables render continuous (Oklab) or stepped and are switchable and
   editable per palette. Exact source fields start in automatic observed-range
   display and support separate field-specific colours and fixed endpoints;

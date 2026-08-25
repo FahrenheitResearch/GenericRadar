@@ -6,12 +6,17 @@
 
 #![forbid(unsafe_code)]
 
+mod camera_motion;
 mod generation;
 mod history;
 mod jobs;
 mod view;
 mod workspace;
 
+pub use camera_motion::{
+    CameraMotion, MotionStep, PAN_FLING_DECAY_SECONDS, PAN_FLING_MAX_SPEED_POINTS_PER_SECOND,
+    PAN_VELOCITY_WINDOW_SECONDS, ZOOM_RESPONSE_SECONDS,
+};
 pub use generation::{Generation, GenerationClock, RenderStamp, SceneStamp};
 pub use history::{
     FrameIdentity, FrameOrigin, FrameStage, HistoryPolicy, InstallDisposition, InstallReport,

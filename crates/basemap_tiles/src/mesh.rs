@@ -106,13 +106,34 @@ pub fn build_tile_mesh<P>(tile: TileId, project: P) -> Option<TileMesh>
 where
     P: Fn(f64, f64) -> Option<(f64, f64)>,
 {
+    build_tile_mesh_with_floor(tile, 1, project)
+}
+
+/// Build an adaptive tile mesh with at least `min_subdivision` edge segments.
+///
+/// Neighboring tiles need matching edge subdivisions to avoid T-junctions
+/// after projection. The scene can therefore apply the largest subdivision
+/// required by any visible tile to the entire set. The floor is rounded up to
+/// the next supported power of two and cannot exceed [`MAX_SUBDIVISION`].
+#[must_use]
+pub fn build_tile_mesh_with_floor<P>(
+    tile: TileId,
+    min_subdivision: u32,
+    project: P,
+) -> Option<TileMesh>
+where
+    P: Fn(f64, f64) -> Option<(f64, f64)>,
+{
     let m_per_texel = tile.ground_resolution_m_per_texel();
     if !m_per_texel.is_finite() || m_per_texel <= 0.0 {
         return None;
     }
     let tolerance_km = SUBDIVISION_TOLERANCE_TEXELS * m_per_texel / 1_000.0;
 
-    let mut subdivision = 1u32;
+    let mut subdivision = min_subdivision
+        .clamp(1, MAX_SUBDIVISION)
+        .next_power_of_two()
+        .min(MAX_SUBDIVISION);
     let (nodes, max_error_km) = loop {
         let nodes = project_grid(tile, subdivision, &project)?;
         let deviation = measure_deviation(tile, subdivision, &nodes, &project)?;
@@ -401,6 +422,73 @@ mod tests {
         assert!(build_tile_mesh(tile, far_away).is_none());
         let just_inside = |_lon: f64, _lat: f64| Some((MAX_TILE_WORLD_KM - 1.0, 0.0));
         assert!(build_tile_mesh(tile, just_inside).is_some());
+    }
+
+    #[test]
+    fn a_floor_of_one_preserves_the_original_adaptive_mesh() {
+        let tile = TileId::new(5, 7, 12).expect("valid");
+        let original = build_tile_mesh(tile, curved_projection).expect("projects");
+        let floored = build_tile_mesh_with_floor(tile, 1, curved_projection).expect("projects");
+
+        assert_eq!(floored.subdivision, original.subdivision);
+        assert_eq!(floored.vertices, original.vertices);
+        assert_eq!(floored.indices, original.indices);
+        assert_eq!(
+            floored.max_error_km.to_bits(),
+            original.max_error_km.to_bits()
+        );
+    }
+
+    #[test]
+    fn subdivision_floor_rounds_up_and_stays_within_the_supported_ladder() {
+        let tile = TileId::new(5, 7, 12).expect("valid");
+        for (requested, expected) in [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (5, MAX_SUBDIVISION),
+            (u32::MAX, MAX_SUBDIVISION),
+        ] {
+            let mesh =
+                build_tile_mesh_with_floor(tile, requested, mercator_projection).expect("projects");
+            assert_eq!(mesh.subdivision, expected, "requested {requested}");
+        }
+    }
+
+    #[test]
+    fn neighboring_tiles_at_the_same_floor_share_exact_edge_positions() {
+        let west = TileId::new(5, 7, 12).expect("valid");
+        let east = TileId::new(5, 8, 12).expect("valid");
+        let south = TileId::new(5, 7, 13).expect("valid");
+
+        for floor in [1, 2, 4, MAX_SUBDIVISION] {
+            let west_mesh =
+                build_tile_mesh_with_floor(west, floor, curved_projection).expect("projects");
+            let east_mesh =
+                build_tile_mesh_with_floor(east, floor, curved_projection).expect("projects");
+            let south_mesh =
+                build_tile_mesh_with_floor(south, floor, curved_projection).expect("projects");
+            assert_eq!(west_mesh.subdivision, east_mesh.subdivision);
+            assert_eq!(west_mesh.subdivision, south_mesh.subdivision);
+
+            let segments = west_mesh.subdivision as usize;
+            let stride = segments + 1;
+            for row in 0..stride {
+                assert_eq!(
+                    west_mesh.vertices[row * stride + segments].position_km,
+                    east_mesh.vertices[row * stride].position_km,
+                    "east/west seam at floor {floor}, row {row}"
+                );
+            }
+            for column in 0..stride {
+                assert_eq!(
+                    west_mesh.vertices[segments * stride + column].position_km,
+                    south_mesh.vertices[column].position_km,
+                    "north/south seam at floor {floor}, column {column}"
+                );
+            }
+        }
     }
 
     #[test]

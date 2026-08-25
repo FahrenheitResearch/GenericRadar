@@ -37,8 +37,8 @@ use std::time::Instant;
 use analyst_runtime::{Camera2D, Generation, LodBucket, MAX_PANES, ScreenPoint, ViewportMetrics};
 use basemap_tiles::{
     DecodedTile, MAX_ANCESTOR_LEVELS, MAX_TILE_ZOOM, MIN_TILE_ZOOM, TileCacheConfig, TileId,
-    TileMesh, TileProvider, TileState, TileStore, TileStoreMetrics, ViewportGeo, build_tile_mesh,
-    visible_tiles, zoom_for_ground_resolution,
+    TileMesh, TileProvider, TileState, TileStore, TileStoreMetrics, ViewportGeo,
+    build_tile_mesh_with_floor, visible_tiles, zoom_for_ground_resolution,
 };
 
 use crate::build::LOD_REFERENCE_KM_PER_POINT;
@@ -80,6 +80,9 @@ const PREFETCH_TILES: usize = 8;
 /// worth bounding so a site change cannot drop a frame, not worth another
 /// worker pool.
 const MAX_MESH_BUILDS_PER_FRAME: usize = 64;
+
+/// At most four attempts cover every supported subdivision: 1, 2, 4, and 8.
+const MAX_FLOOR_ROUNDS: usize = 4;
 
 /// Decoded tiles taken from the store in one frame.
 const MAX_DRAIN_PER_FRAME: usize = 24;
@@ -334,6 +337,8 @@ pub struct TileSceneController {
     /// Meshes for the current projection only; a new anchor drops all of them.
     /// Bounded by [`MAX_RESIDENT_MESHES`] and evicted least-recently-used.
     meshes: HashMap<TileId, ResidentMesh>,
+    /// Monotonic subdivision floor for each tile zoom in the current projection.
+    subdivision_floors: HashMap<u8, u32>,
     mesh_projection: Option<Generation>,
     /// Ticks once per pane per frame. The stamp on a mesh or a fade clock, and
     /// the only ordering eviction needs.
@@ -371,6 +376,7 @@ impl TileSceneController {
             provider: None,
             store,
             meshes: HashMap::new(),
+            subdivision_floors: HashMap::new(),
             mesh_projection: None,
             clock: 0,
             pending_uploads: Vec::new(),
@@ -665,8 +671,9 @@ impl TileSceneController {
         let mut exact = 0_usize;
         let mut fading = false;
         let mut deferred = false;
-        for tile in &tiles {
-            let Some(mesh) = self.mesh_for(*tile, projection, &mut builds, &mut deferred) else {
+        let meshes = self.uniform_meshes(&tiles, zoom, projection, &mut builds, &mut deferred);
+        for (tile, mesh) in tiles.iter().zip(meshes) {
+            let Some(mesh) = mesh else {
                 continue;
             };
             let Some((texture, uv_offset_scale, levels_up)) = self.texture_for(provider, *tile)
@@ -767,25 +774,77 @@ impl TileSceneController {
     fn sync_projection(&mut self, projection: Generation) {
         if self.mesh_projection != Some(projection) {
             self.meshes.clear();
+            self.subdivision_floors.clear();
             self.mesh_projection = Some(projection);
         }
     }
 
-    /// The cached mesh for a tile, building it if there is budget this frame.
+    /// Resolve visible meshes to one shared subdivision, eliminating tile seams.
+    ///
+    /// Floors only rise within a projection, preventing panning from repeatedly
+    /// rebuilding meshes as naturally finer tiles enter and leave the viewport.
+    fn uniform_meshes(
+        &mut self,
+        tiles: &[TileId],
+        zoom: u8,
+        projection: &RadarProjection,
+        builds: &mut usize,
+        deferred: &mut bool,
+    ) -> Vec<Option<Arc<TileMesh>>> {
+        let mut floor = self.subdivision_floors.get(&zoom).copied().unwrap_or(1);
+        let mut meshes = vec![None; tiles.len()];
+
+        for _ in 0..MAX_FLOOR_ROUNDS {
+            let mut required_floor = floor;
+            for (slot, tile) in meshes.iter_mut().zip(tiles) {
+                if slot
+                    .as_ref()
+                    .is_some_and(|mesh: &Arc<TileMesh>| mesh.subdivision == floor)
+                {
+                    continue;
+                }
+                *slot = self.mesh_at(*tile, floor, projection, builds, deferred);
+                if let Some(mesh) = slot {
+                    required_floor = required_floor.max(mesh.subdivision);
+                }
+            }
+            if required_floor == floor {
+                break;
+            }
+            floor = required_floor;
+        }
+
+        if self.subdivision_floors.get(&zoom).copied().unwrap_or(1) < floor {
+            self.subdivision_floors.insert(zoom, floor);
+        }
+
+        for slot in &mut meshes {
+            if slot.as_ref().is_some_and(|mesh| mesh.subdivision != floor) {
+                *slot = None;
+                *deferred = true;
+            }
+        }
+        meshes
+    }
+
+    /// The cached mesh for a tile at the requested minimum subdivision.
     ///
     /// A tile the projection cannot express — a failed geodesic, or a corner
     /// past [`basemap_tiles::MAX_TILE_WORLD_KM`] — is simply not drawn, and
     /// nothing is substituted for it.
-    fn mesh_for(
+    fn mesh_at(
         &mut self,
         tile: TileId,
+        floor: u32,
         projection: &RadarProjection,
         builds: &mut usize,
         deferred: &mut bool,
     ) -> Option<Arc<TileMesh>> {
         if let Some(resident) = self.meshes.get_mut(&tile) {
             resident.last_used = self.clock;
-            return Some(Arc::clone(&resident.mesh));
+            if resident.mesh.subdivision >= floor {
+                return Some(Arc::clone(&resident.mesh));
+            }
         }
         if *builds >= MAX_MESH_BUILDS_PER_FRAME {
             *deferred = true;
@@ -795,7 +854,7 @@ impl TileSceneController {
         // The FALLIBLE projection, deliberately: `lon_lat_to_world` collapses
         // a non-convergent geodesic onto the anchor, which would staple a tile
         // of the far side of the world to the radar.
-        let mesh = build_tile_mesh(tile, |lon, lat| {
+        let mesh = build_tile_mesh_with_floor(tile, floor, |lon, lat| {
             projection
                 .try_lon_lat_to_world(lon, lat)
                 .map(|world| (world.east_km, world.north_km))
@@ -1373,6 +1432,53 @@ mod tests {
         assert_eq!(frame.coverage, 0.0);
         assert!(controller.metrics().meshes_built > 0);
         assert!(!frame.attribution.is_empty());
+    }
+
+    #[test]
+    fn visible_tile_meshes_use_one_subdivision_and_reuse_it_while_panning() {
+        let mut controller = controller();
+        controller.set_provider(Some(TileProvider::UsgsTopo));
+        let projection = RadarProjection::new(KTLX.0, KTLX.1);
+        let zoom = tile_zoom_for(bucket(5.12), KTLX.0, 1.0).expect("zoom");
+
+        for center_east_km in [0.0, 400.0, 900.0, 400.0, 0.0] {
+            for _ in 0..12 {
+                controller.frame_for_pane(
+                    &projection,
+                    Generation::new(1),
+                    bucket(5.12),
+                    Camera2D {
+                        center_east_km,
+                        km_per_point: 5.12,
+                        ..Camera2D::default()
+                    },
+                    viewport(),
+                    [0.0; 3],
+                );
+            }
+
+            let floor = controller
+                .subdivision_floors
+                .get(&zoom)
+                .copied()
+                .unwrap_or(1);
+            let matching: Vec<_> = controller
+                .meshes
+                .iter()
+                .filter(|(tile, _)| tile.z == zoom)
+                .collect();
+            assert!(matching.len() > 8, "only {} meshes", matching.len());
+            assert!(floor.is_power_of_two());
+            assert!(floor <= basemap_tiles::MAX_SUBDIVISION);
+            assert!(
+                matching
+                    .iter()
+                    .all(|(_, mesh)| mesh.mesh.subdivision == floor)
+            );
+        }
+
+        controller.sync_projection(Generation::new(2));
+        assert!(controller.subdivision_floors.is_empty());
     }
 
     #[test]
