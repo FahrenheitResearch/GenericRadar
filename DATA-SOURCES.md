@@ -27,6 +27,16 @@ stop matching the code.
   from the same fixed HTTPS host. This is one official archive, not a claim
   that research-radar Level 1 holdings are centralized.
 - **Watches, warnings and advisories** - NOAA/NWS `api.weather.gov`.
+- **Surface aviation weather observations** - METAR reports published by the
+  **NOAA/NWS Aviation Weather Center** through its public aviation-weather
+  data service.
+- **Surface-observation history and supplemental station networks** -
+  historical ASOS/AWOS reports and environmental station observations served
+  by the **Iowa Environmental Mesonet**, operated by Iowa State University.
+  The application identifies station observations as reports, not forecasts.
+- **User-supplied placefiles** - local files or remote endpoints chosen by the
+  operator. Their contents, attribution requirements and terms belong to each
+  selected provider; no third-party placefile data is redistributed here.
 - **Basemap tiles** - **USGS The National Map** (each service's own credit
   string is displayed in the application, verbatim as that service publishes
   it) and **© OpenStreetMap contributors**, available under the Open Database

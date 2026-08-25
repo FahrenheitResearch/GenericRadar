@@ -126,6 +126,17 @@ pub struct PaneOverlay<'a> {
     pub spectrum: Option<&'a crate::iq_spectrum_ui::GateSpectrum>,
 }
 
+/// Optional geographic layers owned by the application rather than by a
+/// particular radar pane. Borrowing the services keeps their retained data
+/// shared across every visible pane; only the ordinary camera transform is
+/// repeated while the operator pans or zooms.
+#[derive(Clone, Copy, Default)]
+pub struct PaneExternalLayers<'a> {
+    pub observations: Option<&'a crate::app::surface_observations::SurfaceObservationService>,
+    pub placefiles: Option<&'a crate::app::placefiles::PlacefileManager>,
+    pub frame_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// A radar site at a known world position, ready to draw and hit-test.
 #[derive(Clone, Debug)]
 pub struct PlacedSite {
@@ -155,6 +166,10 @@ pub struct PaneInteraction {
     pub viewport: ViewportMetrics,
     /// A radar site marker the user clicked, if any.
     pub clicked_site: Option<String>,
+    /// A real surface-observation station selected with a click or Shift-click.
+    /// Consumed before radar-site selection so a coincident marker cannot
+    /// change radars while an analyst is asking for a station history.
+    pub clicked_observation: Option<String>,
     /// Where a Ctrl+click landed, in degrees `(longitude, latitude)`, when the
     /// pane has a projection to place it with.
     pub ctrl_clicked_lon_lat: Option<(f64, f64)>,
@@ -209,6 +224,7 @@ pub fn pane_rects(canvas: egui::Rect, layout: PaneLayout) -> Vec<(PaneId, egui::
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn draw_pane(
     ui: &mut egui::Ui,
     pane: PaneId,
@@ -222,6 +238,42 @@ pub fn draw_pane(
     title: &str,
     status: &str,
     overlay: &PaneOverlay<'_>,
+) -> PaneInteraction {
+    draw_pane_with_layers(
+        ui,
+        pane,
+        rect,
+        active,
+        camera,
+        north_up,
+        tuning,
+        texture,
+        map,
+        title,
+        status,
+        overlay,
+        PaneExternalLayers::default(),
+    )
+}
+
+/// Draw the same radar pane together with the application's shared geographic
+/// layers. The compatibility entry point above remains the real shipped path
+/// without optional layers for standalone pane proofs and existing callers.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_pane_with_layers(
+    ui: &mut egui::Ui,
+    pane: PaneId,
+    rect: egui::Rect,
+    active: bool,
+    camera: Camera2D,
+    north_up: NorthUpFrame,
+    tuning: NavTuning,
+    texture: Option<PaneTexture<'_>>,
+    map: &PaneMap,
+    title: &str,
+    status: &str,
+    overlay: &PaneOverlay<'_>,
+    external_layers: PaneExternalLayers<'_>,
 ) -> PaneInteraction {
     let response = ui.interact(
         rect,
@@ -359,6 +411,36 @@ pub fn draw_pane(
         paint_transformed_texture(&painter, rect, updated_camera, viewport, texture);
     }
     draw_map_labels(&painter, rect, updated_camera, viewport, map);
+    // Placefiles and real station observations belong above the radar pixels,
+    // not under them. A missing radar position deliberately suppresses every
+    // geographic overlay: painting a station on an unlocated sweep would assert
+    // a position the file never supplied. Warnings and instrument chrome are
+    // painted afterwards so neither can disappear beneath a third-party feed.
+    if map.projection.is_some()
+        && let Some(placefiles) = external_layers.placefiles
+    {
+        placefiles.draw(
+            &painter,
+            rect,
+            updated_camera,
+            viewport,
+            map.projection.as_ref(),
+        );
+    }
+    let clicked_observation = if map.projection.is_some() {
+        external_layers.observations.and_then(|observations| {
+            observations.draw(
+                ui,
+                rect,
+                map.projection.as_ref(),
+                updated_camera,
+                viewport,
+                external_layers.frame_time,
+            )
+        })
+    } else {
+        None
+    };
     // Warnings over the labels: a tornado box must never be the thing a county
     // name is drawn on top of.
     draw_hazards(&painter, rect, updated_camera, viewport, map);
@@ -369,7 +451,9 @@ pub fn draw_pane(
         updated_camera,
         viewport,
         map,
-        response.clicked() && crate::nearest_site::site_marker_click_allowed(modifiers),
+        response.clicked()
+            && clicked_observation.is_none()
+            && crate::nearest_site::site_marker_click_allowed(modifiers),
     );
     // Where the Ctrl+click landed. Read here, decided in `nearest_site`:
     // nothing in this file chooses which radar wins.
@@ -448,12 +532,16 @@ pub fn draw_pane(
     PaneInteraction {
         // A click that selected a site is consumed by that site and a
         // Ctrl+click by the radar switch.
-        clicked: response.clicked() && clicked_site.is_none() && ctrl_clicked_lon_lat.is_none(),
+        clicked: response.clicked()
+            && clicked_site.is_none()
+            && clicked_observation.is_none()
+            && ctrl_clicked_lon_lat.is_none(),
         hovered_world_km: hovered_world_km(ui, rect, updated_camera, viewport, response.hovered()),
         camera: updated_camera,
         camera_changed,
         viewport,
         clicked_site,
+        clicked_observation,
         ctrl_clicked_lon_lat,
     }
 }

@@ -1,5 +1,7 @@
 //! Public radar data-source helpers.
 
+pub mod observations;
+pub mod placefiles;
 pub mod research_archive;
 pub mod tuning;
 pub mod warnings;

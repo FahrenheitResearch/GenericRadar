@@ -44,6 +44,7 @@ pub mod keys {
         pub const IMAGERY_DIM: &str = "imagery_dim";
         pub const SITE_MARKERS: &str = "site_markers";
         pub const SITE_LABELS: &str = "site_labels";
+        pub const PLACEFILES_ENABLED: &str = "placefiles_enabled";
         pub const BOUNDARIES: &str = "boundaries";
         /// RETIRED, and not to be reused: `map/range_rings`.
         ///
@@ -57,6 +58,23 @@ pub mod keys {
         /// by an older build still carries it and reusing the id would
         /// misread that file. An orphaned value is ignored, which is safe.
         pub const RETIRED_RANGE_RINGS: &str = "range_rings";
+    }
+    pub mod observations {
+        pub const CATEGORY: &str = "observations";
+        pub const ENABLED: &str = "enabled";
+        pub const MESONET_ENABLED: &str = "mesonet_enabled";
+        pub const SHOW_TEMPERATURE: &str = "show_temperature";
+        pub const SHOW_DEWPOINT: &str = "show_dewpoint";
+        pub const SHOW_WIND_BARBS: &str = "show_wind_barbs";
+        pub const SHOW_STATION_ID: &str = "show_station_id";
+        pub const SHOW_SKY_COVER: &str = "show_sky_cover";
+        pub const SHOW_WEATHER: &str = "show_weather";
+        pub const SHOW_VISIBILITY: &str = "show_visibility";
+        pub const SHOW_PRESSURE: &str = "show_pressure";
+        pub const SHOW_GUSTS: &str = "show_gusts";
+        pub const FAHRENHEIT: &str = "fahrenheit";
+        pub const DECLUTTER_POINTS: &str = "declutter_points";
+        pub const REFRESH_SECONDS: &str = "refresh_seconds";
     }
     pub mod radar {
         pub const CATEGORY: &str = "radar";
@@ -323,6 +341,7 @@ pub fn registry() -> SettingsRegistry {
 pub fn register_into(registry: &mut SettingsRegistry) {
     registry.register(appearance_category());
     registry.register(map_category());
+    registry.register(observations_category());
     registry.register(radar_category());
     registry.register(navigation_category());
     registry.register(vol3d_category());
@@ -356,7 +375,7 @@ fn appearance_category() -> SettingsCategory {
             )
             .help(
                 "Menu bar keeps one compact row - storm controls stay on it, the \
-                 occasional ones live under File / View / Map / Tools. Everything \
+                 occasional ones live under File / View / Map / Layers / Tools. Everything \
                  visible puts every control on the row itself, which wraps on \
                  narrower windows.",
             ),
@@ -420,6 +439,11 @@ fn map_category() -> SettingsCategory {
                 "Draw every NEXRAD site as a clickable marker. Clicking one is the \
                  quickest way to change radar.",
             ),
+            SettingSpec::new(k::PLACEFILES_ENABLED, "Placefile overlays", toggle(true)).help(
+                "Allow enabled GR/GR2Analyst-compatible placefiles to draw on every radar \
+                     pane. Add, remove, refresh and individually disable sources from the \
+                     Layers > Placefiles menu.",
+            ),
             SettingSpec::new(
                 k::SITE_LABELS,
                 "Site labels",
@@ -459,6 +483,85 @@ fn map_category() -> SettingsCategory {
                  preset. Declared ahead of per-class visibility in the map style.",
             )
             .pending_wiring(),
+        ],
+    )
+}
+
+fn observations_category() -> SettingsCategory {
+    use keys::observations as k;
+
+    SettingsCategory::new(
+        k::CATEGORY,
+        "Surface observations",
+        vec![
+            SettingSpec::new(k::ENABLED, "Show surface observations", toggle(false))
+                .help(
+                    "Draw real METAR / ASOS / AWOS station models above every radar pane. \
+                     Click or Shift-click a station to open its observation history. No \
+                     observation requests are made while this layer is disabled.",
+                )
+                .group("Networks"),
+            SettingSpec::new(
+                k::MESONET_ENABLED,
+                "Include mesonet observations",
+                toggle(false),
+            )
+            .help(
+                "Also request available supplemental road-weather and environmental \
+                     mesonet stations. These are separate, real observations; missing \
+                     networks are never synthesized from METAR data.",
+            )
+            .group("Networks"),
+            SettingSpec::new(
+                k::REFRESH_SECONDS,
+                "Refresh observations every",
+                integer(30, 3_600, 300, "s"),
+            )
+            .help(
+                "How often the background worker asks the public observation providers \
+                 for fresh reports. Existing station plots stay visible during refresh.",
+            )
+            .group("Networks"),
+            SettingSpec::new(k::SHOW_TEMPERATURE, "Temperature", toggle(true))
+                .help("Plot station air temperature in red at the upper left.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_DEWPOINT, "Dewpoint", toggle(true))
+                .help("Plot the measured dewpoint in green at the lower left.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_WIND_BARBS, "Wind barbs", toggle(true))
+                .help("Draw the observed wind direction and speed using standard barbs.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_GUSTS, "Wind gusts", toggle(true))
+                .help("Write reported gusts beside the station wind barb.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_STATION_ID, "Station identifiers", toggle(true))
+                .help("Write each reporting station's real identifier beside its plot.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_SKY_COVER, "Cloud-cover symbols", toggle(true))
+                .help("Fill the station circle according to the reported cloud coverage.")
+                .group("Station model"),
+            SettingSpec::new(k::SHOW_WEATHER, "Present weather", toggle(false))
+                .help("Add reported METAR weather phenomena when supplied by the station.")
+                .group("Additional fields"),
+            SettingSpec::new(k::SHOW_VISIBILITY, "Visibility", toggle(false))
+                .help("Add measured visibility when supplied by the station.")
+                .group("Additional fields"),
+            SettingSpec::new(k::SHOW_PRESSURE, "Sea-level pressure", toggle(false))
+                .help("Add reported sea-level pressure; never fabricate a missing value.")
+                .group("Additional fields"),
+            SettingSpec::new(k::FAHRENHEIT, "Display temperatures in °F", toggle(true))
+                .help("Turn off to show station temperature and dewpoint in degrees Celsius.")
+                .group("Display"),
+            SettingSpec::new(
+                k::DECLUTTER_POINTS,
+                "Minimum station spacing",
+                slider(24.0, 240.0, 76.0, 0, "pt"),
+            )
+            .help(
+                "Minimum screen distance between station models. Zoom in to reveal more \
+                 stations; selected stations remain available without hiding the radar.",
+            )
+            .group("Display"),
         ],
     )
 }
@@ -1689,9 +1792,9 @@ mod tests {
         // "WSR" arrived with the Level 1 page: the threshold that page
         // defaults to is the operational WSR-88D one, and naming the radar it
         // came from is what makes the number checkable rather than arbitrary.
-        const ACRONYMS: [&str; 14] = [
+        const ACRONYMS: [&str; 18] = [
             "UTC", "AM", "PM", "MSL", "ARL", "USGS", "GPU", "MiB", "GB", "VCP", "NEXRAD", "II",
-            "RF", "WSR",
+            "RF", "WSR", "METAR", "ASOS", "AWOS", "GR",
         ];
         for category in registry().categories() {
             for setting in &category.settings {
@@ -1742,6 +1845,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn surface_observations_are_opt_in_with_real_station_model_controls() {
+        let registry = registry();
+        let category = registry
+            .category(keys::observations::CATEGORY)
+            .expect("surface observations own a discoverable settings page");
+        assert_eq!(category.label, "Surface observations");
+
+        for id in [
+            keys::observations::ENABLED,
+            keys::observations::MESONET_ENABLED,
+        ] {
+            let setting = registry
+                .setting(keys::observations::CATEGORY, id)
+                .unwrap_or_else(|| panic!("observation setting {id} is declared"));
+            assert_eq!(setting.kind.default_value(), SettingValue::Bool(false));
+        }
+        for id in [
+            keys::observations::SHOW_TEMPERATURE,
+            keys::observations::SHOW_DEWPOINT,
+            keys::observations::SHOW_WIND_BARBS,
+            keys::observations::SHOW_STATION_ID,
+            keys::observations::SHOW_SKY_COVER,
+        ] {
+            let setting = registry
+                .setting(keys::observations::CATEGORY, id)
+                .unwrap_or_else(|| panic!("station-model setting {id} is declared"));
+            assert_eq!(setting.kind.default_value(), SettingValue::Bool(true));
+        }
+
+        let refresh = registry
+            .setting(
+                keys::observations::CATEGORY,
+                keys::observations::REFRESH_SECONDS,
+            )
+            .expect("observation refresh cadence is configurable");
+        assert_eq!(refresh.kind.default_value(), SettingValue::Int(300));
+    }
+
+    #[test]
+    fn placefile_layer_is_available_by_default_without_inventing_any_sources() {
+        let registry = registry();
+        let setting = registry
+            .setting(keys::map::CATEGORY, keys::map::PLACEFILES_ENABLED)
+            .expect("the global placefile layer toggle is persistent");
+        assert_eq!(setting.kind.default_value(), SettingValue::Bool(true));
     }
 
     #[test]

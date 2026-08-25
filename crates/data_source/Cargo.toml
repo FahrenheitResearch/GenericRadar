@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+flate2.workspace = true
+image.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
 serde.workspace = true

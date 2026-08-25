@@ -92,3 +92,15 @@ fn the_shipped_attribution_credits_the_other_live_endpoints() {
         );
     }
 }
+
+#[test]
+fn the_shipped_attribution_credits_surface_observation_providers() {
+    let (path, attribution) = shipped_attribution();
+    for credit in ["Aviation Weather Center", "Iowa Environmental Mesonet"] {
+        assert!(
+            attribution.contains(credit),
+            "{}: no credit for {credit}, which supplies surface observations or their history",
+            path.display()
+        );
+    }
+}

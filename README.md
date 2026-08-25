@@ -12,6 +12,11 @@ API keys, no telemetry.
   in-progress supplemental scans revealed radial by radial. Maximum elevation,
   minimum sweep-update interval, and live-feed polling cadence are independently
   adjustable
+- Live surface-station observations plotted directly over the radar with
+  temperatures, dewpoints, wind barbs, cloud cover, present weather and
+  station history
+- Local and remote GR-compatible placefiles, including text, icons, lines,
+  polygons, refresh intervals and independently controlled map overlays
 - Files routed by content rather than by extension: NEXRAD Archive II,
   including the legacy Message 1 that every volume before 2008 is written in;
   ODIM_H5 polar volumes; DORADE sweepfiles and mobile deployment zips
@@ -90,6 +95,21 @@ API keys, no telemetry.
   volume stored with no extension still says what it is
 - VROT sampling, NWS warning polygons
 
+## Surface observations and placefiles
+
+Open **Layers** to enable surface observations or manage placefiles. Station
+models use measured METAR values: red temperature, green dewpoint, a standard
+wind barb, cloud cover and the reporting station's identifier. Click a station
+to inspect its historical reports. **Settings → Surface observations** controls
+individual fields, refresh cadence, station spacing, units and optional
+supplemental mesonet networks.
+
+The placefile manager accepts either a local file or an HTTP(S) URL. Sources
+can be enabled, refreshed and removed independently, and their configured
+visibility persists across restarts. GR-compatible text, icons, lines,
+polygons and time ranges are drawn on the radar map; remote files and icon
+sheets are fetched in the background.
+
 ## Build
 
 ```
@@ -116,6 +136,8 @@ from its name.
 - NEXRAD Level II: NOAA/NWS, read from the Unidata-hosted
   `unidata-nexrad-level2` and `unidata-nexrad-level2-chunks` buckets
 - Warnings and site metadata: NOAA/NWS api.weather.gov
+- Surface observations: NOAA Aviation Weather Center; historical reports and
+  supplemental station networks: Iowa Environmental Mesonet
 - Imagery: USGS The National Map (public domain);
   © OpenStreetMap contributors, under the Open Database License (ODbL)
 - Research Level 1 downloads: NOAA/NSSL KOUN THREDDS archive. Research-radar

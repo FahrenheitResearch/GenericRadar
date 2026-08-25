@@ -1,5 +1,6 @@
 use std::array;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,11 @@ use crate::hazards::{PlacedHazard, place_hazards};
 use crate::live_service::{LiveService, LiveUpdate, default_live_cache_dir};
 use crate::load_service::{LoadRequest, LoadService, LoadUpdate, LoadedVolume};
 use crate::north_up::NorthUpFrame;
-use crate::pane_canvas::{PaneMap, PaneTexture, PlacedSite, draw_pane, pane_rects};
+#[cfg(test)]
+use crate::pane_canvas::draw_pane;
+use crate::pane_canvas::{
+    PaneExternalLayers, PaneMap, PaneTexture, PlacedSite, draw_pane_with_layers, pane_rects,
+};
 use crate::product::DisplayProduct;
 
 use crate::app_support::{
@@ -40,6 +45,10 @@ use crate::warnings_service::WarningsService;
 #[path = "live_follow.rs"]
 mod live_follow;
 mod online_data;
+#[path = "placefiles.rs"]
+pub(crate) mod placefiles;
+#[path = "surface_observations.rs"]
+pub(crate) mod surface_observations;
 
 /// How often placed hazards are rebuilt so expiries take effect.
 ///
@@ -51,6 +60,132 @@ const HAZARD_REPLACEMENT_INTERVAL: Duration = Duration::from_secs(30);
 enum LiveAction {
     Start(String),
     Stop,
+}
+
+/// The deliberately small local-file browser for analyst-supplied placefiles.
+/// Radar's existing browser identifies every entry as a radar volume and
+/// routes its selection into the timeline, so sharing that instance would load
+/// a placefile as weather data. This browser never touches the volume loader.
+struct PlacefileBrowser {
+    directory: PathBuf,
+    directory_text: String,
+    entries: Vec<PlacefileBrowserEntry>,
+    error: Option<String>,
+}
+
+struct PlacefileBrowserEntry {
+    path: PathBuf,
+    name: String,
+    is_directory: bool,
+}
+
+impl PlacefileBrowser {
+    fn open() -> Self {
+        let downloads = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .map(|root| root.join("Downloads"));
+        let directory = downloads
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut browser = Self {
+            directory_text: directory.display().to_string(),
+            directory,
+            entries: Vec::new(),
+            error: None,
+        };
+        browser.reload();
+        browser
+    }
+
+    fn change_directory(&mut self, directory: PathBuf) {
+        self.directory_text = directory.display().to_string();
+        self.directory = directory;
+        self.reload();
+    }
+
+    fn reload(&mut self) {
+        self.entries.clear();
+        self.error = None;
+        let directory = match std::fs::read_dir(&self.directory) {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.error = Some(format!("Cannot open folder: {error}"));
+                return;
+            }
+        };
+        for entry in directory.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() && !kind.is_file() {
+                continue;
+            }
+            self.entries.push(PlacefileBrowserEntry {
+                path: entry.path(),
+                name: entry.file_name().to_string_lossy().into_owned(),
+                is_directory: kind.is_dir(),
+            });
+        }
+        self.entries.sort_by(|left, right| {
+            right.is_directory.cmp(&left.is_directory).then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+        });
+    }
+}
+
+/// Recognise a GR placefile by its declared directives rather than by a
+/// filename alone. `.pf` and `.placefile` are unambiguous; extensionless and
+/// `.txt` files are inspected without consuming more than a small header.
+fn dropped_path_is_placefile(path: &Path) -> bool {
+    let extension = path.extension().and_then(|value| value.to_str());
+    if extension.is_some_and(|value| {
+        value.eq_ignore_ascii_case("pf") || value.eq_ignore_ascii_case("placefile")
+    }) {
+        return true;
+    }
+    if extension.is_some_and(|value| !value.eq_ignore_ascii_case("txt")) {
+        return false;
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = [0_u8; 8 * 1024];
+    let Ok(length) = file.read(&mut bytes) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes[..length]) else {
+        return false;
+    };
+    let recognized = text
+        .lines()
+        .map(|line| line.trim_start_matches('\u{feff}').trim())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| {
+            [
+                "title",
+                "refresh",
+                "threshold",
+                "color",
+                "font",
+                "iconfile",
+                "icon",
+                "text",
+                "line",
+                "object",
+                "polygon",
+            ]
+            .iter()
+            .any(|directive| name.trim().eq_ignore_ascii_case(directive))
+        })
+        .take(2)
+        .count();
+    recognized >= 2
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,7 +686,7 @@ struct CapabilitiesKey {
 /// Which of the two supported toolbars draws.
 ///
 /// Both are real, kept, and one setting apart (2026-08-19): the menu bar is
-/// the compact row with File / View / Map / Tools for the occasional
+/// the compact row with File / View / Map / Layers / Tools for the occasional
 /// controls; Everything is the v0.1.0 row that shows every control at once
 /// and wraps on narrower windows. Neither is a legacy mode: both are kept
 /// deliberately, and one setting moves between them.
@@ -577,6 +712,10 @@ struct SettingsCache {
     /// Gates `refresh_placed_sites`: off hands the panes an empty slice, the
     /// same shape `show_warnings` uses for hazards.
     site_markers: bool,
+    /// Surface station models and GR-compatible placefiles are paint-only
+    /// geographic overlays; changing either never invalidates a radar raster.
+    observations_enabled: bool,
+    placefiles_enabled: bool,
     /// Gates each pane's colour bar layout.
     legend: bool,
     /// Off skips the clockwise reveal entirely: arrived radials paint at
@@ -621,6 +760,8 @@ impl Default for SettingsCache {
             toolbar_style: ToolbarStyle::default(),
             site_labels: crate::pane_canvas::SiteLabelMode::default(),
             site_markers: true,
+            observations_enabled: false,
+            placefiles_enabled: true,
             legend: true,
             sweep_animation: true,
             sweep_speed: 1.0,
@@ -766,6 +907,14 @@ pub struct WorkstationApp {
     sites: Vec<LocatedSite>,
     placed_sites: Arc<[PlacedSite]>,
     placed_sites_projection: Option<map_scene::ProjectionId>,
+    /// Real METAR/mesonet reports, their background worker and station
+    /// histories. Shared by every pane rather than fetched once per pane.
+    surface_observations: surface_observations::SurfaceObservationService,
+    /// Analyst-owned GR/GR2Analyst placefiles, retained across refreshes and
+    /// independently persisted without entering the volume timeline.
+    placefiles: placefiles::PlacefileManager,
+    placefiles_window_open: bool,
+    placefile_browser: Option<PlacefileBrowser>,
     live_service: LiveService,
     live_cache_dir: PathBuf,
     site_text: String,
@@ -902,6 +1051,12 @@ impl WorkstationApp {
             sites: Vec::new(),
             placed_sites: Vec::new().into(),
             placed_sites_projection: None,
+            surface_observations: surface_observations::SurfaceObservationService::new(
+                context.clone(),
+            ),
+            placefiles: placefiles::PlacefileManager::load(),
+            placefiles_window_open: false,
+            placefile_browser: None,
             live_cache_dir: default_live_cache_dir(),
             site_text: String::new(),
             live_site: None,
@@ -1126,6 +1281,7 @@ impl WorkstationApp {
 
         self.apply_storm_motion_settings();
         self.apply_vol3d_settings();
+        self.apply_surface_observation_settings();
         self.recompute_settings_cache();
     }
 
@@ -1342,6 +1498,16 @@ impl WorkstationApp {
                 registry,
                 keys::map::CATEGORY,
                 keys::map::SITE_MARKERS,
+            ),
+            observations_enabled: store.effective_bool(
+                registry,
+                keys::observations::CATEGORY,
+                keys::observations::ENABLED,
+            ),
+            placefiles_enabled: store.effective_bool(
+                registry,
+                keys::map::CATEGORY,
+                keys::map::PLACEFILES_ENABLED,
             ),
             legend: store.effective_bool(registry, keys::radar::CATEGORY, keys::radar::LEGEND),
             sweep_animation: store.effective_bool(
@@ -1588,6 +1754,80 @@ impl WorkstationApp {
         }
     }
 
+    /// Apply every persisted observation control to the single shared worker.
+    /// Display changes only repaint egui shapes; they never discard an already
+    /// rendered radar sweep or restart an otherwise healthy acquisition.
+    fn apply_surface_observation_settings(&mut self) {
+        use crate::settings_ui::catalog::keys::observations as key;
+
+        let store = &self.settings_store;
+        let registry = &self.settings_registry;
+        let enabled = store.effective_bool(registry, key::CATEGORY, key::ENABLED);
+        let toggle = |id| store.effective_bool(registry, key::CATEGORY, id);
+        self.surface_observations
+            .set_plot_options(surface_observations::ObservationPlotOptions {
+                show_temperature: toggle(key::SHOW_TEMPERATURE),
+                show_dewpoint: toggle(key::SHOW_DEWPOINT),
+                show_wind_barbs: toggle(key::SHOW_WIND_BARBS),
+                show_station_id: toggle(key::SHOW_STATION_ID),
+                show_sky_cover: toggle(key::SHOW_SKY_COVER),
+                show_weather: toggle(key::SHOW_WEATHER),
+                show_visibility: toggle(key::SHOW_VISIBILITY),
+                show_pressure: toggle(key::SHOW_PRESSURE),
+                show_gusts: toggle(key::SHOW_GUSTS),
+                declutter_px: store.effective_float(registry, key::CATEGORY, key::DECLUTTER_POINTS)
+                    as f32,
+                fahrenheit: toggle(key::FAHRENHEIT),
+            });
+        self.surface_observations
+            .set_mesonet_enabled(toggle(key::MESONET_ENABLED));
+        self.surface_observations
+            .set_refresh_interval(Duration::from_secs(
+                store
+                    .effective_int(registry, key::CATEGORY, key::REFRESH_SECONDS)
+                    .max(1) as u64,
+            ));
+        self.surface_observations.set_enabled(enabled);
+    }
+
+    fn set_surface_observations_enabled(&mut self, enabled: bool) {
+        use crate::settings_ui::catalog::keys::observations as key;
+
+        if self.settings_store.set(
+            key::CATEGORY,
+            key::ENABLED,
+            settings::SettingValue::Bool(enabled),
+        ) {
+            self.apply_changed_setting(key::CATEGORY, key::ENABLED);
+            self.recompute_settings_cache();
+        }
+    }
+
+    fn set_mesonet_observations_enabled(&mut self, enabled: bool) {
+        use crate::settings_ui::catalog::keys::observations as key;
+
+        if self.settings_store.set(
+            key::CATEGORY,
+            key::MESONET_ENABLED,
+            settings::SettingValue::Bool(enabled),
+        ) {
+            self.apply_changed_setting(key::CATEGORY, key::MESONET_ENABLED);
+            self.recompute_settings_cache();
+        }
+    }
+
+    fn set_placefiles_enabled(&mut self, enabled: bool) {
+        use crate::settings_ui::catalog::keys::map as key;
+
+        if self.settings_store.set(
+            key::CATEGORY,
+            key::PLACEFILES_ENABLED,
+            settings::SettingValue::Bool(enabled),
+        ) {
+            self.recompute_settings_cache();
+        }
+    }
+
     /// The newest usable, possibly still-arriving sweep that can honestly
     /// serve one pane's own product. Selecting it while it is in progress is
     /// what lets the existing live animator reveal its real incoming radials.
@@ -1728,6 +1968,9 @@ impl WorkstationApp {
             }
             (keys::map::CATEGORY, keys::map::IMAGERY_DIM | keys::map::IMAGERY_DIM_AUTO) => {
                 self.apply_imagery_dim();
+            }
+            (keys::observations::CATEGORY, _) => {
+                self.apply_surface_observation_settings();
             }
             (
                 keys::analysis::CATEGORY,
@@ -2278,6 +2521,13 @@ impl WorkstationApp {
         preflight: crate::playlist_preflight::PlaylistRamEstimate,
     ) {
         self.pending_playlist_confirmation = None;
+
+        if paths.len() == 1 {
+            // Planning still runs for one file, but it is not a playlist:
+            // its raw Level 1 pulses must remain available for reprocessing.
+            self.begin_load(paths.into_iter().next().expect("one approved path"));
+            return;
+        }
 
         let first = paths[0].display().to_string();
         self.begin_local_session();
@@ -3374,8 +3624,9 @@ impl WorkstationApp {
         // so playback gating is unchanged by the stale pixels.
     }
 
-    /// A drop is either colour tables or radar volumes, decided per path by
-    /// its extension.
+    /// A drop can contain colour tables, genuine GR placefiles and radar
+    /// volumes. Extensionless and text placefiles are recognised by their
+    /// directives rather than being accidentally sent through radar decoding.
     ///
     /// One drop can carry several files, and a folder of palettes is exactly
     /// the kind of thing an analyst drags in one go, so every colour table in
@@ -3392,7 +3643,21 @@ impl WorkstationApp {
         if !tables.is_empty() && self.user_tables.import_all(&tables) {
             self.reresolve_palettes_from_user_tables();
         }
-        let paths = crate::app_support::choose_dropped_radar_files(candidates);
+        let (placefiles, radar_candidates): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|path| dropped_path_is_placefile(path));
+        let mut added_placefiles = 0_usize;
+        for path in placefiles {
+            if self.placefiles.add_path(&path) {
+                added_placefiles += 1;
+            }
+        }
+        if added_placefiles != 0 {
+            self.set_placefiles_enabled(true);
+            self.placefiles_window_open = true;
+            self.status = format!("Added {added_placefiles} placefile overlay(s)");
+        }
+        let paths = crate::app_support::choose_dropped_radar_files(radar_candidates);
         if !paths.is_empty() {
             self.begin_load_sequence(paths);
         }
@@ -3484,8 +3749,124 @@ impl WorkstationApp {
         }
     }
 
+    /// One layer menu shared by both supported toolbars. Every toggle writes
+    /// through the real settings store immediately, so switching toolbar style
+    /// or restarting the application cannot invent a second layer state.
+    fn layers_menu(&mut self, ui: &mut egui::Ui) {
+        use crate::settings_ui::catalog::keys;
+
+        ui.set_min_width(310.0);
+        ui.label(egui::RichText::new("SURFACE OBSERVATIONS").small().strong());
+        let enabled = self.settings_cache.observations_enabled;
+        if ui
+            .selectable_label(enabled, "Show METAR / ASOS / AWOS stations")
+            .on_hover_text(
+                "Draw measured temperature, dewpoint, wind barbs and station identifiers \
+                 above every radar pane. Click or Shift-click a station for its history.",
+            )
+            .clicked()
+        {
+            self.set_surface_observations_enabled(!enabled);
+        }
+
+        let mesonet = self.settings_store.effective_bool(
+            &self.settings_registry,
+            keys::observations::CATEGORY,
+            keys::observations::MESONET_ENABLED,
+        );
+        if ui
+            .add_enabled(
+                self.settings_cache.observations_enabled,
+                egui::Button::new("Include supplemental mesonet stations").selected(mesonet),
+            )
+            .on_hover_text("Add actual reporting road-weather and environmental mesonet stations.")
+            .clicked()
+        {
+            self.set_mesonet_observations_enabled(!mesonet);
+        }
+
+        let station_count = self.surface_observations.station_count();
+        let status = self.surface_observations.status();
+        if self.settings_cache.observations_enabled {
+            ui.label(
+                egui::RichText::new(format!("{station_count} reporting stations · {status}"))
+                    .small()
+                    .weak(),
+            );
+        }
+        if ui
+            .add_enabled(
+                self.settings_cache.observations_enabled,
+                egui::Button::new("Refresh observations now"),
+            )
+            .clicked()
+        {
+            self.surface_observations.refresh();
+        }
+        if let Some(station) = self
+            .surface_observations
+            .selected_station()
+            .map(str::to_owned)
+        {
+            if ui
+                .button(format!("Open {station} observation history…"))
+                .clicked()
+            {
+                let frame_time = self.history.current().map(|frame| frame.volume.volume_time);
+                self.surface_observations
+                    .request_station_history_at(&station, frame_time);
+                ui.close();
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("Click or Shift-click any station to view its history")
+                    .small()
+                    .weak(),
+            );
+        }
+        if ui.button("Observation plot settings…").clicked() {
+            self.settings_ui.open_category(keys::observations::CATEGORY);
+            ui.close();
+        }
+
+        ui.separator();
+        ui.label(
+            egui::RichText::new("GR / GR2ANALYST PLACEFILES")
+                .small()
+                .strong(),
+        );
+        let placefiles_enabled = self.settings_cache.placefiles_enabled;
+        if ui
+            .selectable_label(placefiles_enabled, "Show enabled placefile overlays")
+            .on_hover_text(
+                "Draw icons, labels, lines and polygons from enabled local or online placefiles.",
+            )
+            .clicked()
+        {
+            self.set_placefiles_enabled(!placefiles_enabled);
+        }
+        ui.label(
+            egui::RichText::new(self.placefiles.status_summary())
+                .small()
+                .weak(),
+        );
+        if ui.button("Manage placefiles…").clicked() {
+            self.placefiles_window_open = true;
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                !self.placefiles.layers.is_empty(),
+                egui::Button::new("Refresh all placefiles"),
+            )
+            .clicked()
+        {
+            self.placefiles.refresh_all();
+        }
+    }
+
     /// The menu bar: one compact row at any window width. Storm controls
-    /// stay on it; the occasional ones live under File / View / Map / Tools.
+    /// stay on it; the occasional ones live under File / View / Map / Layers / Tools.
     fn toolbar_menus(&mut self, ui: &mut egui::Ui) {
         use crate::theme::bevel;
 
@@ -3527,7 +3908,7 @@ impl WorkstationApp {
 
         // A menu bar, not a control wall. The bar carries only what an
         // analyst touches mid-storm - product, palette, tilt, site - and the
-        // occasional controls live under File / View / Map / Tools, so the
+        // occasional controls live under File / View / Map / Layers / Tools, so the
         // bar is one row at any window width instead of wrapping into a
         // block that eats the screen.
         //
@@ -3653,6 +4034,9 @@ impl WorkstationApp {
                         &mut self.map_scene,
                         &mut self.settings_store,
                     );
+                });
+                bevel::toolbar_menu(ui, "Layers", |ui| {
+                    self.layers_menu(ui);
                 });
                 bevel::toolbar_menu(ui, "Tools", |ui| {
                     ui.set_min_width(220.0);
@@ -4385,6 +4769,7 @@ impl WorkstationApp {
             }
 
             crate::app_support::basemap_picker(ui, &mut self.map_scene, &mut self.settings_store);
+            ui.menu_button("Layers", |ui| self.layers_menu(ui));
 
             let mut selected_quality = self.quality;
             // `ComboBox::show_ui` builds a non-wrapping horizontal child
@@ -4695,6 +5080,157 @@ impl WorkstationApp {
             self.relative_power_fallback_from_ref[pane.index()] = false;
         }
         self.invalidate_semantic_panes(&changed);
+    }
+
+    /// The operator's persistent list of local and HTTP(S) GR placefiles.
+    /// Sources are owned by the manager; the global layer toggle remains in
+    /// the normal settings document alongside every other persisted map knob.
+    fn placefiles_window(&mut self, context: &egui::Context) {
+        if !self.placefiles_window_open {
+            return;
+        }
+
+        let mut open = self.placefiles_window_open;
+        let mut browse_local = false;
+        let mut layer_enabled = self.settings_cache.placefiles_enabled;
+        egui::Window::new("Placefiles — GR / GR2Analyst overlays")
+            .open(&mut open)
+            .default_width(740.0)
+            .default_height(460.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.label(
+                    "Add a local placefile or HTTPS feed. Enabled icons, labels, lines and \
+                     polygons appear above every correctly located radar pane.",
+                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut layer_enabled, "Show enabled placefiles on the map");
+                    if ui.button("Browse local file…").clicked() {
+                        browse_local = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.placefiles.layers.is_empty(),
+                            egui::Button::new("Refresh all"),
+                        )
+                        .clicked()
+                    {
+                        self.placefiles.refresh_all();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Tip: drag a .pf, .placefile, .txt or extensionless GR placefile \
+                         directly onto the radar window.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+                if self.placefiles.ui(ui) {
+                    context.request_repaint();
+                }
+            });
+        self.placefiles_window_open = open;
+        if layer_enabled != self.settings_cache.placefiles_enabled {
+            self.set_placefiles_enabled(layer_enabled);
+        }
+        if browse_local {
+            self.placefile_browser = Some(PlacefileBrowser::open());
+        }
+    }
+
+    /// An egui-native local browser, separate from the radar-volume browser
+    /// so selecting an overlay cannot replace the analyst's open storm.
+    fn placefile_browser_window(&mut self, context: &egui::Context) {
+        let Some(mut browser) = self.placefile_browser.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut requested_directory = None;
+        let mut selected_file = None;
+        let mut refresh = false;
+        egui::Window::new("Choose a local placefile")
+            .open(&mut open)
+            .default_width(660.0)
+            .default_height(500.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            browser.directory.parent().is_some(),
+                            egui::Button::new("Up"),
+                        )
+                        .clicked()
+                    {
+                        requested_directory = browser.directory.parent().map(Path::to_path_buf);
+                    }
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut browser.directory_text)
+                            .desired_width((ui.available_width() - 110.0).max(120.0)),
+                    );
+                    let enter =
+                        edit.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if ui.button("Go").clicked() || enter {
+                        let path = PathBuf::from(browser.directory_text.trim());
+                        if path.is_file() {
+                            selected_file = Some(path);
+                        } else {
+                            requested_directory = Some(path);
+                        }
+                    }
+                    if ui.button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
+                if let Some(error) = &browser.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.separator();
+                let row_height = ui.text_style_height(&egui::TextStyle::Body) + 5.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("workstation-placefile-browser-entries")
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, browser.entries.len(), |ui, visible| {
+                        for index in visible {
+                            let entry = &browser.entries[index];
+                            let label = if entry.is_directory {
+                                format!("{} /", entry.name)
+                            } else {
+                                entry.name.clone()
+                            };
+                            if ui.selectable_label(false, label).clicked() {
+                                if entry.is_directory {
+                                    requested_directory = Some(entry.path.clone());
+                                } else {
+                                    selected_file = Some(entry.path.clone());
+                                }
+                            }
+                        }
+                    });
+            });
+
+        if let Some(path) = selected_file {
+            if self.placefiles.add_path(&path) {
+                self.set_placefiles_enabled(true);
+                self.placefiles_window_open = true;
+                self.status = format!("Added placefile {}", path.display());
+            } else {
+                self.status = format!("Placefile already present or invalid: {}", path.display());
+            }
+            open = false;
+            context.request_repaint();
+        }
+        if let Some(directory) = requested_directory {
+            browser.change_directory(directory);
+        } else if refresh {
+            browser.reload();
+        }
+        if open {
+            self.placefile_browser = Some(browser);
+        }
     }
 
     /// The 3D volume explorer, in its own window.
@@ -5288,7 +5824,18 @@ impl WorkstationApp {
                     probe: self.panes[pane.index()].probe_text.as_deref(),
                     spectrum: self.panes[pane.index()].spectrum.as_ref(),
                 };
-                draw_pane(
+                let layers = PaneExternalLayers {
+                    observations: self
+                        .settings_cache
+                        .observations_enabled
+                        .then_some(&self.surface_observations),
+                    placefiles: self
+                        .settings_cache
+                        .placefiles_enabled
+                        .then_some(&self.placefiles),
+                    frame_time: volume.as_ref().map(|volume| volume.volume_time),
+                };
+                draw_pane_with_layers(
                     ui,
                     pane,
                     pane_rect,
@@ -5301,6 +5848,7 @@ impl WorkstationApp {
                     &title,
                     &status,
                     &overlay,
+                    layers,
                 )
             };
 
@@ -5325,6 +5873,13 @@ impl WorkstationApp {
                 && self.xsection.handle_pane_click(world)
             {
                 self.workspace.set_active(pane);
+            } else if let Some(station) = interaction.clicked_observation {
+                self.workspace.set_active(pane);
+                self.surface_observations.request_station_history_at(
+                    &station,
+                    volume.as_ref().map(|volume| volume.volume_time),
+                );
+                self.status = format!("Loading observation history for {station}");
             } else if let Some(site) = interaction.clicked_site {
                 // Clicking a site marker is the quickest way to change radar.
                 self.workspace.set_active(pane);
@@ -7152,6 +7707,14 @@ impl eframe::App for WorkstationApp {
         self.poll_load_results();
         self.poll_site_directory();
         self.poll_warnings();
+        self.surface_observations.poll();
+        if self.settings_cache.placefiles_enabled || self.placefiles_window_open {
+            let frame_time = self.history.current().map(|frame| frame.volume.volume_time);
+            self.placefiles.set_reference_time(frame_time);
+            if self.placefiles.poll(&context) {
+                context.request_repaint();
+            }
+        }
         // Before anything asks which sweep to draw.
         self.refresh_capabilities();
         self.follow_live_low_tilts();
@@ -7169,6 +7732,9 @@ impl eframe::App for WorkstationApp {
         self.vol3d_window(&context);
         self.xsection_window(&context);
         self.palette_editor_window(&context);
+        self.surface_observations.history_window(&context);
+        self.placefiles_window(&context);
+        self.placefile_browser_window(&context);
         self.file_browser_window(&context);
         self.playlist_preflight_window(&context);
         if let Some(path) = self.online_data.draw(&context) {
@@ -8081,6 +8647,46 @@ mod tests {
     }
 
     #[test]
+    fn an_approved_single_path_uses_direct_load_instead_of_a_playlist() {
+        let mut app = test_app();
+        let path = PathBuf::from("C:/not-present/single-level-one-candidate.iq");
+
+        app.start_load_sequence(
+            vec![path.clone()],
+            crate::playlist_preflight::estimate_paths(&[]),
+        );
+
+        assert!(
+            app.file_sequence.is_none(),
+            "one approved file must retain the direct loader's raw I/Q session"
+        );
+        assert_eq!(app.source_path_text, path.display().to_string());
+        assert!(app.status.starts_with("Loading "));
+    }
+
+    #[test]
+    fn multiple_approved_paths_still_use_a_playlist() {
+        let mut app = test_app();
+
+        app.start_load_sequence(
+            vec![
+                PathBuf::from("C:/not-present/first-level-one-candidate.iq"),
+                PathBuf::from("C:/not-present/second-level-one-candidate.iq"),
+            ],
+            crate::playlist_preflight::estimate_paths(&[]),
+        );
+
+        assert_eq!(
+            app.file_sequence
+                .as_ref()
+                .expect("multiple approved files remain a playlist")
+                .paths
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn timeline_status_names_unlimited_and_each_configured_dimension() {
         assert_eq!(
             history_policy_status(analyst_runtime::HistoryPolicy::unlimited()),
@@ -8824,6 +9430,7 @@ mod tests {
                 // Theme settings and catalog settings share this page.
                 crate::theme::settings::keys::CATEGORY,
                 keys::map::CATEGORY,
+                keys::observations::CATEGORY,
                 keys::radar::CATEGORY,
                 keys::navigation::CATEGORY,
                 keys::vol3d::CATEGORY,
