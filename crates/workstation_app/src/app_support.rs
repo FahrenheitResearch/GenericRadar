@@ -359,11 +359,15 @@ pub(crate) fn warnings_hover(detail: &str, show_warnings: bool, drawn: usize) ->
     }
 }
 
-/// The same cut of the frame before the selected one, for a sweep blend.
+/// The last finished picture compatible with an arriving sweep.
 ///
-/// Returns `None` at the start of history, when the previous frame never
-/// collected this cut, or when the cut cannot be matched by geometry - all of
-/// which mean "draw this tilt on its own" rather than "error".
+/// A matching cut in the previous retained volume keeps its existing
+/// preference. At the start of a live session, however, a SAILS repeat may
+/// already be arriving before a previous volume exists, and a prior volume can
+/// legitimately lack the commanded tilt. In either case an earlier *completed*
+/// sweep of the same measured elevation and split-cut leg in this very volume
+/// is an honest underpaint. The current frame already owns that volume in an
+/// `Arc`, so sharing it with the renderer does not clone any radar data.
 pub(crate) fn previous_sweep_for(
     history: &VolumeHistory,
     volume: &RadarVolume,
@@ -371,10 +375,86 @@ pub(crate) fn previous_sweep_for(
     moment: &radar_core::MomentType,
 ) -> Option<(std::sync::Arc<RadarVolume>, usize)> {
     let selected = history.selected_index()?;
-    let previous = history.frames().get(selected.checked_sub(1)?)?;
     let target = volume.cuts.get(cut_index)?;
-    let index = crate::sweep::matching_cut_index(&previous.volume, target, moment)?;
-    Some((std::sync::Arc::clone(&previous.volume), index))
+    if let Some(previous) = selected
+        .checked_sub(1)
+        .and_then(|index| history.frames().get(index))
+        && let Some(index) = crate::sweep::matching_cut_index(&previous.volume, target, moment)
+    {
+        return Some((std::sync::Arc::clone(&previous.volume), index));
+    }
+
+    // The caller hands this function a borrowed volume, but the render worker
+    // needs shared ownership. Only the selected history frame can supply that
+    // ownership without copying an entire radar volume. Identity alone is not
+    // enough: successive partial snapshots share a site and timestamp while
+    // holding different radials, so the allocation itself must be identical.
+    let current = history.current()?;
+    if !std::ptr::eq(current.volume.as_ref(), volume) {
+        return None;
+    }
+    let target_elevation = product_engine::capabilities::median_elevation_deg(target)?;
+    let target_leg = sweep_leg(target);
+
+    // File order is collection order within one volume. Walking backwards
+    // chooses the newest earlier compatible SAILS repeat without remeasuring
+    // or sorting every cut in the volume on every animation frame.
+    let index =
+        volume.cuts[..cut_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, candidate)| {
+                if candidate
+                    .moments
+                    .get(moment)
+                    .is_none_or(|grid| grid.radial_count() == 0)
+                    || sweep_leg(candidate) != target_leg
+                {
+                    return None;
+                }
+
+                let elevation = product_engine::capabilities::median_elevation_deg(candidate)?;
+                if (elevation - target_elevation).abs()
+                    > product_engine::capabilities::NOMINAL_ELEVATION_TOLERANCE_DEG
+                {
+                    return None;
+                }
+
+                // Use the reveal's own full-turn measurement rather than a radial
+                // count or an end marker: sector scans and interrupted sweeps can
+                // carry either without providing a complete underpaint.
+                let complete = crate::sweep::SweepAnimator::new()
+                    .observe(candidate, std::time::Duration::ZERO)
+                    .is_some_and(|state| state.complete);
+                complete.then_some(index)
+            })?;
+
+    Some((std::sync::Arc::clone(&current.volume), index))
+}
+
+/// The same moment-based split-leg classification as `product_engine`.
+///
+/// A Doppler sweep can carry REF as well as VEL. Matching on REF alone would
+/// silently paint its short-range field underneath a long-range surveillance
+/// sweep, so the entire leg - not merely the requested moment - has to agree.
+fn sweep_leg(cut: &radar_core::ElevationCut) -> product_engine::CutLeg {
+    use radar_core::MomentType;
+
+    let has_velocity = cut.moments.contains_key(&MomentType::Velocity);
+    let has_dual_pol = cut
+        .moments
+        .contains_key(&MomentType::DifferentialReflectivity)
+        || cut
+            .moments
+            .contains_key(&MomentType::CorrelationCoefficient)
+        || cut.moments.contains_key(&MomentType::DifferentialPhase);
+
+    match (has_velocity, has_dual_pol) {
+        (true, true) => product_engine::CutLeg::Combined,
+        (true, false) => product_engine::CutLeg::Doppler,
+        (false, _) => product_engine::CutLeg::Surveillance,
+    }
 }
 
 /// File extensions the open and drop paths accept, lowercase and without the
@@ -461,7 +541,205 @@ pub(crate) fn choose_dropped_radar_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use analyst_runtime::{FrameOrigin, FrameStage, VolumeFrame};
+    use chrono::{TimeZone, Utc};
+    use radar_core::{
+        ElevationCut, GateRange, MomentGrid, MomentType, RadarSite, Radial, RadialStatus,
+    };
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn blend_volume(minute: u32) -> RadarVolume {
+        RadarVolume::new(
+            RadarSite::new("KTLX"),
+            Utc.with_ymd_and_hms(2026, 8, 24, 18, minute, 0)
+                .single()
+                .expect("valid sweep-blend fixture time"),
+        )
+    }
+
+    fn add_blend_cut(
+        volume: &mut RadarVolume,
+        stored_elevation_deg: f32,
+        measured_elevation_deg: f32,
+        elevation_number: u8,
+        radial_count: usize,
+        moments: &[MomentType],
+    ) {
+        let gate_range = GateRange {
+            first_gate_m: 250,
+            gate_spacing_m: 250,
+            gate_count: 1,
+        };
+        let mut cut = ElevationCut::new(stored_elevation_deg, Some(elevation_number));
+        for index in 0..radial_count {
+            cut.radials.push(Radial {
+                azimuth_deg: index as f32,
+                elevation_deg: measured_elevation_deg,
+                time_offset_ms: index as i32 * 100,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(25.0),
+                // Deliberately present even on a sector fixture: a marker
+                // alone cannot make 120 degrees a complete underpaint.
+                radial_status: Some(if index + 1 == radial_count {
+                    RadialStatus::EndElevation
+                } else {
+                    RadialStatus::Intermediate
+                }),
+            });
+        }
+        for moment in moments {
+            let mut grid = MomentGrid::new_u8(
+                moment.clone(),
+                gate_range.clone(),
+                2.0,
+                66.0,
+                Some(0),
+                Some(1),
+            );
+            for index in 0..radial_count {
+                grid.push_u8_row_slice(index, &[2])
+                    .expect("valid one-gate fixture radial");
+            }
+            cut.moments.insert(moment.clone(), grid);
+        }
+        volume.cuts.push(cut);
+    }
+
+    fn install_blend_volume(history: &mut VolumeHistory, volume: Arc<RadarVolume>) {
+        history.install(VolumeFrame::new(
+            volume,
+            FrameOrigin::Live,
+            FrameStage::Partial,
+            "live-sweep-fixture",
+        ));
+    }
+
+    #[test]
+    fn an_arriving_sails_repeat_underpaints_from_the_newest_completed_compatible_leg() {
+        let mut volume = blend_volume(5);
+        // Stored first-radial angles are intentionally misleading; measured
+        // medians put both surveillance sweeps in the target's real group.
+        add_blend_cut(&mut volume, 0.72, 0.50, 1, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(
+            &mut volume,
+            0.48,
+            0.51,
+            2,
+            360,
+            &[MomentType::Reflectivity, MomentType::Velocity],
+        );
+        add_blend_cut(&mut volume, 0.78, 0.53, 3, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut volume, 0.52, 0.50, 4, 120, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut volume, 0.91, 0.90, 5, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut volume, 0.10, 0.50, 6, 60, &[MomentType::Reflectivity]);
+        let volume = Arc::new(volume);
+        let mut history = VolumeHistory::default();
+        install_blend_volume(&mut history, Arc::clone(&volume));
+
+        let (underpaint, index) =
+            previous_sweep_for(&history, volume.as_ref(), 5, &MomentType::Reflectivity)
+                .expect("the current volume contains a completed compatible SAILS sweep");
+
+        assert!(
+            Arc::ptr_eq(&underpaint, &volume),
+            "underpainting a repeat must share the retained snapshot, never clone radar data"
+        );
+        assert_eq!(
+            index, 2,
+            "skip newer wrong-tilt and unfinished sweeps and preserve the surveillance leg"
+        );
+    }
+
+    #[test]
+    fn a_matching_previous_volume_retains_its_existing_underpaint_preference() {
+        let mut previous = blend_volume(0);
+        add_blend_cut(&mut previous, 0.5, 0.5, 7, 360, &[MomentType::Reflectivity]);
+        let previous = Arc::new(previous);
+
+        let mut current = blend_volume(5);
+        add_blend_cut(&mut current, 0.5, 0.5, 1, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut current, 0.5, 0.5, 7, 60, &[MomentType::Reflectivity]);
+        let current = Arc::new(current);
+
+        let mut history = VolumeHistory::default();
+        install_blend_volume(&mut history, Arc::clone(&previous));
+        install_blend_volume(&mut history, Arc::clone(&current));
+
+        let (underpaint, index) =
+            previous_sweep_for(&history, current.as_ref(), 1, &MomentType::Reflectivity)
+                .expect("the previous retained volume carries the matching tilt");
+
+        assert!(
+            Arc::ptr_eq(&underpaint, &previous),
+            "a same-volume fallback must not replace an already suitable prior volume"
+        );
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn a_prior_volume_without_this_tilt_falls_back_to_the_current_completed_sweep() {
+        let mut previous = blend_volume(0);
+        add_blend_cut(&mut previous, 1.8, 1.8, 9, 360, &[MomentType::Reflectivity]);
+        let previous = Arc::new(previous);
+
+        let mut current = blend_volume(5);
+        add_blend_cut(&mut current, 0.5, 0.5, 1, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut current, 0.5, 0.5, 2, 60, &[MomentType::Reflectivity]);
+        let current = Arc::new(current);
+
+        let mut history = VolumeHistory::default();
+        install_blend_volume(&mut history, previous);
+        install_blend_volume(&mut history, Arc::clone(&current));
+
+        let (underpaint, index) =
+            previous_sweep_for(&history, current.as_ref(), 1, &MomentType::Reflectivity)
+                .expect("the prior volume's missing tilt cannot hide a valid current-volume sweep");
+
+        assert!(Arc::ptr_eq(&underpaint, &current));
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn unfinished_wrong_leg_and_wrong_elevation_sweeps_are_never_underpaint() {
+        let mut volume = blend_volume(5);
+        add_blend_cut(&mut volume, 0.9, 0.9, 1, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(
+            &mut volume,
+            0.5,
+            0.5,
+            2,
+            360,
+            &[MomentType::Reflectivity, MomentType::Velocity],
+        );
+        add_blend_cut(&mut volume, 0.5, 0.5, 3, 120, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut volume, 0.5, 0.5, 4, 60, &[MomentType::Reflectivity]);
+        let volume = Arc::new(volume);
+        let mut history = VolumeHistory::default();
+        install_blend_volume(&mut history, Arc::clone(&volume));
+
+        assert!(
+            previous_sweep_for(&history, volume.as_ref(), 3, &MomentType::Reflectivity).is_none(),
+            "a matching REF key, misleading sweep-end marker, or nearby cut is not enough"
+        );
+    }
+
+    #[test]
+    fn a_different_snapshot_with_the_same_identity_cannot_borrow_the_history_arc() {
+        let mut volume = blend_volume(5);
+        add_blend_cut(&mut volume, 0.5, 0.5, 1, 360, &[MomentType::Reflectivity]);
+        add_blend_cut(&mut volume, 0.5, 0.5, 2, 60, &[MomentType::Reflectivity]);
+        let volume = Arc::new(volume);
+        let different_snapshot = volume.as_ref().clone();
+        let mut history = VolumeHistory::default();
+        install_blend_volume(&mut history, volume);
+
+        assert!(
+            previous_sweep_for(&history, &different_snapshot, 1, &MomentType::Reflectivity,)
+                .is_none(),
+            "matching site/time does not make a different partial snapshot safe to share"
+        );
+    }
 
     #[test]
     fn a_drop_prefers_the_radar_file_over_whatever_came_with_it() {

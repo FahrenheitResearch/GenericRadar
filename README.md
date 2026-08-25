@@ -8,6 +8,10 @@ API keys, no telemetry.
 
 - Live Level II via the NEXRAD real-time chunk feed, with per-radial sweep
   updates and automatic backfill of the previous complete volume
+- Optional automatic following of arriving low-elevation sweeps, including
+  in-progress supplemental scans revealed radial by radial. Maximum elevation,
+  minimum sweep-update interval, and live-feed polling cadence are independently
+  adjustable
 - Files routed by content rather than by extension: NEXRAD Archive II,
   including the legacy Message 1 that every volume before 2008 is written in;
   ODIM_H5 polar volumes; DORADE sweepfiles and mobile deployment zips

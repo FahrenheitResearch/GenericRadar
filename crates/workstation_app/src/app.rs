@@ -37,6 +37,8 @@ use crate::sites_service::{LocatedSite, SitesService};
 use crate::sweep::{SweepAnimator, SweepState, catch_up_factor};
 use crate::warnings_service::WarningsService;
 
+#[path = "live_follow.rs"]
+mod live_follow;
 mod online_data;
 
 /// How often placed hazards are rebuilt so expiries take effect.
@@ -769,6 +771,13 @@ pub struct WorkstationApp {
     site_text: String,
     live_site: Option<String>,
     live_status: String,
+    /// The actual acquisition time last accepted by each pane's low-tilt
+    /// follower. Per-pane state matters because reflectivity and velocity
+    /// often come from different legs of the same split cut.
+    live_follow_last_scan: [Option<DateTime<Utc>>; analyst_runtime::MAX_PANES],
+    /// A manual tilt choice stays visible until a genuinely newer eligible
+    /// sweep arrives; merely repainting the same volume cannot undo it.
+    live_follow_manual_hold: [Option<DateTime<Utc>>; analyst_runtime::MAX_PANES],
     /// What the live poll last said about the feed itself. `None` when no live
     /// session is running, so nothing here can outlive the session that
     /// produced it and label a local file "stalled".
@@ -897,6 +906,8 @@ impl WorkstationApp {
             site_text: String::new(),
             live_site: None,
             live_status: String::new(),
+            live_follow_last_scan: [None; analyst_runtime::MAX_PANES],
+            live_follow_manual_hold: [None; analyst_runtime::MAX_PANES],
             live_feed: None,
             warnings_service: WarningsService::new(context, warnings_source),
             warnings: Vec::new(),
@@ -1530,6 +1541,148 @@ impl WorkstationApp {
         );
     }
 
+    /// The display-follow policy is independent of how often the live
+    /// worker polls for chunks. Keeping those clocks separate lets an analyst
+    /// request, for example, a new eligible sweep every 30 seconds while the
+    /// feed still notices incoming data immediately.
+    fn live_follow_policy(&self) -> live_follow::LiveFollowPolicy {
+        use crate::settings_ui::catalog::keys::data as key;
+
+        live_follow::LiveFollowPolicy {
+            enabled: self.settings_store.effective_bool(
+                &self.settings_registry,
+                key::CATEGORY,
+                key::FOLLOW_LOW_TILTS_ENABLED,
+            ),
+            max_elevation_deg: self.settings_store.effective_float(
+                &self.settings_registry,
+                key::CATEGORY,
+                key::FOLLOW_MAX_ELEVATION_DEG,
+            ) as f32,
+            min_interval: Duration::from_secs(
+                self.settings_store
+                    .effective_int(
+                        &self.settings_registry,
+                        key::CATEGORY,
+                        key::FOLLOW_MIN_SWEEP_INTERVAL_SECONDS,
+                    )
+                    .max(0) as u64,
+            ),
+        }
+    }
+
+    fn reset_live_follow_state(&mut self) {
+        self.live_follow_last_scan = [None; analyst_runtime::MAX_PANES];
+        self.live_follow_manual_hold = [None; analyst_runtime::MAX_PANES];
+    }
+
+    fn set_live_follow_enabled(&mut self, enabled: bool) {
+        use crate::settings_ui::catalog::keys::data as key;
+
+        if self.settings_store.set(
+            key::CATEGORY,
+            key::FOLLOW_LOW_TILTS_ENABLED,
+            settings::SettingValue::Bool(enabled),
+        ) {
+            self.apply_changed_setting(key::CATEGORY, key::FOLLOW_LOW_TILTS_ENABLED);
+        }
+    }
+
+    /// The newest usable, possibly still-arriving sweep that can honestly
+    /// serve one pane's own product. Selecting it while it is in progress is
+    /// what lets the existing live animator reveal its real incoming radials.
+    /// Exact producer-native fields and volume-integrated products have no
+    /// equivalent single-sweep following contract.
+    fn live_follow_candidate(
+        &self,
+        pane: PaneId,
+        policy: live_follow::LiveFollowPolicy,
+        last_followed_scan: Option<DateTime<Utc>>,
+    ) -> Option<live_follow::LiveFollowCandidate> {
+        let frame = self.history.current()?;
+        let capabilities = self.capabilities.as_deref()?;
+        let product = modeled_product_or_source_field(&self.workspace.pane(pane).product).ok()?;
+        if product.derived_volume().is_some() {
+            return None;
+        }
+        let descriptor = product.descriptor();
+        let moment = descriptor.computation.source_moment();
+        live_follow::newest_eligible_cut(
+            &frame.volume,
+            capabilities,
+            &moment,
+            descriptor.cut_policy,
+            policy,
+            last_followed_scan,
+        )
+    }
+
+    /// Apply one independently selected, product-compatible sweep per pane.
+    /// This runs only at the live edge: historical scrubbing, playback and
+    /// local files retain their explicitly selected tilts.
+    fn follow_live_low_tilts(&mut self) {
+        if self.live_site.is_none()
+            || !self.history.follows_live()
+            || self.history.playback() == PlaybackState::Playing
+        {
+            return;
+        }
+        let policy = self.live_follow_policy();
+        if !policy.enabled {
+            return;
+        }
+
+        let mut changed = Vec::new();
+        for pane in self.workspace.visible_panes().iter().copied() {
+            let index = pane.index();
+            let Some(candidate) =
+                self.live_follow_candidate(pane, policy, self.live_follow_last_scan[index])
+            else {
+                continue;
+            };
+            if self.live_follow_manual_hold[index]
+                .is_some_and(|held_scan| candidate.scan_time <= held_scan)
+            {
+                continue;
+            }
+            let Ok(cut_index) = u16::try_from(candidate.cut_index) else {
+                continue;
+            };
+            let selected = TiltSelection::CutIndex(cut_index);
+            if self.workspace.pane(pane).tilt != selected {
+                self.workspace.pane_mut(pane).tilt = selected;
+                changed.push(pane);
+            }
+            self.live_follow_last_scan[index] = Some(candidate.scan_time);
+            self.live_follow_manual_hold[index] = None;
+        }
+
+        if self.vrot_pane.is_some_and(|pane| changed.contains(&pane)) {
+            self.vrot_state
+                .mark_stale(crate::vrot::StaleReason::DifferentCut);
+        }
+        self.invalidate_semantic_panes(&changed);
+    }
+
+    /// Keep a manual tilt choice until a genuinely newer usable low sweep
+    /// arrives, even if that next sweep is still in progress.
+    /// Using the measured sweep frontier, rather than wall-clock delay, keeps
+    /// a quiet feed from repeatedly stealing back the analyst's selection.
+    fn hold_live_follow_for_manual_tilts(&mut self, panes: &[PaneId]) {
+        let mut policy = self.live_follow_policy();
+        if self.live_site.is_none() || !policy.enabled {
+            return;
+        }
+        policy.min_interval = Duration::ZERO;
+        for pane in panes {
+            let frontier = self
+                .live_follow_candidate(*pane, policy, None)
+                .map(|candidate| candidate.scan_time)
+                .or_else(|| self.history.current().map(|frame| frame.volume.volume_time));
+            self.live_follow_manual_hold[pane.index()] = frontier;
+        }
+    }
+
     /// Apply one changed setting to live state. The cache rebuild runs once
     /// per change batch in `settings_frame`; these arms cover the values that
     /// live somewhere other than the cache.
@@ -1608,6 +1761,17 @@ impl WorkstationApp {
                         self.history.len()
                     );
                 }
+            }
+            (
+                keys::data::CATEGORY,
+                keys::data::FOLLOW_LOW_TILTS_ENABLED
+                | keys::data::FOLLOW_MAX_ELEVATION_DEG
+                | keys::data::FOLLOW_MIN_SWEEP_INTERVAL_SECONDS,
+            ) => {
+                // A deliberately changed ceiling or cadence is new analyst
+                // intent, so reconsider the current completed sweep now.
+                self.reset_live_follow_state();
+                self.follow_live_low_tilts();
             }
             (
                 keys::radar::CATEGORY,
@@ -2042,6 +2206,7 @@ impl WorkstationApp {
         // A local file is not a feed. Whatever the last session said about
         // KUEX's prefix must not follow the analyst into an archive volume.
         self.live_feed = None;
+        self.reset_live_follow_state();
         // The file may be any radar's: the coordinates a Vrot endpoint was
         // clicked at name a different place under the new session, so the
         // measurement is retired before the world changes under it.
@@ -2458,6 +2623,7 @@ impl WorkstationApp {
         let generation = self.session_clock.bump();
         self.frame_clock.bump();
         self.history.clear();
+        self.reset_live_follow_state();
         let evicted = self.history.set_policy(history_policy);
         debug_assert!(evicted.is_empty(), "an empty history cannot evict");
         self.load_ms = None;
@@ -2493,6 +2659,7 @@ impl WorkstationApp {
         self.session_clock.bump();
         self.live_site = None;
         self.live_status.clear();
+        self.reset_live_follow_state();
         self.live_feed = None;
         self.status = "Live session stopped".to_owned();
     }
@@ -3348,6 +3515,9 @@ impl WorkstationApp {
         let mut palette_changed = false;
         let mut filter_changed = false;
         let mut tilt_delta = 0_isize;
+        let follow_policy = self.live_follow_policy();
+        let mut toggle_live_follow = false;
+        let mut open_live_follow_settings = false;
         let visible = self.workspace.visible_panes();
         let cameras_linked = visible
             .iter()
@@ -3719,6 +3889,30 @@ impl WorkstationApp {
                 if bevel::toolbar_button(ui, "+ Tilt").clicked() {
                     tilt_delta = 1;
                 }
+                let follow_label = if follow_policy.enabled {
+                    format!("Auto ≤{:.1}°", follow_policy.max_elevation_deg)
+                } else {
+                    "Auto tilt".to_owned()
+                };
+                let follow_response = bevel::toolbar_toggle(
+                    ui,
+                    follow_policy.enabled,
+                    follow_label,
+                )
+                .on_hover_text(format!(
+                    "Follow arriving live sweeps at or below {:.1}° with the \
+                     real radial sweep animation; minimum scan-time gap {} s. \
+                     Click to toggle; right-click \
+                     to adjust the elevation, update interval, or feed polling.",
+                    follow_policy.max_elevation_deg,
+                    follow_policy.min_interval.as_secs(),
+                ));
+                if follow_response.clicked() {
+                    toggle_live_follow = true;
+                }
+                if follow_response.secondary_clicked() {
+                    open_live_follow_settings = true;
+                }
                 // Immediately after the stepper, because these describe the
                 // sweep the stepper chose. Readout wells rather than bare
                 // labels, so they keep the bar's grammar and stay legible on
@@ -3887,6 +4081,13 @@ impl WorkstationApp {
         if tilt_delta != 0 {
             self.change_active_tilt(tilt_delta);
         }
+        if toggle_live_follow {
+            self.set_live_follow_enabled(!follow_policy.enabled);
+        }
+        if open_live_follow_settings {
+            self.settings_ui
+                .open_category(crate::settings_ui::catalog::keys::data::CATEGORY);
+        }
         if toggle_warnings {
             self.show_warnings = !self.show_warnings;
             // Force placement now rather than at the next cadence, so the map
@@ -3932,6 +4133,9 @@ impl WorkstationApp {
         let mut palette_changed = false;
         let mut filter_changed = false;
         let mut tilt_delta = 0_isize;
+        let follow_policy = self.live_follow_policy();
+        let mut toggle_live_follow = false;
+        let mut open_live_follow_settings = false;
         let visible = self.workspace.visible_panes();
         let cameras_linked = visible
             .iter()
@@ -4237,6 +4441,27 @@ impl WorkstationApp {
             if ui.button("+ Tilt").clicked() {
                 tilt_delta = 1;
             }
+            let follow_label = if follow_policy.enabled {
+                format!("Auto ≤{:.1}°", follow_policy.max_elevation_deg)
+            } else {
+                "Auto tilt".to_owned()
+            };
+            let follow_response = ui
+                .selectable_label(follow_policy.enabled, follow_label)
+                .on_hover_text(format!(
+                    "Follow arriving live sweeps at or below {:.1}° with the \
+                     real radial sweep animation; minimum scan-time gap {} s. \
+                     Click to toggle; right-click \
+                     to adjust the elevation, update interval, or feed polling.",
+                    follow_policy.max_elevation_deg,
+                    follow_policy.min_interval.as_secs(),
+                ));
+            if follow_response.clicked() {
+                toggle_live_follow = true;
+            }
+            if follow_response.secondary_clicked() {
+                open_live_follow_settings = true;
+            }
             // The same two facts as on the menu bar, in this style's plain
             // widgets: one readout, one definition of what it says.
             let (snr_readout, resolution_notice) = self.active_censoring_readouts();
@@ -4394,6 +4619,13 @@ impl WorkstationApp {
         if tilt_delta != 0 {
             self.change_active_tilt(tilt_delta);
         }
+        if toggle_live_follow {
+            self.set_live_follow_enabled(!follow_policy.enabled);
+        }
+        if open_live_follow_settings {
+            self.settings_ui
+                .open_category(crate::settings_ui::catalog::keys::data::CATEGORY);
+        }
         if toggle_warnings {
             self.show_warnings = !self.show_warnings;
             // Force placement now rather than at the next cadence, so the map
@@ -4445,6 +4677,8 @@ impl WorkstationApp {
         }
         for pane in &changed {
             self.relative_power_fallback_from_ref[pane.index()] = false;
+            self.live_follow_last_scan[pane.index()] = None;
+            self.live_follow_manual_hold[pane.index()] = None;
         }
         self.invalidate_semantic_panes(&changed);
     }
@@ -6260,6 +6494,7 @@ impl WorkstationApp {
             let changed = self
                 .workspace
                 .apply_tilt_from(active, TiltSelection::CutIndex(next as u16));
+            self.hold_live_follow_for_manual_tilts(&changed);
             self.invalidate_semantic_panes(&changed);
             return;
         }
@@ -6284,6 +6519,7 @@ impl WorkstationApp {
         let changed = self
             .workspace
             .apply_tilt_from(active, TiltSelection::CutIndex(next as u16));
+        self.hold_live_follow_for_manual_tilts(&changed);
         // Belt and braces beside `vrot::measure`'s own `DifferentCuts`
         // refusal: the refusal stops a cross-tilt PAIR, this stops a finished
         // measurement reading as current after the pane left its tilt.
@@ -6918,6 +7154,7 @@ impl eframe::App for WorkstationApp {
         self.poll_warnings();
         // Before anything asks which sweep to draw.
         self.refresh_capabilities();
+        self.follow_live_low_tilts();
         self.map_scene
             .set_pixels_per_point(context.pixels_per_point());
         self.map_scene.poll();
@@ -9136,6 +9373,193 @@ mod tests {
             volume,
             elapsed_ms: 1.0,
         });
+    }
+
+    /// Real, complete sweeps at independently controlled elevations and
+    /// acquisition times; they share one growing live-volume identity.
+    fn live_follow_volume(sweeps: &[(f32, i32)]) -> Arc<RadarVolume> {
+        let mut volume = (*renderable_volume(1_700_000_000)).clone();
+        let template = volume.cuts[0].clone();
+        volume.cuts.clear();
+        for (index, (elevation_deg, offset_ms)) in sweeps.iter().copied().enumerate() {
+            let mut cut = template.clone();
+            cut.elevation_deg = elevation_deg;
+            cut.elevation_number = u8::try_from(index + 1).ok();
+            for (radial_index, radial) in cut.radials.iter_mut().enumerate() {
+                radial.elevation_deg = elevation_deg;
+                radial.time_offset_ms = offset_ms + radial_index as i32 * 10;
+            }
+            volume.cuts.push(cut);
+        }
+        Arc::new(volume)
+    }
+
+    /// Trim the most recent sweep exactly the way a partial live decode does:
+    /// both the physical radials and each required moment's gate rows stop at
+    /// the same real acquisition frontier.
+    fn with_partial_last_sweep(volume: Arc<RadarVolume>, radial_count: usize) -> Arc<RadarVolume> {
+        let mut volume = (*volume).clone();
+        let cut = volume.cuts.last_mut().expect("at least one fixture sweep");
+        cut.radials.truncate(radial_count);
+        for grid in cut.moments.values_mut() {
+            grid.radial_indices.truncate(radial_count);
+            let values = radial_count * grid.gate_range.gate_count;
+            match &mut grid.storage {
+                radar_core::MomentStorage::U8(stored) => stored.truncate(values),
+                radar_core::MomentStorage::U16(stored) => stored.truncate(values),
+                radar_core::MomentStorage::F32(stored) => stored.truncate(values),
+            }
+        }
+        Arc::new(volume)
+    }
+
+    #[test]
+    fn live_follow_animates_an_arriving_sweep_over_the_previous_completed_sweep() {
+        let mut app = test_app();
+        app.live_site = Some("KTLX".to_owned());
+        install_partial(
+            &mut app,
+            with_partial_last_sweep(live_follow_volume(&[(0.5, 0), (0.5, 60_000)]), 120),
+        );
+        app.refresh_capabilities();
+        app.set_live_follow_enabled(true);
+
+        let pane = first_pane();
+        assert_eq!(
+            app.workspace.pane(pane).tilt,
+            TiltSelection::CutIndex(1),
+            "Auto tilt must select the incoming repeat while it is actually sweeping"
+        );
+
+        app.advance_sweeps();
+        let first = app.panes[pane.index()]
+            .sweep_state
+            .expect("the selected incoming cut drives the existing live animator");
+        assert!(
+            !first.complete,
+            "an arriving sweep must not be called complete"
+        );
+        assert!(
+            first.revealed_deg > 0.0 && first.revealed_deg < 360.0,
+            "the genuine incoming radial frontier is an unfinished clockwise reveal"
+        );
+
+        let current = app
+            .history
+            .current()
+            .expect("the partial volume is selected");
+        let (underpaint, underpaint_cut) = crate::app_support::previous_sweep_for(
+            &app.history,
+            &current.volume,
+            1,
+            &radar_core::MomentType::Reflectivity,
+        )
+        .expect("the older complete same-volume sweep remains visible under the wipe");
+        assert!(Arc::ptr_eq(&underpaint, &current.volume));
+        assert_eq!(underpaint_cut, 0);
+
+        install_partial(
+            &mut app,
+            with_partial_last_sweep(live_follow_volume(&[(0.5, 0), (0.5, 60_000)]), 220),
+        );
+        app.refresh_capabilities();
+        app.follow_live_low_tilts();
+        app.advance_sweeps();
+        let grown = app.panes[pane.index()]
+            .sweep_state
+            .expect("the same incoming sweep remains animated as new radials arrive");
+        assert!(!grown.complete);
+        assert!(
+            grown.frontier_deg > first.frontier_deg,
+            "the animator tracks the newer, genuinely received radial frontier"
+        );
+    }
+
+    #[test]
+    fn live_follow_selects_newest_completed_sweep_below_the_adjustable_ceiling() {
+        use crate::settings_ui::catalog::keys::data as key;
+
+        let mut app = test_app();
+        app.live_site = Some("KTLX".to_owned());
+        install_partial(
+            &mut app,
+            live_follow_volume(&[(0.5, 0), (0.9, 30_000), (1.3, 60_000), (1.8, 90_000)]),
+        );
+        app.refresh_capabilities();
+
+        app.set_live_follow_enabled(true);
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::CutIndex(2),
+            "the newest complete 1.3° sweep is allowed; the newer 1.8° sweep is not"
+        );
+
+        assert!(app.settings_store.set(
+            key::CATEGORY,
+            key::FOLLOW_MAX_ELEVATION_DEG,
+            settings::SettingValue::Float(0.8),
+        ));
+        app.apply_changed_setting(key::CATEGORY, key::FOLLOW_MAX_ELEVATION_DEG);
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::CutIndex(0),
+            "changing the ceiling immediately honors the analyst's new limit"
+        );
+    }
+
+    #[test]
+    fn live_follow_respects_manual_tilt_until_a_new_completed_sweep_arrives() {
+        let mut app = test_app();
+        app.live_site = Some("KTLX".to_owned());
+        install_partial(&mut app, live_follow_volume(&[(0.5, 0), (0.9, 30_000)]));
+        app.refresh_capabilities();
+        app.set_live_follow_enabled(true);
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::CutIndex(1)
+        );
+
+        app.change_active_tilt(-1);
+        app.follow_live_low_tilts();
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::CutIndex(0),
+            "repainting the existing volume must not steal back a manually chosen tilt"
+        );
+
+        install_partial(
+            &mut app,
+            live_follow_volume(&[(0.5, 0), (0.9, 30_000), (1.2, 60_000)]),
+        );
+        app.refresh_capabilities();
+        app.follow_live_low_tilts();
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::CutIndex(2),
+            "the next genuinely new completed low sweep resumes automatic following"
+        );
+    }
+
+    #[test]
+    fn live_follow_never_changes_historical_playback_or_local_sessions() {
+        let mut app = test_app();
+        install_partial(&mut app, live_follow_volume(&[(0.5, 0), (0.9, 30_000)]));
+        app.refresh_capabilities();
+        app.set_live_follow_enabled(true);
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::LowestAvailable,
+            "a local or archived session is never an automatic live-follow target"
+        );
+
+        app.live_site = Some("KTLX".to_owned());
+        app.history.set_playback(PlaybackState::Playing);
+        app.follow_live_low_tilts();
+        assert_eq!(
+            app.workspace.pane(first_pane()).tilt,
+            TiltSelection::LowestAvailable,
+            "timeline playback owns its selection even while a live site is connected"
+        );
     }
 
     /// What `canvas` does for pane 0, minus the painting: measure, resolve,

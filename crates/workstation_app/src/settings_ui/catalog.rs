@@ -153,6 +153,9 @@ pub mod keys {
         pub const STARTUP_SITE: &str = "startup_site";
         pub const RESUME_LAST_SITE: &str = "resume_last_site";
         pub const POLL_SECONDS: &str = "poll_seconds";
+        pub const FOLLOW_LOW_TILTS_ENABLED: &str = "follow_low_tilts_enabled";
+        pub const FOLLOW_MAX_ELEVATION_DEG: &str = "follow_max_elevation_deg";
+        pub const FOLLOW_MIN_SWEEP_INTERVAL_SECONDS: &str = "follow_min_sweep_interval_seconds";
         pub const HISTORY_MAX_FRAMES: &str = "history_max_frames";
         pub const HISTORY_MAX_MB: &str = "history_max_mb";
         pub const LIVE_CACHE_LIMIT_MB: &str = "live_cache_limit_mb";
@@ -484,8 +487,9 @@ fn radar_category() -> SettingsCategory {
                      per frame - worth it for a still, heavy on a fast loop.",
             ),
             SettingSpec::new(k::SWEEP_ANIMATION, "Sweep animation", toggle(true)).help(
-                "Reveal an arriving live sweep as a clockwise wipe at the antenna's own \
-                 measured rate, instead of repainting the whole tilt at once.",
+                "Reveal incoming live radials as a clockwise sweep at the antenna's own \
+                 measured rate, instead of repainting the entire tilt at once. This is \
+                 enabled by default when automatically following arriving low tilts.",
             ),
             SettingSpec::new(
                 k::SWEEP_SPEED,
@@ -915,6 +919,42 @@ fn data_category() -> SettingsCategory {
                  picture.",
             )
             .group("Live polling"),
+            SettingSpec::new(
+                k::FOLLOW_LOW_TILTS_ENABLED,
+                "Automatically follow arriving low tilts",
+                toggle(false),
+            )
+            .help(
+                "Automatically select newly arriving, usable sweeps at or below the \
+                 elevation ceiling, including supplemental low-level scans within the \
+                 same volume. Following begins while a sweep is still in progress, with \
+                 incoming data revealed radial by radial. Disable this setting to keep \
+                 tilt selection under manual control.",
+            )
+            .group("Live tilt following"),
+            SettingSpec::new(
+                k::FOLLOW_MAX_ELEVATION_DEG,
+                "Maximum followed elevation",
+                slider(0.1, 20.0, 1.4, 1, "°"),
+            )
+            .help(
+                "The highest measured elevation a live sweep may have before automatic \
+                 following ignores it. For example, 1.4° admits arriving sweeps around \
+                 0.5°, 0.9° and 1.3° without following the radar to higher tilts.",
+            )
+            .group("Live tilt following"),
+            SettingSpec::new(
+                k::FOLLOW_MIN_SWEEP_INTERVAL_SECONDS,
+                "Minimum sweep update interval",
+                integer(1, 600, 30, "s"),
+            )
+            .help(
+                "The minimum difference between the measured scan times of consecutive \
+                 automatically followed sweeps. This is a display-selection interval, not \
+                 the live acquisition poll interval above: the feed continues checking \
+                 for new chunks while the selected sweep updates radial by radial.",
+            )
+            .group("Live tilt following"),
             SettingSpec::new(
                 k::HISTORY_MAX_FRAMES,
                 "History frame limit (0 = Unlimited)",
@@ -1702,6 +1742,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn live_tilt_following_is_opt_in_and_distinct_from_acquisition_polling() {
+        let registry = registry();
+        let category = registry
+            .category(keys::data::CATEGORY)
+            .expect("the Data settings page is declared");
+        let section = category
+            .sections()
+            .into_iter()
+            .find(|section| section.heading == "Live tilt following")
+            .expect("live tilt following has its own settings section");
+        let ids: Vec<&str> = section
+            .settings
+            .iter()
+            .map(|setting| setting.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                keys::data::FOLLOW_LOW_TILTS_ENABLED,
+                keys::data::FOLLOW_MAX_ELEVATION_DEG,
+                keys::data::FOLLOW_MIN_SWEEP_INTERVAL_SECONDS,
+            ],
+            "display-selection controls must not be mixed into network polling"
+        );
+
+        let enable = registry
+            .setting(keys::data::CATEGORY, keys::data::FOLLOW_LOW_TILTS_ENABLED)
+            .expect("the opt-in toggle is declared");
+        assert_eq!(enable.kind.default_value(), SettingValue::Bool(false));
+        assert!(
+            enable.help.contains("still in progress") && enable.help.contains("radial by radial"),
+            "automatic following must describe in-progress sweeps and incoming radials"
+        );
+
+        let animation = registry
+            .setting(keys::radar::CATEGORY, keys::radar::SWEEP_ANIMATION)
+            .expect("the existing live sweep animation is declared");
+        assert_eq!(
+            animation.kind.default_value(),
+            SettingValue::Bool(true),
+            "automatic following should reveal incoming sweeps without another toggle"
+        );
+
+        let elevation = registry
+            .setting(keys::data::CATEGORY, keys::data::FOLLOW_MAX_ELEVATION_DEG)
+            .expect("the elevation ceiling is declared");
+        let SettingKind::Slider {
+            min,
+            max,
+            default,
+            decimals,
+            unit,
+            ..
+        } = &elevation.kind
+        else {
+            panic!("the elevation ceiling must be a degree slider");
+        };
+        assert_eq!((*min, *max, *default, *decimals), (0.1, 20.0, 1.4, 1));
+        assert_eq!(unit, "°");
+
+        let interval = registry
+            .setting(
+                keys::data::CATEGORY,
+                keys::data::FOLLOW_MIN_SWEEP_INTERVAL_SECONDS,
+            )
+            .expect("the minimum followed-sweep interval is declared");
+        let SettingKind::Integer {
+            min,
+            max,
+            default,
+            unit,
+        } = &interval.kind
+        else {
+            panic!("the minimum followed-sweep interval must use whole seconds");
+        };
+        assert_eq!((*min, *max, *default), (1, 600, 30));
+        assert_eq!(unit, "s");
+        assert!(
+            interval
+                .help
+                .contains("not the live acquisition poll interval"),
+            "the display interval must not be mistaken for the network poll cadence"
+        );
+
+        let acquisition = registry
+            .setting(keys::data::CATEGORY, keys::data::POLL_SECONDS)
+            .expect("the pre-existing acquisition poll remains declared");
+        assert_eq!(acquisition.group, "Live polling");
+        assert_eq!(acquisition.kind.default_value(), SettingValue::Float(1.2));
     }
 
     /// The pages that had stopped being readable as a list carry headings.
