@@ -804,6 +804,47 @@ struct ProbeCensor {
     mask: Option<render2d::GateFilterMask>,
 }
 
+/// A private screenshot tag: the still-image exporter deliberately ignores it.
+#[derive(Clone, Debug)]
+struct LoopCaptureTag {
+    capture_id: u64,
+    frame_index: usize,
+}
+
+/// Equal timestamps are legitimate in independently selected research files,
+/// so an identity alone cannot identify which picture a loop promised to save.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoopFrameKey {
+    identity: analyst_runtime::FrameIdentity,
+    source_label: String,
+}
+
+impl LoopFrameKey {
+    fn from_frame(frame: &VolumeFrame) -> Self {
+        Self {
+            identity: frame.identity.clone(),
+            source_label: frame.source_label.clone(),
+        }
+    }
+}
+
+/// Drives one honest oldest-to-newest loop through the actual displayed panes.
+/// Frames are intentionally uncapped: the analyst controls their own history.
+struct LoopExportState {
+    capture_id: u64,
+    frame_keys: Vec<LoopFrameKey>,
+    original_frame: Option<LoopFrameKey>,
+    original_selected: Option<usize>,
+    original_follows_live: bool,
+    original_playback: PlaybackState,
+    next_index: usize,
+    awaiting_screenshot: bool,
+    settled_paints_remaining: u8,
+    frames: Vec<Arc<egui::ColorImage>>,
+    file_base: String,
+    delay_ms: u32,
+}
+
 pub struct WorkstationApp {
     workspace: WorkspaceState,
     history: VolumeHistory,
@@ -895,6 +936,10 @@ pub struct WorkstationApp {
     sequence_status: Option<String>,
     sequence_detail: Option<String>,
     current_view_export: crate::current_view_export::CurrentViewExport,
+    /// A full-window screenshot for each exact, settled history frame.
+    loop_export: Option<LoopExportState>,
+    next_loop_capture_id: u64,
+    loop_export_notice: Option<String>,
     /// Public research-radar catalog navigation and its background download
     /// worker. Kept beside the local browser because both return a path into
     /// the same load seam; neither performs decoding itself.
@@ -1043,6 +1088,9 @@ impl WorkstationApp {
             sequence_status: None,
             sequence_detail: None,
             current_view_export: crate::current_view_export::CurrentViewExport::default(),
+            loop_export: None,
+            next_loop_capture_id: 0,
+            loop_export_notice: None,
             online_data: online_data::OnlineDataBrowser::new(context.clone()),
             status: "Drop a Level II file here or enter a path above".to_owned(),
             load_ms: None,
@@ -3887,6 +3935,7 @@ impl WorkstationApp {
         let mut requested_load = None;
         let mut open_browser = false;
         let mut export_current_view = false;
+        let mut export_loop = false;
         let mut open_online_data = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
@@ -3960,7 +4009,7 @@ impl WorkstationApp {
                     });
                     if ui
                         .add_enabled(
-                            !self.current_view_export.in_flight(),
+                            !self.current_view_export.in_flight() && self.loop_export.is_none(),
                             egui::Button::new("Export current view"),
                         )
                         .on_hover_text(
@@ -3969,6 +4018,21 @@ impl WorkstationApp {
                         .clicked()
                     {
                         export_current_view = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.history.is_empty()
+                                && !self.current_view_export.in_flight()
+                                && self.loop_export.is_none(),
+                            egui::Button::new("Export loop…"),
+                        )
+                        .on_hover_text(
+                            "Save every loaded radar frame, including the current map, legends and overlays, as a high-quality animated GIF directly to Downloads.",
+                        )
+                        .clicked()
+                    {
+                        export_loop = true;
                         ui.close();
                     }
                     if ui.button("Download Level I data…").clicked() {
@@ -4443,6 +4507,9 @@ impl WorkstationApp {
         if export_current_view {
             self.request_current_view_export(ui.ctx());
         }
+        if export_loop {
+            self.begin_loop_export(ui.ctx());
+        }
         if open_online_data {
             self.online_data.open();
         }
@@ -4508,6 +4575,7 @@ impl WorkstationApp {
         let mut requested_load = None;
         let mut open_browser = false;
         let mut export_current_view = false;
+        let mut export_loop = false;
         let mut open_online_data = false;
         let mut live_action = None;
         let mut selected_layout = self.workspace.layout;
@@ -4549,7 +4617,7 @@ impl WorkstationApp {
             }
             if ui
                 .add_enabled(
-                    !self.current_view_export.in_flight(),
+                    !self.current_view_export.in_flight() && self.loop_export.is_none(),
                     egui::Button::new("Export current view"),
                 )
                 .on_hover_text(
@@ -4558,6 +4626,20 @@ impl WorkstationApp {
                 .clicked()
             {
                 export_current_view = true;
+            }
+            if ui
+                .add_enabled(
+                    !self.history.is_empty()
+                        && !self.current_view_export.in_flight()
+                        && self.loop_export.is_none(),
+                    egui::Button::new("Export loop…"),
+                )
+                .on_hover_text(
+                    "Save every loaded radar frame and its visible overlays as an animated GIF directly to Downloads.",
+                )
+                .clicked()
+            {
+                export_loop = true;
             }
             if ui
                 .button("Online Level I…")
@@ -4982,6 +5064,9 @@ impl WorkstationApp {
         if export_current_view {
             self.request_current_view_export(ui.ctx());
         }
+        if export_loop {
+            self.begin_loop_export(ui.ctx());
+        }
         if open_online_data {
             self.online_data.open();
         }
@@ -5321,6 +5406,225 @@ impl WorkstationApp {
         let file_base =
             crate::current_view_export::capture_file_base(site, volume_time, &view, Utc::now());
         self.current_view_export.request(context, file_base);
+    }
+
+    /// Capture exactly the retained timeline, without synthesising or skipping
+    /// any frame. Selection is restored even when a live eviction interrupts it.
+    fn begin_loop_export(&mut self, context: &egui::Context) {
+        if self.history.is_empty()
+            || self.loop_export.is_some()
+            || self.current_view_export.in_flight()
+        {
+            return;
+        }
+
+        let frame = self.history.current();
+        let site = frame.map(|frame| frame.identity.site_id.as_str());
+        let volume_time = frame.map(|frame| frame.identity.volume_time);
+        let product_id = self.workspace.active().product.clone();
+        let product = DisplayProduct::from_product_id(&product_id);
+        let product_name = crate::source_fields::producer_name_from_product_id(&product_id)
+            .unwrap_or_else(|| product.id());
+        let pane_count = self.workspace.visible_panes().len();
+        let view = if pane_count == 1 {
+            product_name.to_owned()
+        } else {
+            format!("{pane_count}panes-{product_name}-active")
+        };
+        let file_base =
+            crate::current_view_export::loop_file_base(site, volume_time, &view, Utc::now());
+        let frame_keys: Vec<_> = self
+            .history
+            .frames()
+            .iter()
+            .map(LoopFrameKey::from_frame)
+            .collect();
+        let frame_count = frame_keys.len();
+        self.next_loop_capture_id = self.next_loop_capture_id.wrapping_add(1);
+        self.loop_export_notice = None;
+        self.loop_export = Some(LoopExportState {
+            capture_id: self.next_loop_capture_id,
+            frame_keys,
+            original_frame: frame.map(LoopFrameKey::from_frame),
+            original_selected: self.history.selected_index(),
+            original_follows_live: self.history.follows_live(),
+            original_playback: self.history.playback(),
+            next_index: 0,
+            awaiting_screenshot: false,
+            settled_paints_remaining: 2,
+            frames: Vec::with_capacity(frame_count),
+            file_base,
+            delay_ms: self
+                .settings_cache
+                .loop_frame_time
+                .as_millis()
+                .clamp(1, u128::from(u32::MAX)) as u32,
+        });
+        self.history.set_playback(PlaybackState::Paused);
+        self.select_loop_export_frame(context);
+    }
+
+    fn select_loop_export_frame(&mut self, context: &egui::Context) {
+        let Some(target) = self
+            .loop_export
+            .as_ref()
+            .and_then(|state| state.frame_keys.get(state.next_index))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(index) = self
+            .history
+            .frames()
+            .iter()
+            .position(|frame| LoopFrameKey::from_frame(frame) == target)
+        else {
+            self.abort_loop_export(
+                context,
+                "a frame was removed from the timeline before it could be captured",
+            );
+            return;
+        };
+
+        let before = self.current_frame_signature();
+        self.history.select(index);
+        self.commit_history_selection(before);
+        if let Some(state) = self.loop_export.as_mut() {
+            // eframe screenshots observe a presented frame, not a merely
+            // installed texture. Two complete paints also clear a File popup.
+            state.settled_paints_remaining = 2;
+        }
+        context.request_repaint();
+    }
+
+    fn restore_loop_export_selection(&mut self, state: &LoopExportState) {
+        let before = self.current_frame_signature();
+        if state.original_follows_live {
+            self.history.go_live();
+        } else {
+            let original_index = state.original_frame.as_ref().and_then(|original| {
+                self.history
+                    .frames()
+                    .iter()
+                    .position(|frame| LoopFrameKey::from_frame(frame) == *original)
+            });
+            if let Some(index) = original_index.or_else(|| {
+                state
+                    .original_selected
+                    .filter(|index| *index < self.history.len())
+            }) {
+                self.history.select(index);
+            }
+        }
+        self.history.set_playback(state.original_playback);
+        self.last_playback_step = Instant::now();
+        self.commit_history_selection(before);
+    }
+
+    fn abort_loop_export(&mut self, context: &egui::Context, reason: &str) {
+        if let Some(state) = self.loop_export.take() {
+            self.restore_loop_export_selection(&state);
+            let message = format!("Loop export failed: {reason}");
+            self.status.clone_from(&message);
+            self.loop_export_notice = Some(message);
+            context.request_repaint();
+        }
+    }
+
+    /// Consume only our private tagged screenshot; the PNG exporter continues
+    /// to own its own unrelated capture events.
+    fn handle_loop_capture_events(&mut self, context: &egui::Context) {
+        let captures: Vec<(LoopCaptureTag, Arc<egui::ColorImage>)> = context.input(|input| {
+            input
+                .raw
+                .events
+                .iter()
+                .filter_map(|event| {
+                    let egui::Event::Screenshot {
+                        user_data, image, ..
+                    } = event
+                    else {
+                        return None;
+                    };
+                    let tag = user_data.data.as_ref()?.downcast_ref::<LoopCaptureTag>()?;
+                    Some((tag.clone(), Arc::clone(image)))
+                })
+                .collect()
+        });
+
+        for (tag, image) in captures {
+            let matches_pending = self.loop_export.as_ref().is_some_and(|state| {
+                state.capture_id == tag.capture_id
+                    && state.next_index == tag.frame_index
+                    && state.awaiting_screenshot
+            });
+            if !matches_pending {
+                continue;
+            }
+
+            let target = self
+                .loop_export
+                .as_ref()
+                .and_then(|state| state.frame_keys.get(state.next_index));
+            let current = self.history.current().map(LoopFrameKey::from_frame);
+            if target != current.as_ref() {
+                self.abort_loop_export(context, "the displayed frame changed during capture");
+                return;
+            }
+
+            let state = self.loop_export.as_mut().expect("pending capture exists");
+            state.frames.push(image);
+            state.next_index += 1;
+            state.awaiting_screenshot = false;
+            if state.next_index < state.frame_keys.len() {
+                self.select_loop_export_frame(context);
+                continue;
+            }
+
+            let state = self.loop_export.take().expect("completed capture exists");
+            self.restore_loop_export_selection(&state);
+            self.current_view_export.request_loop(
+                context,
+                state.file_base,
+                state.frames,
+                state.delay_ms,
+            );
+            context.request_repaint();
+        }
+    }
+
+    /// Called after the map, overlays, toolbar and timeline were all painted.
+    fn drive_loop_export_capture(&mut self, context: &egui::Context) {
+        let Some(state) = self.loop_export.as_ref() else {
+            return;
+        };
+        if state.awaiting_screenshot {
+            return;
+        }
+        let target = state.frame_keys.get(state.next_index);
+        let current = self.history.current().map(LoopFrameKey::from_frame);
+        if target != current.as_ref() {
+            self.abort_loop_export(context, "the requested frame is no longer displayed");
+            return;
+        }
+        if !self.visible_panes_ready() {
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        let state = self.loop_export.as_mut().expect("active capture exists");
+        if state.settled_paints_remaining > 0 {
+            state.settled_paints_remaining -= 1;
+            context.request_repaint();
+            return;
+        }
+        let tag = LoopCaptureTag {
+            capture_id: state.capture_id,
+            frame_index: state.next_index,
+        };
+        state.awaiting_screenshot = true;
+        context.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(tag)));
+        context.request_repaint();
     }
 
     /// Draw the `Open…` window and load whatever it was pointed at.
@@ -5948,20 +6252,22 @@ impl WorkstationApp {
     fn timeline(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let frame_count = self.history.len();
         let mut selected = self.history.selected_index().unwrap_or(0);
+        let export_active = self.loop_export.is_some();
         let mut choose_frame = None;
         let mut go_live = false;
         let mut toggle_playback = false;
+        let mut export_loop = false;
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(frame_count > 1, egui::Button::new("◀"))
+                .add_enabled(frame_count > 1 && !export_active, egui::Button::new("◀"))
                 .clicked()
             {
                 choose_frame = selected.checked_sub(1);
             }
             if ui
                 .add_enabled(
-                    frame_count > 1,
+                    frame_count > 1 && !export_active,
                     egui::Button::new(if self.history.playback() == PlaybackState::Playing {
                         "Pause"
                     } else {
@@ -5974,7 +6280,7 @@ impl WorkstationApp {
             }
             if ui
                 .add_enabled(
-                    frame_count > 1 && selected + 1 < frame_count,
+                    frame_count > 1 && selected + 1 < frame_count && !export_active,
                     egui::Button::new("▶"),
                 )
                 .clicked()
@@ -5982,18 +6288,31 @@ impl WorkstationApp {
                 choose_frame = Some(selected + 1);
             }
             if ui
-                .add_enabled(frame_count > 0, egui::Button::new("Go live"))
+                .add_enabled(frame_count > 0 && !export_active, egui::Button::new("Go live"))
                 .clicked()
             {
                 go_live = true;
             }
 
+            if ui
+                .add_enabled(
+                    frame_count > 0 && !export_active && !self.current_view_export.in_flight(),
+                    egui::Button::new("Export loop"),
+                )
+                .on_hover_text("Save this timeline as an animated GIF in Downloads")
+                .clicked()
+            {
+                export_loop = true;
+            }
+
             if frame_count > 1 {
-                let response = ui.add_sized(
-                    [220.0, ui.spacing().interact_size.y],
-                    egui::Slider::new(&mut selected, 0..=frame_count - 1).show_value(false),
-                );
-                if response.changed() {
+                let response = ui.add_enabled_ui(!export_active, |ui| {
+                    ui.add_sized(
+                        [220.0, ui.spacing().interact_size.y],
+                        egui::Slider::new(&mut selected, 0..=frame_count - 1).show_value(false),
+                    )
+                });
+                if response.inner.changed() {
                     choose_frame = Some(selected);
                 }
             }
@@ -6007,7 +6326,16 @@ impl WorkstationApp {
                         .unwrap_or("File playlist status"),
                 );
             }
-            if let Some(status) = self.current_view_export.status() {
+            if let Some(state) = self.loop_export.as_ref() {
+                ui.label(format!(
+                    "Exporting loop: frame {} of {}",
+                    state.next_index + 1,
+                    state.frame_keys.len()
+                ))
+                .on_hover_text("Capturing the fully rendered radar map, legends and overlays");
+            } else if let Some(notice) = self.loop_export_notice.as_deref() {
+                ui.label(notice);
+            } else if let Some(status) = self.current_view_export.status() {
                 ui.label(status).on_hover_text(
                     self.current_view_export
                         .detail()
@@ -6051,6 +6379,9 @@ impl WorkstationApp {
             self.history.select(index);
             self.history.set_playback(PlaybackState::Paused);
             self.commit_history_selection(before);
+        }
+        if export_loop {
+            self.begin_loop_export(context);
         }
     }
 
@@ -6225,7 +6556,7 @@ impl WorkstationApp {
         // Only the live edge animates. A frame the analyst has scrubbed back to
         // is finished data, and revealing it a spoke at a time would animate
         // history rather than report on an arriving sweep.
-        if !self.history.at_live_edge() {
+        if self.loop_export.is_some() || !self.history.at_live_edge() {
             for runtime in &mut self.panes {
                 runtime.reset_sweep();
             }
@@ -7682,6 +8013,7 @@ impl eframe::App for WorkstationApp {
         let context = ui.ctx().clone();
         self.current_view_export.poll();
         self.current_view_export.handle_capture_events(&context);
+        self.handle_loop_capture_events(&context);
         self.handle_dropped_files(&context);
         // A save made in the colour table editor, one frame ago.
         //
@@ -7782,6 +8114,9 @@ impl eframe::App for WorkstationApp {
         // because that line is only shown when no volume is loaded, which is
         // never the moment somebody drops a palette.
         self.user_tables.draw_notice(&context);
+        // Screenshot commands issued here observe the finished composited
+        // window, never the stale texture that preceded this canvas paint.
+        self.drive_loop_export_capture(&context);
 
         // A reveal that has caught up with the data is not animating: it is
         // waiting for a chunk, and the load service wakes the UI when one
@@ -9068,6 +9403,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loop_export_keeps_equal_timestamp_frames_and_restores_selection_and_playback() {
+        let mut app = test_app();
+        let volume = renderable_volume(1_768_605_600);
+        for source in ["selected/first.nc", "selected/second.nc"] {
+            app.history.install_distinct(VolumeFrame::new(
+                Arc::clone(&volume),
+                FrameOrigin::Local,
+                FrameStage::Complete,
+                source,
+            ));
+        }
+        assert!(app.history.select(1));
+        app.history.set_playback(PlaybackState::Playing);
+        let context = egui::Context::default();
+
+        app.begin_loop_export(&context);
+
+        let state = app.loop_export.as_ref().expect("loop capture started");
+        assert_eq!(state.frame_keys.len(), 2);
+        assert_eq!(state.frame_keys[0].source_label, "selected/first.nc");
+        assert_eq!(state.frame_keys[1].source_label, "selected/second.nc");
+        assert_eq!(state.delay_ms, 700);
+        assert_eq!(app.history.selected_index(), Some(0));
+        assert_eq!(app.history.playback(), PlaybackState::Paused);
+
+        let state = app.loop_export.take().expect("capture remains active");
+        app.restore_loop_export_selection(&state);
+        assert_eq!(app.history.selected_index(), Some(1));
+        assert!(!app.history.follows_live());
+        assert_eq!(app.history.playback(), PlaybackState::Playing);
+    }
+
+    #[test]
+    fn loop_export_restores_live_follow_on_failure() {
+        let mut app = test_app();
+        for timestamp in [1_768_605_600, 1_768_605_900] {
+            app.history.install(VolumeFrame::new(
+                renderable_volume(timestamp),
+                FrameOrigin::Live,
+                FrameStage::Complete,
+                "live",
+            ));
+        }
+        app.history.go_live();
+        assert!(app.history.follows_live());
+        let context = egui::Context::default();
+
+        app.begin_loop_export(&context);
+        assert_eq!(app.history.selected_index(), Some(0));
+        assert!(!app.history.follows_live());
+        app.abort_loop_export(&context, "the test removed a frame");
+
+        assert!(app.loop_export.is_none());
+        assert!(app.history.follows_live());
+        assert_eq!(app.history.selected_index(), Some(1));
+        assert_eq!(
+            app.loop_export_notice.as_deref(),
+            Some("Loop export failed: the test removed a frame")
+        );
+    }
+
     /// Every string one `draw_pane` pass emitted, with the settings cache the
     /// application would be holding driving it.
     ///
@@ -9577,6 +9974,7 @@ mod tests {
             "Radar volume file path".to_owned(),
             "Load".to_owned(),
             "Export current view".to_owned(),
+            "Export loop…".to_owned(),
             "Online Level I…".to_owned(),
             "KRTX".to_owned(),
             "Start live".to_owned(),

@@ -148,7 +148,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "analyst_runtime"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "radar_core",
@@ -430,7 +430,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "basemap_tiles"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "bytemuck",
  "image",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.6.4"
+version = "0.6.5"
 
 [[package]]
 name = "calloop"
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "color_tables"
-version = "0.6.4"
+version = "0.6.5"
 
 [[package]]
 name = "combine"
@@ -808,7 +808,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "data_source"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "flate2",
@@ -2017,7 +2017,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "map_scene"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "analyst_runtime",
  "basemap_tiles",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "nexrad_io"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "byteorder",
  "bzip2",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "radar_core",
@@ -2906,7 +2906,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "serde",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "render2d"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
  "color_tables",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "analyst_runtime",
  "color_tables",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "timeline"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "chrono",
 ]
@@ -4862,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "workstation_app"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "analyst_runtime",
  "chrono",

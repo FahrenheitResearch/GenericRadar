@@ -44,6 +44,11 @@ API keys, no telemetry.
   applies inside mobile deployment ZIPs
 - **Export current view** writes the fully composited application window as a
   non-overwriting PNG directly to Downloads
+- **Export loop** writes the complete radar timeline as a smoothly timed,
+  infinitely looping GIF directly to Downloads, preserving the visible map,
+  overlays, legends and station observations. Adaptive color quantization,
+  duplicate-frame coalescing, changed-region cropping and LZW compression keep
+  radar colors accurate and files compact without external encoders
 - Up to four linked panes: reflectivity, velocity (dealiased and
   storm-relative), spectrum width, ZDR, CC, PHI, KDP, and derived products
   (CREF, ET, VIL, VILD, MESH, POH/POSH)
